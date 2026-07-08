@@ -1,0 +1,4 @@
+FROM drone_herding:v1
+
+RUN apt install ros-${ROS_DISTRO}-turtlebot3* -y
+

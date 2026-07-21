@@ -48,7 +48,7 @@ class PeopleRepeller(Node):
 
     def quaternion_to_yaw(self, orientation):
         q_w = orientation.w
-        q_x = orientation.y
+        q_x = orientation.x
         q_y = orientation.y
         q_z = orientation.z
         siny_cosp = 2.0 * (q_w * q_z + q_x * q_y)
@@ -135,7 +135,7 @@ class PeopleRepeller(Node):
             control_d = 5.0
 
             twist = Twist()
-            twist.linear.x  = 0.05
+            twist.linear.x  = 0.5
             twist.angular.z = (diff_rad * control_p) + (control_d * (diff_rad - last_diff_rad))
 
             self.publishers_dict[key].publish(twist)

@@ -112,15 +112,15 @@ def cow_launch_description(context, *args, **kwargs):
         array.append(spawn_robot)
         array.append(robot_state_publisher)
 
-    #array.append(
-    #    Node(
-    #        package="cow_pkg",
-    #        executable="repeller",
-    #        arguments=[model_ns, number_of_drones, number_of_cows],
-    #        name='cow_pkg',
-    #        output="screen"
-    #    ),
-    #)
+    array.append(
+        Node(
+            package="cow_pkg",
+            executable="repeller",
+            arguments=[model_ns, number_of_drones, number_of_cows],
+            name='cow_pkg',
+            output="screen"
+        ),
+    )
 
     array.append(
         Node(
@@ -150,6 +150,12 @@ def drone_launch_description(context, *args, **kwargs):
     sjtu_drone_bringup_path = get_package_share_directory('sjtu_drone_bringup')
 
     number_of_drones = LaunchConfiguration('number_of_drones').perform(context)
+
+    cow_pos = [
+        [3,5],
+        [-6,7],
+        [-3,2]
+    ]
 
     for i in range(int(number_of_drones)):
         name = model_ns + str(i)

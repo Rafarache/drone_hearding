@@ -96,9 +96,22 @@ class DronePositionControl(Node):
                                       (self.camera_focus_position_y - self.drone_y)**2)
 
         if distance_to_final <= self.tolerance:
-            # Stop the drone if it is within the tolerance of the final position
-            self.publish_cmd_vel()
-            self.get_logger().info("Drone reached the destination.")
+            # Stop translation, but still rotate to face camera focus if needed
+            angular_vec = Vector3()
+            if distance_to_focus > 0.5:
+                angle_to_focus = math.atan2(self.camera_focus_position_y - self.drone_y,
+                                            self.camera_focus_position_x - self.drone_x)
+                angle_difference = angle_to_focus - self.drone_angle
+                
+                # Normalize the angle difference to the range [-pi, pi]
+                angle_difference = (angle_difference + math.pi) % (2 * math.pi) - math.pi
+
+                if abs(angle_difference) > 0.02:
+                    angular_vec.z = self.max_angular_velocity * (angle_difference / math.pi)
+                else:
+                    angular_vec.z = 0.0
+            self.publish_cmd_vel(Vector3(), angular_vec)
+            self.get_logger().info("Drone reached the destination. Spinning/focusing in place.")
         else:
             # Calculate the direction vector to the final position
             direction_x = self.final_position_x - self.drone_x

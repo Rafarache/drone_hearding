@@ -18,5 +18,5 @@ docker run \
     --privileged \
     --net=host \
     --name="drone_herding" \
-    drone_herding:v2
+    drone_herding:1.0
 xhost -local:docker

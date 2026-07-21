@@ -61,7 +61,7 @@ class YoloPersonSubscriber(Node):
         for box in detections:
             cls_id = int(box.cls[0])
             label = self.model.names[cls_id]
-            if label != "cow" and label!='horse':
+            if label != "cow" and label!='horse' and label!='giraffe':
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])

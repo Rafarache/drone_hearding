@@ -16,7 +16,8 @@ class HerdingControlMy(Node):
             sys.exit(1)
 
         self.namespace = sys.argv[1]
-        number_of_drones = int(sys.argv[2])
+        self.number_of_drones = int(sys.argv[2])
+        number_of_drones = self.number_of_drones
 
         # --- Occupancy Grid ---
         self.grid_width = 100
@@ -26,11 +27,11 @@ class HerdingControlMy(Node):
 
         # --- Goal position (world coordinates, meters) ---
         # This is where the cows should be herded TO.
-        self.goal = np.array([0.0, 20.0])
+        self.goal = np.array([0.0, 15.0])
 
         # --- APF tuning constants ---
         # Distance behind the cow (away from goal) where the drone should position itself
-        self.herding_distance = 2.0  # meters
+        self.herding_distance = 4.0  # meters
 
         # Cow repulsion radius: drones are strongly pushed away within this distance
         self.cow_repulsion_radius = 3.0  # meters
@@ -111,11 +112,10 @@ class HerdingControlMy(Node):
         for cow in cows_pos:
             diff = cow - self.goal
             dist = np.linalg.norm(diff)
-            if dist < 1e-6:
-                # Cow is already at the goal; pick an arbitrary direction
-                direction = np.array([1.0, 0.0])
-            else:
-                direction = diff / dist
+            if dist < 2.0:
+                # Cow is closer than 2m to the goal/target; consider it reached the goal
+                continue
+            direction = diff / dist
             target = cow + direction * self.herding_distance
             targets.append(target)
         return targets
@@ -173,6 +173,54 @@ class HerdingControlMy(Node):
     # -------------------------------------------------------------------------
 
     def move_drones(self):
+        if len(self.drone_pos_dir) < self.number_of_drones:
+            return
+
+        if not hasattr(self, '_scan_finished'):
+            self._scan_finished = False
+
+        if not self._scan_finished:
+            if not hasattr(self, '_scan_initialized'):
+                self._scan_initialized = True
+                self._scan_progress = {}
+                for name, pose in self.drone_pos_dir.items():
+                    yaw = math.radians(self.get_yaw_degrees(pose.orientation))
+                    self._scan_progress[name] = {
+                        'start_yaw': yaw,
+                        'current_yaw': yaw,
+                        'initial_pos': np.array([pose.position.x, pose.position.y])
+                    }
+                self.get_logger().info("Starting initial 360-degree scan...")
+
+            all_done = True
+            for name, progress in self._scan_progress.items():
+                pose = self.drone_pos_dir[name]
+                rel_angle = progress['current_yaw'] - progress['start_yaw']
+                if rel_angle < 2 * math.pi:
+                    progress['current_yaw'] += 0.2
+                    all_done = False
+                
+                # Keep drone in place by command to initial_pos
+                target_pose = Pose()
+                target_pose.position.x = float(progress['initial_pos'][0])
+                target_pose.position.y = float(progress['initial_pos'][1])
+                target_pose.position.z = pose.position.z
+                self.drone_goto_pub_list[name].publish(target_pose)
+
+                # Focus point rotates around initial_pos to complete 360 degrees
+                focus_x = progress['initial_pos'][0] + 2.0 * math.cos(progress['current_yaw'])
+                focus_y = progress['initial_pos'][1] + 2.0 * math.sin(progress['current_yaw'])
+                focus_pose = Pose()
+                focus_pose.position.x = float(focus_x)
+                focus_pose.position.y = float(focus_y)
+                focus_pose.position.z = pose.position.z
+                self.drone_focusin_pub_list[name].publish(focus_pose)
+
+            if all_done:
+                self._scan_finished = True
+                self.get_logger().info("360-degree scan complete. Starting herding algorithm.")
+            return
+
         cows_pos = self.get_cows_pos()
         targets = self.compute_drone_targets(cows_pos)
 
@@ -189,10 +237,18 @@ class HerdingControlMy(Node):
                 total_force += self.w_attractive * f
 
             # 2. Repulsive force from cows: avoid entering cow_repulsion_radius
+            # The closer the cow is to the final destination (goal), the more intense the repulsion force is.
+            # When cows are at or near the final destination, we scale up the repulsion radius and weight
+            # so that drones are pushed far away and do not nudge them beyond the goal.
             for cow in cows_pos:
-                f = self.repulsive_force(xi, cow, self.cow_repulsion_radius,
+                dist_to_goal = np.linalg.norm(cow - self.goal)
+                factor = max(0.0, 1.0 - dist_to_goal / 10.0)
+                r_rep = self.cow_repulsion_radius + 5.0 * factor
+                w_rep = self.w_cow_repulsion * (1.0 + 4.0 * factor)
+
+                f = self.repulsive_force(xi, cow, r_rep,
                                          self.cow_rep_a, self.cow_rep_c)
-                total_force += self.w_cow_repulsion * f
+                total_force += w_rep * f
 
             # 3. Repulsive force from other drones (keep separation)
             for other_name, other_pose in self.drone_pos_dir.items():
@@ -216,10 +272,16 @@ class HerdingControlMy(Node):
             target_pose.position.y = float(xi[1] + unit_force[1])
             self.drone_goto_pub_list[name].publish(target_pose)
 
-            # Point camera in the direction of the net force vector
+            # Point camera in the direction of the nearest cow, or the net force vector if none detected
             focus_pose = Pose()
-            focus_pose.position.x = float(xi[0] + unit_force[0] * 10.0)
-            focus_pose.position.y = float(xi[1] + unit_force[1] * 10.0)
+            if cows_pos:
+                dists = [np.linalg.norm(cow - xi) for cow in cows_pos]
+                nearest_cow = cows_pos[np.argmin(dists)]
+                focus_pose.position.x = float(nearest_cow[0])
+                focus_pose.position.y = float(nearest_cow[1])
+            else:
+                focus_pose.position.x = float(xi[0] + unit_force[0] * 10.0)
+                focus_pose.position.y = float(xi[1] + unit_force[1] * 10.0)
             focus_pose.position.z = pose.position.z  # keep same altitude focus
             self.drone_focusin_pub_list[name].publish(focus_pose)
 
@@ -239,14 +301,14 @@ class HerdingControlMy(Node):
         # Draw goal: green filled circle
         gx, gy = self.world_to_grid(self.goal[0], self.goal[1])
         if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
-            cv2.circle(display_img, (gx, gy), 3, (0, 255, 0), -1)  # green
+            cv2.circle(display_img, (gx, gy), 1, (0, 255, 0), -1)  # green
 
         # Draw computed drone target positions: yellow dots
         if hasattr(self, '_last_targets'):
             for target in self._last_targets:
                 tx, ty = self.world_to_grid(target[0], target[1])
                 if 0 <= tx < self.grid_width and 0 <= ty < self.grid_height:
-                    cv2.circle(display_img, (tx, ty), 2, (0, 255, 255), -1)  # yellow
+                    cv2.circle(display_img, (tx, ty), 1, (0, 255, 255), -1)  # yellow
 
         # Draw drones: blue dots (existing function)
         self.draw_drones_pos(self.drone_pos_dir, display_img)

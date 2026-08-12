@@ -335,7 +335,7 @@ private:
           float max_arrow_len = cell_size * 0.8f;
           float arrow_scale = std::min(mag * 5.0f, 1.0f) * (max_arrow_len / 2.0f);
 
-          cv::Point2f dir(vec.x / mag, vec.y / mag);
+          cv::Point2f dir(vec.x / mag, -vec.y / mag);
           cv::Point2f start_pt = center - dir * arrow_scale;
           cv::Point2f end_pt   = center + dir * arrow_scale;
 

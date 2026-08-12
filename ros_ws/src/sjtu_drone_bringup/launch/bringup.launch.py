@@ -112,15 +112,15 @@ def cow_launch_description(context, *args, **kwargs):
         array.append(spawn_robot)
         array.append(robot_state_publisher)
 
-    array.append(
-        Node(
-            package="cow_pkg",
-            executable="repeller",
-            arguments=[model_ns, number_of_drones, number_of_cows],
-            name='cow_pkg',
-            output="screen"
-        ),
-    )
+    # array.append(
+    #     Node(
+    #         package="cow_pkg",
+    #         executable="repeller",
+    #         arguments=[model_ns, number_of_drones, number_of_cows],
+    #         name='cow_pkg',
+    #         output="screen"
+    #     ),
+    # )
 
     array.append(
         Node(
@@ -132,15 +132,15 @@ def cow_launch_description(context, *args, **kwargs):
         ),
     )
 
-    array.append(
-        Node(
-            package="herding_pkg",
-            executable="herding_control_my",
-            arguments=[model_ns, number_of_drones],
-            name='herding_pkg',
-            output="screen"
-        ),
-    )
+    # array.append(
+    #     Node(
+    #         package="herding_pkg",
+    #         executable="herding_control_my",
+    #         arguments=[model_ns, number_of_drones],
+    #         name='herding_pkg',
+    #         output="screen"
+    #     ),
+    # )
 
     return array
 
@@ -184,6 +184,17 @@ def drone_launch_description(context, *args, **kwargs):
             }.items()
         )
 
+        array.append(
+        Node(
+            package="grid_visualizer_pkg",
+            executable="grid_visualizer_node",
+            arguments=[name],
+            namespace=name,
+            name='grid_visualizer_pkg',
+            output="screen"
+        ),
+    )
+
         array.append(node)
         array.append(func)
         array.append(desc)
@@ -225,7 +236,7 @@ def generate_launch_description():
 
     declare_number_drones_arg = DeclareLaunchArgument(
         'number_of_drones',
-        default_value='6',
+        default_value='1',
         description='Number of drones argument'
     )
 

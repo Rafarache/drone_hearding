@@ -1,10 +1,13 @@
 import math
 import sys
+from collections import deque
+
 import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, PoseArray
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
@@ -17,6 +20,23 @@ PLOT_HISTORY_MS = 10000
 PLOT_POSITION_GRID_METERS = 1.0
 PLOT_MAP_X_LIMITS = (-10.0, 10.0)
 PLOT_MAP_Y_LIMITS = (-10.0, 10.0)
+TRACKED_ANIMAL_LABELS = ('cow',)
+YOLO_CONFIDENCE_THRESHOLD = 0.45
+MAX_COW_DETECTION_DISTANCE_METERS = 20.0
+POSE_HISTORY_LENGTH = 500
+MAX_POSE_TIME_ERROR_SECONDS = 0.25
+MULTI_CAMERA_MERGE_DISTANCE_METERS = 1.0
+MAX_CAMERA_BATCH_WAIT_SECONDS = 0.20
+
+TRACKER_DEFAULT_DT_SECONDS = 0.1
+TRACKER_MAX_LOST_FRAMES = 15
+TRACKER_MAHALANOBIS_GATE = 9.21
+TRACKER_MAX_POSITION_DISTANCE_METERS = 3.0
+TRACKER_MIN_CONFIRMATION_HITS = 3
+TRACKER_MAX_PREDICTION_STEP_SECONDS = 1.0
+TRACKER_ACCELERATION_NOISE_STD = 1.5
+TRACKER_MEASUREMENT_NOISE_STD = 1.5
+TRACKER_INITIAL_VELOCITY_STD = 3.0
 
 
 class RealtimeCowPlotter:
@@ -39,9 +59,8 @@ class RealtimeCowPlotter:
         self.noise_rect = (70, 735, 1065, 860)
         self._create_window()
 
-    def update(self, timestamp, tracks, measurements):
+    def update(self, timestamp, tracks):
         timestamp = float(timestamp)
-        measurement_array = np.asarray(measurements, dtype=float).reshape(-1, 2)
         active_track_ids = set()
 
         for track in tracks:
@@ -49,7 +68,7 @@ class RealtimeCowPlotter:
             active_track_ids.add(track_id)
             x = float(track['x'])
             y = float(track['y'])
-            noise = self._nearest_measurement_distance(x, y, measurement_array)
+            noise = float(track.get('innovation_norm', np.nan))
 
             values = self.history.setdefault(track_id, [])
             values.append(
@@ -79,13 +98,6 @@ class RealtimeCowPlotter:
             if not self.history[track_id] and track_id not in active_track_ids:
                 del self.history[track_id]
 
-    def _nearest_measurement_distance(self, x, y, measurements):
-        if len(measurements) == 0:
-            return np.nan
-
-        deltas = measurements - np.array([[x, y]], dtype=float)
-        distances = np.linalg.norm(deltas, axis=1)
-        return float(np.min(distances))
 
     def _draw(self, timestamp):
         if not self._window_is_available():
@@ -251,30 +263,6 @@ class RealtimeCowPlotter:
         py = bottom - int((y - min_y) / (max_y - min_y) * (bottom - top))
         return px, py
 
-    def _equal_xy_limits(self, x_values, y_values, rect):
-        if not x_values or not y_values:
-            return (-5.0, 5.0), (-5.0, 5.0)
-
-        min_x = float(np.min(x_values))
-        max_x = float(np.max(x_values))
-        min_y = float(np.min(y_values))
-        max_y = float(np.max(y_values))
-        center_x = 0.5 * (min_x + max_x)
-        center_y = 0.5 * (min_y + max_y)
-
-        width_m = max(max_x - min_x, 2.0)
-        height_m = max(max_y - min_y, 2.0)
-        left, top, right, bottom = rect
-        pixel_aspect = (right - left) / (bottom - top)
-
-        if width_m / height_m > pixel_aspect:
-            height_m = width_m / pixel_aspect
-        else:
-            width_m = height_m * pixel_aspect
-
-        width_m = math.ceil(width_m / self.grid_meters) * self.grid_meters
-        height_m = math.ceil(height_m / self.grid_meters) * self.grid_meters
-        return (center_x - width_m / 2.0, center_x + width_m / 2.0), (center_y - height_m / 2.0, center_y + height_m / 2.0)
 
     def _limits(self, values, default=(-1.0, 1.0), pad=0.1):
         if not values:
@@ -295,7 +283,7 @@ class RealtimeCowPlotter:
         return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
 
-class YoloPersonSubscriber(Node):
+class YoloCowSubscriber(Node):
     def __init__(self):
         super().__init__('yolo_pkg')
 
@@ -304,10 +292,17 @@ class YoloPersonSubscriber(Node):
 
         self.drone_image_sub_list = {}
         self.drone_pos_sub_list = {}
-        self.drone_pos_dir = {}
+        self.drone_pose_history = {}
+        self.drone_index_by_name = {}
+        self.expected_camera_names = set()
+        self.pending_detection_batches = {}
+        self.pending_batch_start_timestamp = None
 
         for i in range(number_of_drones):
             name = self.namespace + str(i)
+            self.drone_index_by_name[name] = i
+            self.expected_camera_names.add(name)
+            self.drone_pose_history[name] = deque(maxlen=POSE_HISTORY_LENGTH)
             self.drone_image_sub_list[name] = self.create_subscription(
                 Image,
                 name + '/front/image_raw',
@@ -315,19 +310,23 @@ class YoloPersonSubscriber(Node):
                 10,
             )
             self.drone_pos_sub_list[name] = self.create_subscription(
-                Pose,
-                name + '/gt_pose',
+                Odometry,
+                name + '/odom',
                 lambda msg, n=name: self.drone_callback(msg, n),
                 10,
             )
 
         self.publisher = self.create_publisher(PoseArray, '/cows_pos', 10)
         self.tracker = CowTrackerManager(
-            dt=0.1,
-            max_lost_frames=15,
-            mahalanobis_gate=9.21,
-            min_hits=2,
-            max_dt=1.0,
+            dt=TRACKER_DEFAULT_DT_SECONDS,
+            max_lost_frames=TRACKER_MAX_LOST_FRAMES,
+            mahalanobis_gate=TRACKER_MAHALANOBIS_GATE,
+            max_position_distance=TRACKER_MAX_POSITION_DISTANCE_METERS,
+            min_hits=TRACKER_MIN_CONFIRMATION_HITS,
+            max_dt=TRACKER_MAX_PREDICTION_STEP_SECONDS,
+            acceleration_noise_std=TRACKER_ACCELERATION_NOISE_STD,
+            measurement_noise_std=TRACKER_MEASUREMENT_NOISE_STD,
+            initial_velocity_std=TRACKER_INITIAL_VELOCITY_STD,
         )
         self.plotter = RealtimeCowPlotter() if ENABLE_REALTIME_TRACK_PLOT else None
 
@@ -335,29 +334,40 @@ class YoloPersonSubscriber(Node):
         self.model = YOLO('yolov8n.pt')
 
     def drone_callback(self, msg, namespace):
-        self.drone_pos_dir[namespace] = msg
+        timestamp = self._stamp_to_seconds(msg.header.stamp)
+        pose = msg.pose.pose
+        self.drone_pose_history[namespace].append(
+            (
+                timestamp,
+                float(pose.position.x),
+                float(pose.position.y),
+                self._yaw_from_quaternion(pose.orientation),
+            )
+        )
 
     def listener_callback(self, msg, name):
-        if name not in self.drone_pos_dir:
+        timestamp = self._stamp_to_seconds(msg.header.stamp)
+        drone_state = self._drone_state_at(name, timestamp)
+        if drone_state is None:
             return
 
+        self._flush_stale_detection_batch(timestamp)
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        results = self.model(frame)
+        results = self.model(
+            frame,
+            conf=YOLO_CONFIDENCE_THRESHOLD,
+            verbose=False,
+        )
         detections = results[0].boxes
 
-        drone_pose = self.drone_pos_dir[name]
-        drone_x = drone_pose.position.x
-        drone_y = drone_pose.position.y
-        drone_qz = drone_pose.orientation.z
-        drone_qw = drone_pose.orientation.w
-        drone_yaw = 2.0 * math.atan2(drone_qz, drone_qw)
+        drone_x, drone_y, drone_yaw = drone_state
 
         global_measurements = []
 
         for box in detections:
             cls_id = int(box.cls[0])
             label = self.model.names[cls_id]
-            if label not in ('cow', 'horse', 'giraffe'):
+            if label not in TRACKED_ANIMAL_LABELS:
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -371,7 +381,11 @@ class YoloPersonSubscriber(Node):
             )
             full_distance = abs(distance_1 / np.cos(image_angle * (np.pi / 180.0)))
 
-            if not np.isfinite(full_distance):
+            if (
+                not np.isfinite(full_distance)
+                or full_distance <= 0.0
+                or full_distance > MAX_COW_DETECTION_DISTANCE_METERS
+            ):
                 continue
 
             sign = 1.0 if center_x >= 320.0 else -1.0
@@ -381,29 +395,152 @@ class YoloPersonSubscriber(Node):
             cow_y = drone_y + math.sin(world_bearing) * full_distance
             global_measurements.append((cow_x, cow_y))
 
-        timestamp = self._stamp_to_seconds(msg.header.stamp)
-        tracks = self.tracker.update(global_measurements, timestamp=timestamp)
-        if self.plotter is not None:
-            self.plotter.update(timestamp, tracks, global_measurements)
-        self._publish_tracks(tracks, msg.header)
+        if self.pending_batch_start_timestamp is None:
+            self.pending_batch_start_timestamp = timestamp
+        self.pending_detection_batches[name] = (
+            timestamp,
+            global_measurements,
+            msg.header,
+        )
+        if self.expected_camera_names.issubset(
+            self.pending_detection_batches
+        ):
+            self._process_detection_batch()
 
-    def _publish_tracks(self, tracks, header):
+    def _flush_stale_detection_batch(self, timestamp):
+        if self.pending_batch_start_timestamp is None:
+            return
+        if (
+            timestamp - self.pending_batch_start_timestamp
+            >= MAX_CAMERA_BATCH_WAIT_SECONDS
+        ):
+            self._process_detection_batch()
+
+    def _process_detection_batch(self):
+        if not self.pending_detection_batches:
+            return
+
+        batches = self.pending_detection_batches
+        self.pending_detection_batches = {}
+        self.pending_batch_start_timestamp = None
+        timestamp, _, header = max(
+            batches.values(),
+            key=lambda batch: batch[0],
+        )
+        measurements = self._merge_camera_measurements(batches)
+        tracks = self.tracker.update(measurements, timestamp=timestamp)
+        if self.plotter is not None:
+            self.plotter.update(timestamp, tracks)
+
+        source_name = min(
+            batches,
+            key=lambda camera_name: self.drone_index_by_name[camera_name],
+        )
+        source_drone_index = self.drone_index_by_name[source_name]
+        self._publish_tracks(tracks, header, source_drone_index)
+
+    @staticmethod
+    def _merge_camera_measurements(batches):
+        clusters = []
+        for source_name, (_, measurements, _) in batches.items():
+            for measurement in measurements:
+                measurement = np.asarray(measurement, dtype=float)
+                candidates = [
+                    (np.linalg.norm(measurement - cluster['center']), cluster)
+                    for cluster in clusters
+                    if source_name not in cluster['sources']
+                ]
+                candidates = [
+                    item
+                    for item in candidates
+                    if item[0] <= MULTI_CAMERA_MERGE_DISTANCE_METERS
+                ]
+
+                if candidates:
+                    _, cluster = min(candidates, key=lambda item: item[0])
+                    cluster['sum'] += measurement
+                    cluster['count'] += 1
+                    cluster['sources'].add(source_name)
+                    cluster['center'] = cluster['sum'] / cluster['count']
+                else:
+                    clusters.append(
+                        {
+                            'sum': measurement.copy(),
+                            'count': 1,
+                            'center': measurement.copy(),
+                            'sources': {source_name},
+                        }
+                    )
+
+        return [tuple(cluster['center']) for cluster in clusters]
+
+    def _drone_state_at(self, name, timestamp):
+        history = self.drone_pose_history.get(name)
+        if not history:
+            return None
+
+        if timestamp <= history[0][0]:
+            nearest = history[0]
+            if nearest[0] - timestamp > MAX_POSE_TIME_ERROR_SECONDS:
+                return None
+            return nearest[1], nearest[2], nearest[3]
+
+        if timestamp >= history[-1][0]:
+            nearest = history[-1]
+            if timestamp - nearest[0] > MAX_POSE_TIME_ERROR_SECONDS:
+                return None
+            return nearest[1], nearest[2], nearest[3]
+
+        for newer_index in range(1, len(history)):
+            newer = history[newer_index]
+            if newer[0] < timestamp:
+                continue
+
+            older = history[newer_index - 1]
+            interval = newer[0] - older[0]
+            if interval <= 0.0:
+                return newer[1], newer[2], newer[3]
+
+            ratio = (timestamp - older[0]) / interval
+            yaw_delta = (
+                (newer[3] - older[3] + math.pi) % (2.0 * math.pi)
+                - math.pi
+            )
+            x = older[1] + ratio * (newer[1] - older[1])
+            y = older[2] + ratio * (newer[2] - older[2])
+            yaw = older[3] + ratio * yaw_delta
+            return x, y, yaw
+
+        return None
+
+    def _publish_tracks(self, tracks, header, source_drone_index):
         tracked_cows = PoseArray()
-        tracked_cows.header = header
+        tracked_cows.header.stamp = header.stamp
         tracked_cows.header.frame_id = 'map'
 
         for track in tracks:
             pose = Pose()
             pose.position.x = float(track['x'])
             pose.position.y = float(track['y'])
-            pose.position.z = float(track['id'])
-            pose.orientation.x = float(track['vx'])
-            pose.orientation.y = float(track['vy'])
-            pose.orientation.z = 1.0 if track['coasting'] else 0.0
+            # Keep the legacy PoseArray contract: z identifies the source drone.
+            # Track IDs, velocities and coast state remain available to the plotter.
+            pose.position.z = float(source_drone_index)
             pose.orientation.w = 1.0
             tracked_cows.poses.append(pose)
 
         self.publisher.publish(tracked_cows)
+
+    @staticmethod
+    def _yaw_from_quaternion(orientation):
+        sin_yaw = 2.0 * (
+            orientation.w * orientation.z
+            + orientation.x * orientation.y
+        )
+        cos_yaw = 1.0 - 2.0 * (
+            orientation.y * orientation.y
+            + orientation.z * orientation.z
+        )
+        return math.atan2(sin_yaw, cos_yaw)
 
     @staticmethod
     def _stamp_to_seconds(stamp):
@@ -412,7 +549,7 @@ class YoloPersonSubscriber(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = YoloPersonSubscriber()
+    node = YoloCowSubscriber()
     rclpy.spin(node)
     node.destroy_node()
     cv2.destroyAllWindows()

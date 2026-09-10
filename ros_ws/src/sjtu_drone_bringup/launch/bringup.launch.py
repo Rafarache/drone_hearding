@@ -126,7 +126,7 @@ def cow_launch_description(context, *args, **kwargs):
         Node(
             package="yolo_pkg",
             executable="yolo_subscriber",
-            arguments=[model_ns, number_of_cows],
+            arguments=[model_ns, number_of_drones],
             name='yolo_pkg',
             output="screen"
         ),

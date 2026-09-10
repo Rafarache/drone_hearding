@@ -2,10 +2,7 @@ import itertools
 
 import numpy as np
 
-try:
-    from scipy.optimize import linear_sum_assignment
-except ImportError:
-    linear_sum_assignment = None
+from scipy.optimize import linear_sum_assignment
 
 
 class CowKalmanFilter:
@@ -14,11 +11,22 @@ class CowKalmanFilter:
         dt,
         initial_x,
         initial_y,
-        acceleration_noise=2.0,
-        measurement_noise_std=5.0,
+        acceleration_noise_std=1.5,
+        measurement_noise_std=1.5,
+        initial_velocity_std=3.0,
     ):
         self.dt = float(dt)
-        self.acceleration_noise = float(acceleration_noise)
+        acceleration_noise_std = float(acceleration_noise_std)
+        measurement_noise_std = float(measurement_noise_std)
+        initial_velocity_std = float(initial_velocity_std)
+        if acceleration_noise_std <= 0.0:
+            raise ValueError('acceleration_noise_std must be positive')
+        if measurement_noise_std <= 0.0:
+            raise ValueError('measurement_noise_std must be positive')
+        if initial_velocity_std <= 0.0:
+            raise ValueError('initial_velocity_std must be positive')
+
+        self.acceleration_noise_variance = acceleration_noise_std ** 2
         self.x = np.array([[initial_x], [initial_y], [0.0], [0.0]], dtype=float)
         self.H = np.array(
             [
@@ -27,8 +35,16 @@ class CowKalmanFilter:
             ],
             dtype=float,
         )
-        self.P = np.diag([25.0, 25.0, 100.0, 100.0]).astype(float)
-        self.R = np.eye(2, dtype=float) * float(measurement_noise_std) ** 2
+        measurement_variance = measurement_noise_std ** 2
+        self.P = np.diag(
+            [
+                measurement_variance,
+                measurement_variance,
+                initial_velocity_std ** 2,
+                initial_velocity_std ** 2,
+            ]
+        ).astype(float)
+        self.R = np.eye(2, dtype=float) * measurement_variance
         self._set_dt(self.dt)
 
     def _set_dt(self, dt):
@@ -46,7 +62,7 @@ class CowKalmanFilter:
         dt2 = self.dt * self.dt
         dt3 = dt2 * self.dt
         dt4 = dt2 * dt2
-        q = self.acceleration_noise
+        q = self.acceleration_noise_variance
         self.Q = q * np.array(
             [
                 [dt4 / 4.0, 0.0, dt3 / 2.0, 0.0],
@@ -95,17 +111,36 @@ class CowKalmanFilter:
 class Track:
     _id_counter = itertools.count(1)
 
-    def __init__(self, dt, initial_x, initial_y, min_hits):
+    def __init__(
+        self,
+        dt,
+        initial_x,
+        initial_y,
+        min_hits,
+        acceleration_noise_std,
+        measurement_noise_std,
+        initial_velocity_std,
+    ):
         self.track_id = next(Track._id_counter)
-        self.kf = CowKalmanFilter(dt, initial_x, initial_y)
+        self.kf = CowKalmanFilter(
+            dt,
+            initial_x,
+            initial_y,
+            acceleration_noise_std=acceleration_noise_std,
+            measurement_noise_std=measurement_noise_std,
+            initial_velocity_std=initial_velocity_std,
+        )
         self.min_hits = min_hits
         self.hits = 1
+        self.hit_streak = 1
         self.age = 1
         self.lost_frames = 0
+        self.is_confirmed = min_hits <= 1
+        self.innovation_norm = float('nan')
 
     @property
     def confirmed(self):
-        return self.hits >= self.min_hits
+        return self.is_confirmed
 
     @property
     def coasting(self):
@@ -118,23 +153,54 @@ class CowTrackerManager:
         dt=0.1,
         max_lost_frames=15,
         mahalanobis_gate=9.21,
-        min_hits=2,
+        max_position_distance=3.0,
+        min_hits=3,
         max_dt=1.0,
+        acceleration_noise_std=1.5,
+        measurement_noise_std=1.5,
+        initial_velocity_std=3.0,
     ):
         self.default_dt = float(dt)
         self.max_lost_frames = int(max_lost_frames)
         self.mahalanobis_gate = float(mahalanobis_gate)
+        self.max_position_distance = float(max_position_distance)
         self.min_hits = int(min_hits)
         self.max_dt = float(max_dt)
+        self.acceleration_noise_std = float(acceleration_noise_std)
+        self.measurement_noise_std = float(measurement_noise_std)
+        self.initial_velocity_std = float(initial_velocity_std)
+        if self.default_dt <= 0.0:
+            raise ValueError('dt must be positive')
+        if self.max_lost_frames < 1:
+            raise ValueError('max_lost_frames must be at least one')
+        if self.mahalanobis_gate <= 0.0:
+            raise ValueError('mahalanobis_gate must be positive')
+        if self.max_position_distance <= 0.0:
+            raise ValueError('max_position_distance must be positive')
+        if self.min_hits < 1:
+            raise ValueError('min_hits must be at least one')
+        if self.max_dt <= 0.0:
+            raise ValueError('max_dt must be positive')
+        if self.acceleration_noise_std <= 0.0:
+            raise ValueError('acceleration_noise_std must be positive')
+        if self.measurement_noise_std <= 0.0:
+            raise ValueError('measurement_noise_std must be positive')
+        if self.initial_velocity_std <= 0.0:
+            raise ValueError('initial_velocity_std must be positive')
+
         self.tracks = []
         self.last_timestamp = None
 
     def update(self, global_measurements, timestamp=None):
         dt = self._compute_dt(timestamp)
         measurements = np.asarray(global_measurements, dtype=float).reshape(-1, 2)
+        measurements = measurements[np.all(np.isfinite(measurements), axis=1)]
 
+        prediction_steps = max(1, int(np.ceil(dt / self.max_dt)))
+        prediction_dt = dt / prediction_steps
         for track in self.tracks:
-            track.kf.predict(dt)
+            for _ in range(prediction_steps):
+                track.kf.predict(prediction_dt)
             track.age += 1
 
         matched_track_indices = set()
@@ -147,19 +213,32 @@ class CowTrackerManager:
             for track_idx, meas_idx in zip(row_ind, col_ind):
                 if cost_matrix[track_idx, meas_idx] <= self.mahalanobis_gate:
                     measurement = measurements[meas_idx]
-                    self.tracks[track_idx].kf.update(measurement[0], measurement[1])
-                    self.tracks[track_idx].hits += 1
-                    self.tracks[track_idx].lost_frames = 0
+                    track = self.tracks[track_idx]
+                    innovation, _ = track.kf.innovation(measurement)
+                    track.innovation_norm = float(np.linalg.norm(innovation))
+                    track.kf.update(measurement[0], measurement[1])
+                    track.hits += 1
+                    track.hit_streak += 1
+                    track.lost_frames = 0
+                    if track.hit_streak >= track.min_hits:
+                        track.is_confirmed = True
                     matched_track_indices.add(track_idx)
                     matched_meas_indices.add(meas_idx)
 
         for track_idx, track in enumerate(self.tracks):
             if track_idx not in matched_track_indices:
                 track.lost_frames += 1
+                track.hit_streak = 0
+                track.innovation_norm = float('nan')
 
         self.tracks = [
-            track for track in self.tracks
-            if track.lost_frames < self.max_lost_frames
+            track
+            for track in self.tracks
+            if (
+                track.lost_frames < self.max_lost_frames
+                if track.confirmed
+                else track.lost_frames == 0
+            )
         ]
 
         for meas_idx, measurement in enumerate(measurements):
@@ -170,6 +249,9 @@ class CowTrackerManager:
                         initial_x=measurement[0],
                         initial_y=measurement[1],
                         min_hits=self.min_hits,
+                        acceleration_noise_std=self.acceleration_noise_std,
+                        measurement_noise_std=self.measurement_noise_std,
+                        initial_velocity_std=self.initial_velocity_std,
                     )
                 )
 
@@ -183,6 +265,7 @@ class CowTrackerManager:
                 "coasting": track.coasting,
                 "confirmed": track.confirmed,
                 "lost_frames": track.lost_frames,
+                "innovation_norm": track.innovation_norm,
             }
             for track in self.tracks
             if track.confirmed
@@ -199,46 +282,34 @@ class CowTrackerManager:
 
         dt = timestamp - self.last_timestamp
         if dt <= 0.0:
-            return self.default_dt
+            return 1.0e-3
 
         self.last_timestamp = timestamp
-        return min(dt, self.max_dt)
+        return dt
 
     def _build_cost_matrix(self, measurements):
+        forbidden_cost = 1.0e9
         cost_matrix = np.full(
             (len(self.tracks), len(measurements)),
-            fill_value=self.mahalanobis_gate + 1.0,
+            fill_value=forbidden_cost,
             dtype=float,
         )
 
         for track_idx, track in enumerate(self.tracks):
             for meas_idx, measurement in enumerate(measurements):
                 distance_sq = track.kf.mahalanobis_distance_sq(measurement)
-                if distance_sq <= self.mahalanobis_gate:
+                predicted_position = track.kf.x[:2, 0]
+                position_distance = np.linalg.norm(
+                    measurement - predicted_position
+                )
+                if (
+                    distance_sq <= self.mahalanobis_gate
+                    and position_distance <= self.max_position_distance
+                ):
                     cost_matrix[track_idx, meas_idx] = distance_sq
 
         return cost_matrix
 
-    def _assign(self, cost_matrix):
-        if linear_sum_assignment is not None:
-            return linear_sum_assignment(cost_matrix)
-
-        # Small fallback for environments where scipy is not installed.
-        pairs = []
-        used_rows = set()
-        used_cols = set()
-        flat_indices = np.argsort(cost_matrix, axis=None)
-        rows, cols = np.unravel_index(flat_indices, cost_matrix.shape)
-
-        for row, col in zip(rows, cols):
-            if row in used_rows or col in used_cols:
-                continue
-            used_rows.add(row)
-            used_cols.add(col)
-            pairs.append((row, col))
-
-        if not pairs:
-            return np.array([], dtype=int), np.array([], dtype=int)
-
-        row_ind, col_ind = zip(*pairs)
-        return np.asarray(row_ind), np.asarray(col_ind)
+    @staticmethod
+    def _assign(cost_matrix):
+        return linear_sum_assignment(cost_matrix)

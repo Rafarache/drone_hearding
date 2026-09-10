@@ -343,7 +343,13 @@ class HerdingControlMy(Node):
             cv2.circle(image, (x_idx, y_idx), radius, color, -1)
 
     def cow_callback(self, msg):
-        drone_pos = self.drone_pos_dir[self.namespace + str(int(msg.poses[0].position.z))]
+        if not msg.poses:
+            return
+
+        drone_name = self.namespace + str(int(msg.poses[0].position.z))
+        drone_pos = self.drone_pos_dir.get(drone_name)
+        if drone_pos is None:
+            return
         drone_x_idx = int((drone_pos.position.x * self.grid_amplifier) + self.grid_width / 2)
         drone_y_idx = int((drone_pos.position.y * self.grid_amplifier) + self.grid_height / 2)
         drone_qz = drone_pos.orientation.z

@@ -185,15 +185,18 @@ def drone_launch_description(context, *args, **kwargs):
         )
 
         array.append(
-        Node(
-            package="grid_visualizer_pkg",
-            executable="grid_visualizer_node",
-            arguments=[name],
-            namespace=name,
-            name='grid_visualizer_pkg',
-            output="screen"
-        ),
-    )
+            Node(
+                package="grid_visualizer_pkg",
+                executable="grid_visualizer_node",
+                namespace=name,
+                name=f"grid{i}",
+                parameters=[{
+                    "drone_index": i,
+                    "total_drones": int(number_of_drones),
+                }],
+                output="screen",
+            )
+        )
 
         array.append(node)
         array.append(func)

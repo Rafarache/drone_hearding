@@ -8,6 +8,7 @@
 #include <functional>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <tuple>
 
 #include "rclcpp/rclcpp.hpp"
@@ -34,6 +35,7 @@ constexpr double COW_EXCLUSION_RADIUS = 2.0;   // meters
 constexpr double PUSH_POINT_MARGIN = 0.2;       // meters
 constexpr double MAX_GOTO_MOVEMENT = 0.5;       // meters
 constexpr double COW_MEMORY_ASSOCIATION_DISTANCE = 3.0;  // meters
+constexpr const char* DRONE_NAMESPACE_PREFIX = "/simple_drone";
 
 class OccupancyGridVisualizer : public rclcpp::Node
 {
@@ -41,20 +43,36 @@ public:
   OccupancyGridVisualizer()
   : Node("occupancy_grid_visualizer")
   {
-    // Declare and get namespace parameter
-    this->declare_parameter<std::string>("name", "");
-    this->declare_parameter<std::string>("namespace", "");
+    drone_index_ = this->declare_parameter<int>("drone_index", 0);
+    total_drones_ = this->declare_parameter<int>("total_drones", 1);
 
-    std::string name_param = this->get_parameter("name").as_string();
-    if (name_param.empty()) {
-      name_param = this->get_parameter("namespace").as_string();
+    if (total_drones_ <= 0) {
+      throw std::invalid_argument("total_drones must be greater than zero");
+    }
+    if (drone_index_ < 0 || drone_index_ >= total_drones_) {
+      throw std::invalid_argument(
+        "drone_index must be in the range [0, total_drones)");
     }
 
-    // Construct topic names dynamically
-    std::string drone_gt_topic = name_param.empty() ? "gt_pose" : (name_param.front() == '/' ? name_param + "/gt_pose" : "/" + name_param + "/gt_pose");
-    std::string goto_topic     = name_param.empty() ? "goto"    : (name_param.front() == '/' ? name_param + "/goto"    : "/" + name_param + "/goto");
-    std::string focus_topic    = name_param.empty() ? "focusin" : (name_param.front() == '/' ? name_param + "/focusin" : "/" + name_param + "/focusin");
+    drone_namespace_ =
+      std::string(DRONE_NAMESPACE_PREFIX) + std::to_string(drone_index_);
+    grid_name_ = "grid" + std::to_string(drone_index_);
+    occupancy_window_name_ = "Occupancy Grid - " + grid_name_;
+    vector_window_name_ = "Vector Movement Grid - " + grid_name_;
 
+    // The index parameter owns topic selection. The ROS namespace only
+    // organizes the node in the graph and cannot redirect another drone.
+    const std::string drone_gt_topic = drone_namespace_ + "/gt_pose";
+    const std::string goto_topic = drone_namespace_ + "/goto";
+    const std::string focus_topic = drone_namespace_ + "/focusin";
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "%s controls drone %d of %d in %s",
+      grid_name_.c_str(),
+      drone_index_,
+      total_drones_,
+      drone_namespace_.c_str());
     RCLCPP_INFO(this->get_logger(), "Drone Pose Sub Topic: %s", drone_gt_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Cows Pose Sub Topic: /cows_pos");
     RCLCPP_INFO(this->get_logger(), "Drone Goto Pub Topic: %s", goto_topic.c_str());
@@ -813,7 +831,7 @@ private:
 
     cv::Mat enlarged_img;
     cv::resize(display_img, enlarged_img, cv::Size(400, 400), 0, 0, cv::INTER_NEAREST);
-    cv::imshow("Occupancy Grid", enlarged_img);
+    cv::imshow(occupancy_window_name_, enlarged_img);
     cv::waitKey(1);
   }
 
@@ -868,7 +886,7 @@ private:
       }
     }
 
-    cv::imshow("Vector Movement Grid", vector_img);
+    cv::imshow(vector_window_name_, vector_img);
     cv::waitKey(1);
   }
 
@@ -995,6 +1013,13 @@ private:
 
   rclcpp::TimerBase::SharedPtr timer_5hz_;
   rclcpp::TimerBase::SharedPtr timer_2hz_;
+
+  int drone_index_{0};
+  int total_drones_{1};
+  std::string drone_namespace_;
+  std::string grid_name_;
+  std::string occupancy_window_name_;
+  std::string vector_window_name_;
 
   std::mutex mutex_;
   geometry_msgs::msg::Pose::SharedPtr latest_drone_pose_;

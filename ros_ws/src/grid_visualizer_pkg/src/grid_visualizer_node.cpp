@@ -20,6 +20,10 @@
 constexpr double MAP_HALF_WIDTH = 10.0; // Displays 20m x 20m map (from -10m to +10m on X and Y)
 constexpr int GRID_SIZE = 40;          // Grid resolution N x N cells
 constexpr double GRID_CELL_SIZE = (2.0 * MAP_HALF_WIDTH) / GRID_SIZE;
+constexpr int GRID_CENTER_ROW = GRID_SIZE / 2;
+constexpr int GRID_CENTER_COL = GRID_SIZE / 2;
+constexpr double LOCAL_OBJECTIVE_HALF_EXTENT =
+  MAP_HALF_WIDTH - 1.5 * GRID_CELL_SIZE;
 constexpr int RELAXATION_MAX_ITERATIONS = 1000;
 constexpr double RELAXATION_TOLERANCE = 1.0e-8;
 constexpr double SOR_RELAXATION_FACTOR = 1.7;
@@ -31,10 +35,11 @@ constexpr int CONTROL_RECOVERY_SEARCH_RADIUS_CELLS = 8;
 
 // Herding Constants
 const cv::Point2f GOAL_POSITION(10.0f, 10.0f);
-constexpr double COW_EXCLUSION_RADIUS = 2.0;   // meters
-constexpr double PUSH_POINT_MARGIN = 0.2;       // meters
+constexpr double DEFAULT_COW_EXCLUSION_RADIUS = 3.0;  // meters
+constexpr double DEFAULT_PUSH_POINT_MARGIN = 0.2;       // meters
 constexpr double MAX_GOTO_MOVEMENT = 0.5;       // meters
 constexpr double COW_MEMORY_ASSOCIATION_DISTANCE = 3.0;  // meters
+constexpr double FINAL_GOAL_REACHED_RADIUS = 0.5;           // meters
 constexpr const char* DRONE_NAMESPACE_PREFIX = "/simple_drone";
 
 class OccupancyGridVisualizer : public rclcpp::Node
@@ -45,6 +50,18 @@ public:
   {
     drone_index_ = this->declare_parameter<int>("drone_index", 0);
     total_drones_ = this->declare_parameter<int>("total_drones", 1);
+    global_map_min_x_ =
+      this->declare_parameter<double>("global_map_min_x", -50.0);
+    global_map_max_x_ =
+      this->declare_parameter<double>("global_map_max_x", 50.0);
+    global_map_min_y_ =
+      this->declare_parameter<double>("global_map_min_y", -50.0);
+    global_map_max_y_ =
+      this->declare_parameter<double>("global_map_max_y", 50.0);
+    cow_exclusion_radius_ = this->declare_parameter<double>(
+      "cow_exclusion_radius", DEFAULT_COW_EXCLUSION_RADIUS);
+    push_point_margin_ = this->declare_parameter<double>(
+      "push_point_margin", DEFAULT_PUSH_POINT_MARGIN);
 
     if (total_drones_ <= 0) {
       throw std::invalid_argument("total_drones must be greater than zero");
@@ -53,6 +70,33 @@ public:
       throw std::invalid_argument(
         "drone_index must be in the range [0, total_drones)");
     }
+    if (
+      !std::isfinite(global_map_min_x_) ||
+      !std::isfinite(global_map_max_x_) ||
+      !std::isfinite(global_map_min_y_) ||
+      !std::isfinite(global_map_max_y_) ||
+      global_map_min_x_ >= global_map_max_x_ ||
+      global_map_min_y_ >= global_map_max_y_)
+    {
+      throw std::invalid_argument(
+        "global map bounds must be finite and each minimum must be "
+        "smaller than its maximum");
+    }
+
+    if (
+      !std::isfinite(cow_exclusion_radius_) ||
+      cow_exclusion_radius_ <= 0.0 ||
+      !std::isfinite(push_point_margin_) ||
+      push_point_margin_ < 0.0)
+    {
+      throw std::invalid_argument(
+        "cow_exclusion_radius must be positive and push_point_margin "
+        "must be nonnegative");
+    }
+
+    global_map_center_ = cv::Point2f(
+      static_cast<float>((global_map_min_x_ + global_map_max_x_) / 2.0),
+      static_cast<float>((global_map_min_y_ + global_map_max_y_) / 2.0));
 
     drone_namespace_ =
       std::string(DRONE_NAMESPACE_PREFIX) + std::to_string(drone_index_);
@@ -73,6 +117,19 @@ public:
       drone_index_,
       total_drones_,
       drone_namespace_.c_str());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Global map bounds: X=[%.2f, %.2f], Y=[%.2f, %.2f]",
+      global_map_min_x_,
+      global_map_max_x_,
+      global_map_min_y_,
+      global_map_max_y_);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Cow approach distance: %.2f m (exclusion %.2f + margin %.2f)",
+      cow_exclusion_radius_ + push_point_margin_,
+      cow_exclusion_radius_,
+      push_point_margin_);
     RCLCPP_INFO(this->get_logger(), "Drone Pose Sub Topic: %s", drone_gt_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Cows Pose Sub Topic: /cows_pos");
     RCLCPP_INFO(this->get_logger(), "Drone Goto Pub Topic: %s", goto_topic.c_str());
@@ -121,6 +178,13 @@ private:
 
   void drone_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
   {
+    if (
+      !std::isfinite(msg->position.x) ||
+      !std::isfinite(msg->position.y))
+    {
+      return;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     latest_drone_pose_ = msg;
     received_drone_ = true;
@@ -140,8 +204,9 @@ private:
       valid_cows->header = msg->header;
       for (const auto& pose : msg->poses) {
         if (
-          std::isfinite(pose.position.x) &&
-          std::isfinite(pose.position.y))
+          is_inside_global_map(
+            pose.position.x,
+            pose.position.y))
         {
           valid_cows->poses.push_back(pose);
         }
@@ -162,8 +227,9 @@ private:
 
     for (const auto& detected_cow : msg->poses) {
       if (
-        !std::isfinite(detected_cow.position.x) ||
-        !std::isfinite(detected_cow.position.y))
+        !is_inside_global_map(
+          detected_cow.position.x,
+          detected_cow.position.y))
       {
         continue;
       }
@@ -206,30 +272,143 @@ private:
   // HELPER MAPPING FUNCTIONS
   // -------------------------------------------------------------
 
-  static bool map_to_grid(double x, double y, int& row, int& col)
+  static bool local_to_grid(double x, double y, int& row, int& col)
   {
-    if (x < -MAP_HALF_WIDTH || x > MAP_HALF_WIDTH || y < -MAP_HALF_WIDTH || y > MAP_HALF_WIDTH) {
+    if (
+      !std::isfinite(x) ||
+      !std::isfinite(y) ||
+      x < -MAP_HALF_WIDTH ||
+      x > MAP_HALF_WIDTH ||
+      y < -MAP_HALF_WIDTH ||
+      y > MAP_HALF_WIDTH)
+    {
       return false;
     }
-    double norm_x = (x + MAP_HALF_WIDTH) / (2.0 * MAP_HALF_WIDTH);
-    double norm_y = (MAP_HALF_WIDTH - y) / (2.0 * MAP_HALF_WIDTH);
+
+    const double norm_x =
+      (x + MAP_HALF_WIDTH) / (2.0 * MAP_HALF_WIDTH);
+    const double norm_y =
+      (MAP_HALF_WIDTH - y) / (2.0 * MAP_HALF_WIDTH);
 
     col = static_cast<int>(std::floor(norm_x * GRID_SIZE));
     row = static_cast<int>(std::floor(norm_y * GRID_SIZE));
 
-    col = std::max(0, std::min(GRID_SIZE - 1, col));
-    row = std::max(0, std::min(GRID_SIZE - 1, row));
+    col = std::clamp(col, 0, GRID_SIZE - 1);
+    row = std::clamp(row, 0, GRID_SIZE - 1);
     return true;
   }
 
-  static cv::Point2f grid_to_world(int row, int col)
+  static cv::Point2f grid_to_local(int row, int col)
   {
-    float norm_x = (col + 0.5f) / GRID_SIZE;
-    float norm_y = (row + 0.5f) / GRID_SIZE;
+    const float norm_x = (col + 0.5f) / GRID_SIZE;
+    const float norm_y = (row + 0.5f) / GRID_SIZE;
 
-    float x = norm_x * (2.0f * MAP_HALF_WIDTH) - MAP_HALF_WIDTH;
-    float y = MAP_HALF_WIDTH - norm_y * (2.0f * MAP_HALF_WIDTH);
+    const float x =
+      norm_x * (2.0f * MAP_HALF_WIDTH) - MAP_HALF_WIDTH;
+    const float y =
+      MAP_HALF_WIDTH - norm_y * (2.0f * MAP_HALF_WIDTH);
     return cv::Point2f(x, y);
+  }
+
+  static cv::Point2f grid_to_global(
+    int row,
+    int col,
+    const cv::Point2f& grid_center)
+  {
+    return grid_center + grid_to_local(row, col);
+  }
+
+  bool is_inside_global_map(double x, double y) const
+  {
+    return
+      std::isfinite(x) &&
+      std::isfinite(y) &&
+      x >= global_map_min_x_ &&
+      x <= global_map_max_x_ &&
+      y >= global_map_min_y_ &&
+      y <= global_map_max_y_;
+  }
+
+  bool global_to_grid(
+    double global_x,
+    double global_y,
+    const cv::Point2f& grid_center,
+    int& row,
+    int& col) const
+  {
+    return local_to_grid(
+      global_x - grid_center.x,
+      global_y - grid_center.y,
+      row,
+      col);
+  }
+
+  bool clip_target_to_valid_region(
+    const cv::Point2f& grid_center,
+    const cv::Point2f& target,
+    cv::Point2f& clipped_target) const
+  {
+    const double valid_min_x = std::max(
+      static_cast<double>(grid_center.x) - LOCAL_OBJECTIVE_HALF_EXTENT,
+      global_map_min_x_);
+    const double valid_max_x = std::min(
+      static_cast<double>(grid_center.x) + LOCAL_OBJECTIVE_HALF_EXTENT,
+      global_map_max_x_);
+    const double valid_min_y = std::max(
+      static_cast<double>(grid_center.y) - LOCAL_OBJECTIVE_HALF_EXTENT,
+      global_map_min_y_);
+    const double valid_max_y = std::min(
+      static_cast<double>(grid_center.y) + LOCAL_OBJECTIVE_HALF_EXTENT,
+      global_map_max_y_);
+
+    if (
+      valid_min_x > valid_max_x ||
+      valid_min_y > valid_max_y ||
+      grid_center.x < valid_min_x ||
+      grid_center.x > valid_max_x ||
+      grid_center.y < valid_min_y ||
+      grid_center.y > valid_max_y)
+    {
+      return false;
+    }
+
+    const double direction_x = target.x - grid_center.x;
+    const double direction_y = target.y - grid_center.y;
+    if (
+      std::abs(direction_x) <= POTENTIAL_DESCENT_EPSILON &&
+      std::abs(direction_y) <= POTENTIAL_DESCENT_EPSILON)
+    {
+      clipped_target = grid_center;
+      return true;
+    }
+
+    double scale = 1.0;
+    if (direction_x > POTENTIAL_DESCENT_EPSILON) {
+      scale = std::min(
+        scale, (valid_max_x - grid_center.x) / direction_x);
+    } else if (direction_x < -POTENTIAL_DESCENT_EPSILON) {
+      scale = std::min(
+        scale, (valid_min_x - grid_center.x) / direction_x);
+    }
+    if (direction_y > POTENTIAL_DESCENT_EPSILON) {
+      scale = std::min(
+        scale, (valid_max_y - grid_center.y) / direction_y);
+    } else if (direction_y < -POTENTIAL_DESCENT_EPSILON) {
+      scale = std::min(
+        scale, (valid_min_y - grid_center.y) / direction_y);
+    }
+
+    scale = std::clamp(scale, 0.0, 1.0);
+    if (scale <= POTENTIAL_DESCENT_EPSILON) {
+      return false;
+    }
+
+    clipped_target = cv::Point2f(
+      static_cast<float>(grid_center.x + scale * direction_x),
+      static_cast<float>(grid_center.y + scale * direction_y));
+    return
+      std::isfinite(clipped_target.x) &&
+      std::isfinite(clipped_target.y);
   }
 
   static bool find_nearest_free_interior_cell(
@@ -370,6 +549,7 @@ private:
     int drone_col,
     const std::vector<std::vector<cv::Point2f>>& vector_grid,
     const cv::Mat& is_fixed,
+    const cv::Point2f& grid_center,
     cv::Point2f& recovery_direction)
   {
     double best_distance_sq = std::numeric_limits<double>::infinity();
@@ -401,7 +581,8 @@ private:
             continue;
           }
 
-          const cv::Point2f candidate_position = grid_to_world(row, col);
+          const cv::Point2f candidate_position =
+            grid_to_global(row, col, grid_center);
           const double delta_x = candidate_position.x - drone_x;
           const double delta_y = candidate_position.y - drone_y;
           const double distance_sq = delta_x * delta_x + delta_y * delta_y;
@@ -422,7 +603,8 @@ private:
       return false;
     }
 
-    const cv::Point2f recovery_target = grid_to_world(best_row, best_col);
+    const cv::Point2f recovery_target =
+      grid_to_global(best_row, best_col, grid_center);
     const double direction_x = recovery_target.x - drone_x;
     const double direction_y = recovery_target.y - drone_y;
     const double magnitude = std::hypot(direction_x, direction_y);
@@ -444,6 +626,7 @@ private:
   {
     geometry_msgs::msg::Pose::SharedPtr drone_pose;
     geometry_msgs::msg::PoseArray::SharedPtr cows;
+    std::vector<cv::Point2f> remembered_push_points;
     bool has_drone = false;
     bool has_cows = false;
 
@@ -451,106 +634,157 @@ private:
       std::lock_guard<std::mutex> lock(mutex_);
       drone_pose = latest_drone_pose_;
       cows = latest_cows_;
+      remembered_push_points = latest_valid_push_points_global_;
       has_drone = received_drone_;
       has_cows = received_cows_;
     }
 
-    // 1. Compute state grids
-    std::vector<std::vector<CellState>> grid(GRID_SIZE, std::vector<CellState>(GRID_SIZE, EMPTY));
+    if (!has_drone || !drone_pose) {
+      return;
+    }
+
+    const cv::Point2f grid_center(
+      static_cast<float>(drone_pose->position.x),
+      static_cast<float>(drone_pose->position.y));
+
+    std::vector<std::vector<CellState>> grid(
+      GRID_SIZE,
+      std::vector<CellState>(GRID_SIZE, EMPTY));
     cv::Mat potential_grid(
       GRID_SIZE, GRID_SIZE, CV_64F, cv::Scalar(0.5));
     cv::Mat is_fixed(
       GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
     cv::Mat objective_mask(
       GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
-    std::vector<cv::Point2f> push_points;
+    std::vector<cv::Point2f> current_push_points;
+    bool evaluated_at_least_one_cow = false;
 
-    // Circular Cow Exclusion & Pushing Objective Setup
+    // The local perimeter closes the relaxation problem. Cells whose global
+    // centers lie outside the finite map are also unavailable.
+    for (int row = 0; row < GRID_SIZE; ++row) {
+      for (int col = 0; col < GRID_SIZE; ++col) {
+        const cv::Point2f global_cell =
+          grid_to_global(row, col, grid_center);
+        const bool is_local_perimeter =
+          row == 0 ||
+          row == GRID_SIZE - 1 ||
+          col == 0 ||
+          col == GRID_SIZE - 1;
+        if (
+          is_local_perimeter ||
+          !is_inside_global_map(global_cell.x, global_cell.y))
+        {
+          grid[row][col] = EXCLUSION;
+          potential_grid.at<double>(row, col) = 1.0;
+          is_fixed.at<uchar>(row, col) = 1;
+        }
+      }
+    }
+
+    // Cow state remains global. Reproject every cow into this drone's local
+    // moving window instead of shifting or mutating remembered positions.
     if (has_cows && cows) {
       for (const auto& cow_pose : cows->poses) {
         const float cow_x = cow_pose.position.x;
         const float cow_y = cow_pose.position.y;
-        if (!std::isfinite(cow_x) || !std::isfinite(cow_y)) {
+        if (!is_inside_global_map(cow_x, cow_y)) {
           continue;
         }
+        evaluated_at_least_one_cow = true;
 
-        int c_row = 0, c_col = 0;
-        if (map_to_grid(cow_x, cow_y, c_row, c_col)) {
-          grid[c_row][c_col] = COW;
+        int cow_row = 0;
+        int cow_col = 0;
+        if (global_to_grid(
+            cow_x, cow_y, grid_center, cow_row, cow_col))
+        {
+          grid[cow_row][cow_col] = COW;
         }
 
-        // Circular Exclusion Radius (cow_exclusion_radius = 2.0m)
-        for (int r = 0; r < GRID_SIZE; ++r) {
-          for (int c = 0; c < GRID_SIZE; ++c) {
-            cv::Point2f cell_w = grid_to_world(r, c);
-            double dist = std::hypot(cell_w.x - cow_x, cell_w.y - cow_y);
-            if (dist <= COW_EXCLUSION_RADIUS) {
-              if (grid[r][c] != COW) {
-                grid[r][c] = EXCLUSION;
+        // A cow outside the visible window can still affect cells where its
+        // exclusion circle overlaps the window.
+        for (int row = 0; row < GRID_SIZE; ++row) {
+          for (int col = 0; col < GRID_SIZE; ++col) {
+            const cv::Point2f global_cell =
+              grid_to_global(row, col, grid_center);
+            const double distance = std::hypot(
+              global_cell.x - cow_x,
+              global_cell.y - cow_y);
+            if (distance <= cow_exclusion_radius_) {
+              if (grid[row][col] != COW) {
+                grid[row][col] = EXCLUSION;
               }
-              potential_grid.at<double>(r, c) = 1.0;
-              is_fixed.at<uchar>(r, c) = 1;
+              potential_grid.at<double>(row, col) = 1.0;
+              is_fixed.at<uchar>(row, col) = 1;
             }
           }
         }
 
-        // Dynamic Drone Objectives (Pushing Points)
-        cv::Point2f cow_pt(cow_x, cow_y);
-        cv::Point2f dir_to_goal = GOAL_POSITION - cow_pt;
-        float goal_dist = std::sqrt(dir_to_goal.x * dir_to_goal.x + dir_to_goal.y * dir_to_goal.y);
+        const cv::Point2f cow_point(cow_x, cow_y);
+        const cv::Point2f direction_to_goal =
+          GOAL_POSITION - cow_point;
+        const float goal_distance = std::hypot(
+          direction_to_goal.x,
+          direction_to_goal.y);
 
-        if (goal_dist > 1e-4f) {
-          cv::Point2f norm_dir(dir_to_goal.x / goal_dist, dir_to_goal.y / goal_dist);
-          // Push point placed opposite to goal direction
-          cv::Point2f push_pt = cow_pt - norm_dir * (COW_EXCLUSION_RADIUS + PUSH_POINT_MARGIN);
+        // A cow inside the final goal radius no longer needs a behind-cow
+        // push objective. The objective is generated again if it leaves.
+        if (goal_distance > FINAL_GOAL_REACHED_RADIUS) {
+          const cv::Point2f normalized_direction(
+            direction_to_goal.x / goal_distance,
+            direction_to_goal.y / goal_distance);
+          const cv::Point2f global_push_point =
+            cow_point -
+            normalized_direction *
+            (cow_exclusion_radius_ + push_point_margin_);
 
-          if (std::isfinite(push_pt.x) && std::isfinite(push_pt.y)) {
-            push_points.push_back(push_pt);
+          if (
+            std::isfinite(global_push_point.x) &&
+            std::isfinite(global_push_point.y))
+          {
+            current_push_points.push_back(global_push_point);
           }
         }
       }
     }
 
-    // Set drone cell state
-    if (has_drone && drone_pose) {
-      int d_row = 0, d_col = 0;
-      if (map_to_grid(drone_pose->position.x, drone_pose->position.y, d_row, d_col)) {
-        grid[d_row][d_col] = DRONE;
+    const bool all_evaluated_cows_at_goal =
+      evaluated_at_least_one_cow &&
+      current_push_points.empty();
+
+    // A valid remembered cow set is authoritative even when every cow has
+    // reached the goal. Objective memory is used only when no cow can be
+    // evaluated, preventing completion from reviving an old push point.
+    const std::vector<cv::Point2f>& active_push_points =
+      evaluated_at_least_one_cow ?
+      current_push_points :
+      remembered_push_points;
+
+    // Project each global push destination into the intersection of the local
+    // window and finite global map. Ray clipping preserves its direction from
+    // the drone and creates an intermediate edge objective when necessary.
+    for (const auto& global_push_point : active_push_points) {
+      cv::Point2f clipped_push_point;
+      if (!clip_target_to_valid_region(
+          grid_center,
+          global_push_point,
+          clipped_push_point))
+      {
+        continue;
       }
-    }
 
-    // Outer Perimeter boundaries set to 1.0 (fixed)
-    for (int c = 0; c < GRID_SIZE; ++c) {
-      potential_grid.at<double>(0, c) = 1.0;
-      potential_grid.at<double>(GRID_SIZE - 1, c) = 1.0;
-      is_fixed.at<uchar>(0, c) = 1;
-      is_fixed.at<uchar>(GRID_SIZE - 1, c) = 1;
-    }
-    for (int r = 0; r < GRID_SIZE; ++r) {
-      potential_grid.at<double>(r, 0) = 1.0;
-      potential_grid.at<double>(r, GRID_SIZE - 1) = 1.0;
-      is_fixed.at<uchar>(r, 0) = 1;
-      is_fixed.at<uchar>(r, GRID_SIZE - 1) = 1;
-    }
-
-    // Apply objectives after every high-potential boundary has been built.
-    // A blocked or out-of-map objective is moved to the nearest free interior
-    // cell, so a visible objective always remains a real zero-potential sink.
-    for (const auto& push_point : push_points) {
-      const double normalized_x =
-        (push_point.x + MAP_HALF_WIDTH) / (2.0 * MAP_HALF_WIDTH);
-      const double normalized_y =
-        (MAP_HALF_WIDTH - push_point.y) / (2.0 * MAP_HALF_WIDTH);
-      const int desired_col = std::clamp(
-        static_cast<int>(std::floor(
-          std::clamp(normalized_x, 0.0, 1.0) * GRID_SIZE)),
-        1,
-        GRID_SIZE - 2);
-      const int desired_row = std::clamp(
-        static_cast<int>(std::floor(
-          std::clamp(normalized_y, 0.0, 1.0) * GRID_SIZE)),
-        1,
-        GRID_SIZE - 2);
+      int desired_row = -1;
+      int desired_col = -1;
+      if (!global_to_grid(
+          clipped_push_point.x,
+          clipped_push_point.y,
+          grid_center,
+          desired_row,
+          desired_col))
+      {
+        continue;
+      }
+      desired_row = std::clamp(desired_row, 1, GRID_SIZE - 2);
+      desired_col = std::clamp(desired_col, 1, GRID_SIZE - 2);
 
       int objective_row = -1;
       int objective_col = -1;
@@ -783,36 +1017,173 @@ private:
       usable_vector_count > 0 &&
       cv::checkRange(potential_grid);
 
-    // Atomically commit only complete, usable fields. A failed candidate keeps
-    // the last field for both control and visualization.
+    // Commit vectors together with the global center that defined their
+    // coordinate frame. Never reinterpret an old raster at a new center.
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (candidate_field_is_valid) {
+      if (all_evaluated_cows_at_goal) {
         latest_vector_grid_ = vector_grid;
         latest_cell_grid_ = grid;
         latest_is_fixed_grid_ = is_fixed.clone();
         latest_saddle_escape_grid_ = saddle_escape_grid.clone();
+        latest_grid_center_ = grid_center;
+        latest_grid_offset_ = grid_center - global_map_center_;
+        latest_valid_push_points_global_.clear();
+        has_vector_grid_ = false;
+        all_cows_at_goal_ = true;
+        has_last_nonzero_move_direction_ = false;
+      } else if (candidate_field_is_valid) {
+        latest_vector_grid_ = vector_grid;
+        latest_cell_grid_ = grid;
+        latest_is_fixed_grid_ = is_fixed.clone();
+        latest_saddle_escape_grid_ = saddle_escape_grid.clone();
+        latest_grid_center_ = grid_center;
+        latest_grid_offset_ = grid_center - global_map_center_;
+        if (!current_push_points.empty()) {
+          latest_valid_push_points_global_ = current_push_points;
+        }
         has_vector_grid_ = true;
-        has_field_snapshot_ = true;
-      } else if (has_field_snapshot_) {
-        vector_grid = latest_vector_grid_;
-        grid = latest_cell_grid_;
-        is_fixed = latest_is_fixed_grid_.clone();
-        saddle_escape_grid = latest_saddle_escape_grid_.clone();
+        all_cows_at_goal_ = false;
       }
     }
 
-    // Render Displays (Modular Functions)
-    compute_and_display_occupancy_map(grid);
+    // Render this center-aware candidate. Remembered global objectives make
+    // empty detection updates regenerate at the current drone position.
+    compute_and_display_occupancy_map(grid, grid_center);
     compute_and_display_vector_grid(
-      grid, vector_grid, is_fixed, saddle_escape_grid);
+      grid, vector_grid, is_fixed, saddle_escape_grid, grid_center);
+  }
+
+  void draw_final_goal(
+    cv::Mat& image,
+    const cv::Point2f& grid_center) const
+  {
+    const double local_x = GOAL_POSITION.x - grid_center.x;
+    const double local_y = GOAL_POSITION.y - grid_center.y;
+    const bool goal_is_inside_local_grid =
+      local_x >= -MAP_HALF_WIDTH &&
+      local_x <= MAP_HALF_WIDTH &&
+      local_y >= -MAP_HALF_WIDTH &&
+      local_y <= MAP_HALF_WIDTH;
+
+    // A moving local grid cannot show the true position of an off-screen
+    // global goal. Keep a marker on the map edge along the ray toward it so
+    // the final destination remains visible on every drone map.
+    double displayed_local_x = local_x;
+    double displayed_local_y = local_y;
+    if (!goal_is_inside_local_grid) {
+      const double marker_extent = MAP_HALF_WIDTH - GRID_CELL_SIZE;
+      const double x_scale = std::abs(local_x) > marker_extent ?
+        marker_extent / std::abs(local_x) : 1.0;
+      const double y_scale = std::abs(local_y) > marker_extent ?
+        marker_extent / std::abs(local_y) : 1.0;
+      const double ray_scale = std::min(x_scale, y_scale);
+      displayed_local_x *= ray_scale;
+      displayed_local_y *= ray_scale;
+    }
+
+    const int pixel_x = std::clamp(
+      static_cast<int>(std::lround(
+        (displayed_local_x + MAP_HALF_WIDTH) /
+        (2.0 * MAP_HALF_WIDTH) *
+        (image.cols - 1))),
+      0,
+      image.cols - 1);
+    const int pixel_y = std::clamp(
+      static_cast<int>(std::lround(
+        (MAP_HALF_WIDTH - displayed_local_y) /
+        (2.0 * MAP_HALF_WIDTH) *
+        (image.rows - 1))),
+      0,
+      image.rows - 1);
+    const cv::Point center(pixel_x, pixel_y);
+    const int radius = std::max(5, image.cols / 60);
+
+    // Yellow distinguishes the fixed global cow destination from green
+    // behind-cow push objectives.
+    if (!goal_is_inside_local_grid) {
+      const cv::Point image_center(image.cols / 2, image.rows / 2);
+      const cv::Point2f direction(
+        static_cast<float>(center.x - image_center.x),
+        static_cast<float>(center.y - image_center.y));
+      const float direction_length = std::hypot(direction.x, direction.y);
+      if (direction_length > 0.0f) {
+        const cv::Point2f unit_direction = direction / direction_length;
+        const cv::Point arrow_start(
+          cvRound(center.x - unit_direction.x * radius * 2.5f),
+          cvRound(center.y - unit_direction.y * radius * 2.5f));
+        cv::arrowedLine(
+          image,
+          arrow_start,
+          center,
+          cv::Scalar(0, 180, 180),
+          2,
+          cv::LINE_AA,
+          0,
+          0.45);
+      }
+    }
+
+    cv::circle(
+      image,
+      center,
+      radius,
+      cv::Scalar(0, 255, 255),
+      2,
+      cv::LINE_AA);
+    cv::line(
+      image,
+      center - cv::Point(radius, 0),
+      center + cv::Point(radius, 0),
+      cv::Scalar(0, 255, 255),
+      1,
+      cv::LINE_AA);
+    cv::line(
+      image,
+      center - cv::Point(0, radius),
+      center + cv::Point(0, radius),
+      cv::Scalar(0, 255, 255),
+      1,
+      cv::LINE_AA);
+
+    const std::string goal_label = goal_is_inside_local_grid ?
+      "FINAL" :
+      cv::format("FINAL %.1fm", std::hypot(local_x, local_y));
+    const double font_scale = image.cols >= 600 ? 0.45 : 0.35;
+    int text_baseline = 0;
+    const cv::Size text_size = cv::getTextSize(
+      goal_label,
+      cv::FONT_HERSHEY_SIMPLEX,
+      font_scale,
+      1,
+      &text_baseline);
+    const cv::Point label_origin(
+      std::clamp(
+        center.x + radius + 3,
+        2,
+        std::max(2, image.cols - text_size.width - 2)),
+      std::clamp(
+        center.y - radius - 2,
+        text_size.height + 2,
+        std::max(text_size.height + 2, image.rows - text_baseline - 2)));
+    cv::putText(
+      image,
+      goal_label,
+      label_origin,
+      cv::FONT_HERSHEY_SIMPLEX,
+      font_scale,
+      cv::Scalar(0, 160, 160),
+      1,
+      cv::LINE_AA);
   }
 
   // -------------------------------------------------------------
   // MODULAR FUNCTION 1: OCCUPANCY GRID RENDERING
   // -------------------------------------------------------------
 
-  void compute_and_display_occupancy_map(const std::vector<std::vector<CellState>>& grid)
+  void compute_and_display_occupancy_map(
+    const std::vector<std::vector<CellState>>& grid,
+    const cv::Point2f& grid_center)
   {
     cv::Mat display_img(GRID_SIZE, GRID_SIZE, CV_8UC3, cv::Scalar(255, 255, 255));
     for (int r = 0; r < GRID_SIZE; ++r) {
@@ -830,7 +1201,41 @@ private:
     }
 
     cv::Mat enlarged_img;
-    cv::resize(display_img, enlarged_img, cv::Size(400, 400), 0, 0, cv::INTER_NEAREST);
+    cv::resize(
+      display_img,
+      enlarged_img,
+      cv::Size(400, 400),
+      0,
+      0,
+      cv::INTER_NEAREST);
+
+    draw_final_goal(enlarged_img, grid_center);
+
+    // GRID_SIZE is even, so draw the drone at the exact geometric center
+    // instead of offsetting it into one of the four central cells.
+    cv::circle(
+      enlarged_img,
+      cv::Point(enlarged_img.cols / 2, enlarged_img.rows / 2),
+      6,
+      cv::Scalar(255, 0, 0),
+      cv::FILLED,
+      cv::LINE_AA);
+    const cv::Point2f global_offset = grid_center - global_map_center_;
+    cv::putText(
+      enlarged_img,
+      cv::format(
+        "global=(%.1f, %.1f) offset=(%.1f, %.1f)",
+        grid_center.x,
+        grid_center.y,
+        global_offset.x,
+        global_offset.y),
+      cv::Point(8, 18),
+      cv::FONT_HERSHEY_SIMPLEX,
+      0.4,
+      cv::Scalar(0, 0, 0),
+      1,
+      cv::LINE_AA);
+
     cv::imshow(occupancy_window_name_, enlarged_img);
     cv::waitKey(1);
   }
@@ -843,7 +1248,8 @@ private:
     const std::vector<std::vector<CellState>>& grid,
     const std::vector<std::vector<cv::Point2f>>& vector_grid,
     const cv::Mat& is_fixed,
-    const cv::Mat& saddle_escape_grid)
+    const cv::Mat& saddle_escape_grid,
+    const cv::Point2f& grid_center)
   {
     const int CANVAS_SIZE = 600;
     const float cell_size = static_cast<float>(CANVAS_SIZE) / GRID_SIZE;
@@ -886,6 +1292,31 @@ private:
       }
     }
 
+    draw_final_goal(vector_img, grid_center);
+
+    cv::circle(
+      vector_img,
+      cv::Point(vector_img.cols / 2, vector_img.rows / 2),
+      7,
+      cv::Scalar(255, 0, 0),
+      cv::FILLED,
+      cv::LINE_AA);
+    const cv::Point2f global_offset = grid_center - global_map_center_;
+    cv::putText(
+      vector_img,
+      cv::format(
+        "global=(%.1f, %.1f) offset=(%.1f, %.1f)",
+        grid_center.x,
+        grid_center.y,
+        global_offset.x,
+        global_offset.y),
+      cv::Point(8, 18),
+      cv::FONT_HERSHEY_SIMPLEX,
+      0.45,
+      cv::Scalar(0, 0, 0),
+      1,
+      cv::LINE_AA);
+
     cv::imshow(vector_window_name_, vector_img);
     cv::waitKey(1);
   }
@@ -901,11 +1332,13 @@ private:
     std::vector<std::vector<cv::Point2f>> vector_grid;
     std::vector<std::vector<CellState>> cell_grid;
     cv::Mat is_fixed_grid;
+    cv::Point2f grid_center;
     cv::Point2f last_move_direction;
     bool has_drone = false;
     bool has_cows = false;
     bool has_grid = false;
     bool has_last_move_direction = false;
+    bool all_cows_at_goal = false;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -914,11 +1347,13 @@ private:
       vector_grid = latest_vector_grid_;
       cell_grid = latest_cell_grid_;
       is_fixed_grid = latest_is_fixed_grid_.clone();
+      grid_center = latest_grid_center_;
       last_move_direction = last_nonzero_move_direction_;
       has_drone = received_drone_;
       has_cows = received_cows_;
       has_grid = has_vector_grid_;
       has_last_move_direction = has_last_nonzero_move_direction_;
+      all_cows_at_goal = all_cows_at_goal_;
     }
 
     if (!has_drone || !drone_pose) {
@@ -928,62 +1363,94 @@ private:
     double drone_x = drone_pose->position.x;
     double drone_y = drone_pose->position.y;
 
-    // 1. Goto Calculation
-    if (has_grid) {
-      int d_row = 0, d_col = 0;
-      if (map_to_grid(drone_x, drone_y, d_row, d_col)) {
-        cv::Point2f vec = vector_grid[d_row][d_col];
-        float mag = std::sqrt(vec.x * vec.x + vec.y * vec.y);
+    // 1. Goto Calculation. Hold position once every remembered cow is
+    // inside the final goal radius; movement resumes if any cow leaves.
+    if (all_cows_at_goal) {
+      geometry_msgs::msg::Pose hold_msg = *drone_pose;
+      goto_pub_->publish(hold_msg);
+    } else if (
+      has_grid &&
+      vector_grid.size() == GRID_SIZE &&
+      vector_grid[GRID_CENTER_ROW].size() == GRID_SIZE)
+    {
+      const int drone_row = GRID_CENTER_ROW;
+      const int drone_col = GRID_CENTER_COL;
+      cv::Point2f vector = vector_grid[drone_row][drone_col];
+      float magnitude = std::hypot(vector.x, vector.y);
 
-        const bool is_push_objective =
-          !cell_grid.empty() &&
-          cell_grid[d_row][d_col] == PUSH_OBJECTIVE;
+      const double bounded_x =
+        std::clamp(drone_x, global_map_min_x_, global_map_max_x_);
+      const double bounded_y =
+        std::clamp(drone_y, global_map_min_y_, global_map_max_y_);
+      const cv::Point2f boundary_recovery(
+        static_cast<float>(bounded_x - drone_x),
+        static_cast<float>(bounded_y - drone_y));
+      const float boundary_recovery_magnitude =
+        std::hypot(boundary_recovery.x, boundary_recovery.y);
+      if (boundary_recovery_magnitude > 1.0e-6f) {
+        vector = boundary_recovery / boundary_recovery_magnitude;
+        magnitude = 1.0f;
+      }
 
-        if (mag <= 0.5f && !is_push_objective) {
-          cv::Point2f recovery_direction;
-          if (
-            !is_fixed_grid.empty() &&
-            find_local_recovery_direction(
-              drone_x,
-              drone_y,
-              d_row,
-              d_col,
-              vector_grid,
-              is_fixed_grid,
-              recovery_direction))
-          {
-            vec = recovery_direction;
-            mag = 1.0f;
-          } else if (has_last_move_direction) {
-            vec = last_move_direction;
-            mag = std::hypot(vec.x, vec.y);
-          }
+      const bool is_push_objective =
+        !cell_grid.empty() &&
+        cell_grid[drone_row][drone_col] == PUSH_OBJECTIVE;
+
+      if (magnitude <= 0.5f && !is_push_objective) {
+        cv::Point2f recovery_direction;
+        if (
+          !is_fixed_grid.empty() &&
+          find_local_recovery_direction(
+            drone_x,
+            drone_y,
+            drone_row,
+            drone_col,
+            vector_grid,
+            is_fixed_grid,
+            grid_center,
+            recovery_direction))
+        {
+          vector = recovery_direction;
+          magnitude = 1.0f;
+        } else if (has_last_move_direction) {
+          vector = last_move_direction;
+          magnitude = std::hypot(vector.x, vector.y);
         }
+      }
 
-        cv::Point2f move_vec(0.0f, 0.0f);
-        if (mag > 0.5f) {
-          // The grid stores either a unit direction or zero, so every valid
-          // direction produces the same fixed waypoint displacement.
-          move_vec = cv::Point2f((vec.x / mag) * static_cast<float>(MAX_GOTO_MOVEMENT),
-                                 (vec.y / mag) * static_cast<float>(MAX_GOTO_MOVEMENT));
-          {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_nonzero_move_direction_ = cv::Point2f(
-              vec.x / mag, vec.y / mag);
-            has_last_nonzero_move_direction_ = true;
-          }
-        } else if (!is_push_objective) {
-          // Keep the previous nonzero waypoint active rather than replacing it
-          // with an accidental command to hold the current position.
-          return;
+      cv::Point2f movement(0.0f, 0.0f);
+      bool publish_goto = true;
+      if (magnitude > 0.5f) {
+        movement = cv::Point2f(
+          (vector.x / magnitude) *
+            static_cast<float>(MAX_GOTO_MOVEMENT),
+          (vector.y / magnitude) *
+            static_cast<float>(MAX_GOTO_MOVEMENT));
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          last_nonzero_move_direction_ = cv::Point2f(
+            vector.x / magnitude,
+            vector.y / magnitude);
+          has_last_nonzero_move_direction_ = true;
         }
+      } else if (!is_push_objective) {
+        // Preserve the previously active nonzero waypoint instead of
+        // publishing an accidental hold command.
+        publish_goto = false;
+      }
 
+      if (publish_goto) {
         geometry_msgs::msg::Pose goto_msg;
-        goto_msg.position.x = drone_x + move_vec.x;
-        goto_msg.position.y = drone_y + move_vec.y;
+        goto_msg.position.x = std::clamp(
+          drone_x + movement.x,
+          global_map_min_x_,
+          global_map_max_x_);
+        goto_msg.position.y = std::clamp(
+          drone_y + movement.y,
+          global_map_min_y_,
+          global_map_max_y_);
         goto_msg.position.z = drone_pose->position.z;
         goto_msg.orientation = drone_pose->orientation;
-
         goto_pub_->publish(goto_msg);
       }
     }
@@ -1016,6 +1483,16 @@ private:
 
   int drone_index_{0};
   int total_drones_{1};
+  double global_map_min_x_{-50.0};
+  double global_map_max_x_{50.0};
+  double global_map_min_y_{-50.0};
+  double global_map_max_y_{50.0};
+  double cow_exclusion_radius_{DEFAULT_COW_EXCLUSION_RADIUS};
+  double push_point_margin_{DEFAULT_PUSH_POINT_MARGIN};
+  cv::Point2f global_map_center_{0.0f, 0.0f};
+  cv::Point2f latest_grid_center_{0.0f, 0.0f};
+  cv::Point2f latest_grid_offset_{0.0f, 0.0f};
+  std::vector<cv::Point2f> latest_valid_push_points_global_;
   std::string drone_namespace_;
   std::string grid_name_;
   std::string occupancy_window_name_;
@@ -1032,8 +1509,8 @@ private:
   bool received_drone_{false};
   bool received_cows_{false};
   bool has_vector_grid_{false};
-  bool has_field_snapshot_{false};
   bool has_last_nonzero_move_direction_{false};
+  bool all_cows_at_goal_{false};
 };
 
 int main(int argc, char ** argv)

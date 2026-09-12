@@ -16,6 +16,7 @@ from yolo_pkg.cow_tracker import CowTrackerManager
 
 
 ENABLE_REALTIME_TRACK_PLOT = True
+ENABLE_ANNOTATED_CAMERA_VIEW = True
 PLOT_HISTORY_MS = 10000
 PLOT_POSITION_GRID_METERS = 1.0
 PLOT_MAP_X_LIMITS = (-10.0, 10.0)
@@ -297,6 +298,18 @@ class YoloCowSubscriber(Node):
         self.expected_camera_names = set()
         self.pending_detection_batches = {}
         self.pending_batch_start_timestamp = None
+        self.show_annotated_camera = bool(
+            self.declare_parameter(
+                'show_annotated_camera',
+                ENABLE_ANNOTATED_CAMERA_VIEW,
+            ).value
+        )
+        camera_view_state = (
+            'enabled' if self.show_annotated_camera else 'disabled'
+        )
+        self.get_logger().info(
+            f'Annotated YOLO camera view is {camera_view_state}'
+        )
 
         for i in range(number_of_drones):
             name = self.namespace + str(i)
@@ -359,6 +372,9 @@ class YoloCowSubscriber(Node):
             verbose=False,
         )
         detections = results[0].boxes
+        annotated_frame = (
+            frame.copy() if self.show_annotated_camera else None
+        )
 
         drone_x, drone_y, drone_yaw = drone_state
 
@@ -394,6 +410,30 @@ class YoloCowSubscriber(Node):
             cow_x = drone_x + math.cos(world_bearing) * full_distance
             cow_y = drone_y + math.sin(world_bearing) * full_distance
             global_measurements.append((cow_x, cow_y))
+
+            if annotated_frame is not None:
+                confidence = float(box.conf[0])
+                cv2.rectangle(
+                    annotated_frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 0),
+                    2,
+                )
+                cv2.putText(
+                    annotated_frame,
+                    f'{label} {confidence:.2f} {full_distance:.2f}m',
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+        if annotated_frame is not None:
+            cv2.imshow(f'{name} - YOLO cow detection', annotated_frame)
+            cv2.waitKey(1)
 
         if self.pending_batch_start_timestamp is None:
             self.pending_batch_start_timestamp = timestamp

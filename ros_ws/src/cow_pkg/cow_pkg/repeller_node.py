@@ -36,7 +36,24 @@ class PeopleRepeller(Node):
         self.cows_dict = None
         self.last_cows_dict = None
 
-        self.threshold = 5.0  # distancia limite para repelir
+        self.drone_sensing_radius = float(
+            self.declare_parameter(
+                'drone_sensing_radius', 6.0).value)
+        self.drone_approach_radius = float(
+            self.declare_parameter(
+                'drone_approach_radius', 3.0).value)
+        self.push_point_margin = float(
+            self.declare_parameter(
+                'push_point_margin', 0.2).value)
+        minimum_sensing_radius = (
+            self.drone_approach_radius + self.push_point_margin)
+        if self.drone_sensing_radius <= minimum_sensing_radius:
+            raise ValueError(
+                'drone_sensing_radius must be greater than the complete '
+                'drone approach distance')
+        self.get_logger().info(
+            f'Cow drone sensing radius={self.drone_sensing_radius:.2f} m; '
+            f'drone approach distance={minimum_sensing_radius:.2f} m')
 
         self.publishers_dict = {}
         for i in range(number_of_cows):
@@ -72,8 +89,8 @@ class PeopleRepeller(Node):
         if self.cows_dict is None or len(self.publishers_dict.keys()) == 0:
             return
 
-        drone_threshold = 5.0   # metres - repulsion radius from drones
-        cow_threshold   = 1.0   # metres - repulsion radius from other cows
+        drone_threshold = self.drone_sensing_radius
+        cow_threshold = 1.0  # metres - repulsion radius from other cows
 
         for key, value in self.cows_dict.items():
             if value is None:
@@ -95,7 +112,7 @@ class PeopleRepeller(Node):
                 dx = px - drone_pose.position.x
                 dy = py - drone_pose.position.y
                 dist = math.sqrt(dx * dx + dy * dy)
-                if 0.0 < dist < drone_threshold:
+                if 0.0 < dist <= drone_threshold:
                     # APF: force magnitude = 1/d²  (points away from drone)
                     magnitude = 1.0 / (dist * dist)
                     fx += magnitude * (dx / dist)

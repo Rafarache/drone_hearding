@@ -78,6 +78,24 @@ def cow_launch_description(context, *args, **kwargs):
     name_default = "cow"
     number_of_cows = LaunchConfiguration('number_of_cows').perform(context)
     number_of_drones = LaunchConfiguration('number_of_drones').perform(context)
+    drone_approach_radius = float(
+        LaunchConfiguration('drone_approach_radius').perform(context))
+    push_point_margin = float(
+        LaunchConfiguration('push_point_margin').perform(context))
+    cow_drone_sensing_radius = float(
+        LaunchConfiguration('cow_drone_sensing_radius').perform(context))
+    show_yolo_camera_value = (
+        LaunchConfiguration('show_yolo_camera').perform(context)
+        .strip().lower()
+    )
+    if show_yolo_camera_value not in {'true', 'false'}:
+        raise ValueError('show_yolo_camera must be true or false')
+    show_yolo_camera = show_yolo_camera_value == 'true'
+    if cow_drone_sensing_radius <= (
+            drone_approach_radius + push_point_margin):
+        raise ValueError(
+            'cow_drone_sensing_radius must be greater than '
+            'drone_approach_radius + push_point_margin')
     model_ns = "/simple_drone"
     array = []
 
@@ -118,6 +136,11 @@ def cow_launch_description(context, *args, **kwargs):
             executable="repeller",
             arguments=[model_ns, number_of_drones, number_of_cows],
             name='cow_pkg',
+            parameters=[{
+                'drone_sensing_radius': cow_drone_sensing_radius,
+                'drone_approach_radius': drone_approach_radius,
+                'push_point_margin': push_point_margin,
+            }],
             output="screen"
         ),
     )
@@ -128,6 +151,9 @@ def cow_launch_description(context, *args, **kwargs):
             executable="yolo_subscriber",
             arguments=[model_ns, number_of_drones],
             name='yolo_pkg',
+            parameters=[{
+                'show_annotated_camera': show_yolo_camera,
+            }],
             output="screen"
         ),
     )
@@ -150,6 +176,18 @@ def drone_launch_description(context, *args, **kwargs):
     sjtu_drone_bringup_path = get_package_share_directory('sjtu_drone_bringup')
 
     number_of_drones = LaunchConfiguration('number_of_drones').perform(context)
+    global_map_min_x = float(
+        LaunchConfiguration('global_map_min_x').perform(context))
+    global_map_max_x = float(
+        LaunchConfiguration('global_map_max_x').perform(context))
+    global_map_min_y = float(
+        LaunchConfiguration('global_map_min_y').perform(context))
+    global_map_max_y = float(
+        LaunchConfiguration('global_map_max_y').perform(context))
+    drone_approach_radius = float(
+        LaunchConfiguration('drone_approach_radius').perform(context))
+    push_point_margin = float(
+        LaunchConfiguration('push_point_margin').perform(context))
 
     cow_pos = [
         [3,5],
@@ -193,6 +231,12 @@ def drone_launch_description(context, *args, **kwargs):
                 parameters=[{
                     "drone_index": i,
                     "total_drones": int(number_of_drones),
+                    "global_map_min_x": global_map_min_x,
+                    "global_map_max_x": global_map_max_x,
+                    "global_map_min_y": global_map_min_y,
+                    "global_map_max_y": global_map_max_y,
+                    "cow_exclusion_radius": drone_approach_radius,
+                    "push_point_margin": push_point_margin,
                 }],
                 output="screen",
             )
@@ -243,6 +287,55 @@ def generate_launch_description():
         description='Number of drones argument'
     )
 
+    global_map_bound_args = [
+        DeclareLaunchArgument(
+            'global_map_min_x',
+            default_value='-50.0',
+            description='Minimum global map X coordinate'
+        ),
+        DeclareLaunchArgument(
+            'global_map_max_x',
+            default_value='50.0',
+            description='Maximum global map X coordinate'
+        ),
+        DeclareLaunchArgument(
+            'global_map_min_y',
+            default_value='-50.0',
+            description='Minimum global map Y coordinate'
+        ),
+        DeclareLaunchArgument(
+            'global_map_max_y',
+            default_value='50.0',
+            description='Maximum global map Y coordinate'
+        ),
+    ]
+
+    herding_radius_args = [
+        DeclareLaunchArgument(
+            'drone_approach_radius',
+            default_value='3.0',
+            description='Minimum drone distance from a cow in metres'
+        ),
+        DeclareLaunchArgument(
+            'push_point_margin',
+            default_value='0.2',
+            description='Extra distance behind each cow push point'
+        ),
+        DeclareLaunchArgument(
+            'cow_drone_sensing_radius',
+            default_value='6.0',
+            description='Distance at which cows react to drones in metres'
+        ),
+    ]
+
+    yolo_visualization_args = [
+        DeclareLaunchArgument(
+            'show_yolo_camera',
+            default_value='true',
+            description='Show annotated cow detections from each drone camera'
+        ),
+    ]
+
     cow_launch_function_action = OpaqueFunction(function=cow_launch_description)
 
     drone_launch_function_action = OpaqueFunction(function=drone_launch_description)
@@ -267,6 +360,9 @@ def generate_launch_description():
 
         declare_number__cows_arg,
         declare_number_drones_arg,
+        *global_map_bound_args,
+        *herding_radius_args,
+        *yolo_visualization_args,
         cow_launch_function_action,
         drone_launch_function_action,
 

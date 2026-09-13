@@ -91,6 +91,14 @@ def cow_launch_description(context, *args, **kwargs):
     if show_yolo_camera_value not in {'true', 'false'}:
         raise ValueError('show_yolo_camera must be true or false')
     show_yolo_camera = show_yolo_camera_value == 'true'
+    camera_horizontal_fov_rad = float(
+        LaunchConfiguration('camera_horizontal_fov_rad').perform(context))
+    tracker_reacquisition_distance = float(
+        LaunchConfiguration(
+            'tracker_reacquisition_distance').perform(context))
+    tracker_reacquisition_mahalanobis_gate = float(
+        LaunchConfiguration(
+            'tracker_reacquisition_mahalanobis_gate').perform(context))
     if cow_drone_sensing_radius <= (
             drone_approach_radius + push_point_margin):
         raise ValueError(
@@ -153,6 +161,13 @@ def cow_launch_description(context, *args, **kwargs):
             name='yolo_pkg',
             parameters=[{
                 'show_annotated_camera': show_yolo_camera,
+                'camera_horizontal_fov_rad': camera_horizontal_fov_rad,
+                'tracker_reacquisition_distance': (
+                    tracker_reacquisition_distance
+                ),
+                'tracker_reacquisition_mahalanobis_gate': (
+                    tracker_reacquisition_mahalanobis_gate
+                ),
             }],
             output="screen"
         ),
@@ -188,6 +203,15 @@ def drone_launch_description(context, *args, **kwargs):
         LaunchConfiguration('drone_approach_radius').perform(context))
     push_point_margin = float(
         LaunchConfiguration('push_point_margin').perform(context))
+    max_near_goal_objective_potential = float(
+        LaunchConfiguration(
+            'max_near_goal_objective_potential').perform(context))
+    objective_priority_min_spread = float(
+        LaunchConfiguration(
+            'objective_priority_min_spread').perform(context))
+    objective_priority_fallback_bias_m = float(
+        LaunchConfiguration(
+            'objective_priority_fallback_bias_m').perform(context))
 
     cow_pos = [
         [3,5],
@@ -237,6 +261,12 @@ def drone_launch_description(context, *args, **kwargs):
                     "global_map_max_y": global_map_max_y,
                     "cow_exclusion_radius": drone_approach_radius,
                     "push_point_margin": push_point_margin,
+                    "max_near_goal_objective_potential":
+                        max_near_goal_objective_potential,
+                    "objective_priority_min_spread":
+                        objective_priority_min_spread,
+                    "objective_priority_fallback_bias_m":
+                        objective_priority_fallback_bias_m,
                 }],
                 output="screen",
             )
@@ -328,11 +358,62 @@ def generate_launch_description():
         ),
     ]
 
+    objective_priority_args = [
+        DeclareLaunchArgument(
+            'max_near_goal_objective_potential',
+            default_value='0.5',
+            description=(
+                'Maximum relaxation potential assigned to the nearest '
+                'active cow objective'
+            )
+        ),
+        DeclareLaunchArgument(
+            'objective_priority_min_spread',
+            default_value='1.0',
+            description=(
+                'Minimum cow-to-goal distance spread used to normalize '
+                'objective priority in metres'
+            )
+        ),
+        DeclareLaunchArgument(
+            'objective_priority_fallback_bias_m',
+            default_value='10.0',
+            description=(
+                'Maximum geodesic fallback penalty for a low-priority '
+                'cow objective in metres'
+            )
+        ),
+    ]
+
     yolo_visualization_args = [
         DeclareLaunchArgument(
             'show_yolo_camera',
             default_value='true',
             description='Show annotated cow detections from each drone camera'
+        ),
+        DeclareLaunchArgument(
+            'camera_horizontal_fov_rad',
+            default_value='2.09',
+            description=(
+                'Horizontal field of view used to decide whether a missing '
+                'cow should count as a tracker miss'
+            )
+        ),
+        DeclareLaunchArgument(
+            'tracker_reacquisition_distance',
+            default_value='5.0',
+            description=(
+                'Maximum Euclidean distance for reacquiring a confirmed '
+                'cow track in metres'
+            )
+        ),
+        DeclareLaunchArgument(
+            'tracker_reacquisition_mahalanobis_gate',
+            default_value='16.0',
+            description=(
+                'Squared Mahalanobis gate used to reacquire a confirmed '
+                'cow track'
+            )
         ),
     ]
 
@@ -362,6 +443,7 @@ def generate_launch_description():
         declare_number_drones_arg,
         *global_map_bound_args,
         *herding_radius_args,
+        *objective_priority_args,
         *yolo_visualization_args,
         cow_launch_function_action,
         drone_launch_function_action,

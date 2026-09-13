@@ -37,9 +37,11 @@ constexpr int CONTROL_RECOVERY_SEARCH_RADIUS_CELLS = 8;
 const cv::Point2f GOAL_POSITION(10.0f, 10.0f);
 constexpr double DEFAULT_COW_EXCLUSION_RADIUS = 3.0;  // meters
 constexpr double DEFAULT_PUSH_POINT_MARGIN = 0.2;       // meters
+constexpr double DEFAULT_MAX_NEAR_GOAL_OBJECTIVE_POTENTIAL = 0.5;
+constexpr double DEFAULT_OBJECTIVE_PRIORITY_MIN_SPREAD = 1.0;  // meters
+constexpr double DEFAULT_OBJECTIVE_PRIORITY_FALLBACK_BIAS = 10.0;  // meters
 constexpr double MAX_GOTO_MOVEMENT = 0.5;       // meters
-constexpr double COW_MEMORY_ASSOCIATION_DISTANCE = 3.0;  // meters
-constexpr double FINAL_GOAL_REACHED_RADIUS = 0.5;           // meters
+constexpr double FINAL_GOAL_REACHED_RADIUS = 2.0;           // meters
 constexpr const char* DRONE_NAMESPACE_PREFIX = "/simple_drone";
 
 class OccupancyGridVisualizer : public rclcpp::Node
@@ -62,6 +64,15 @@ public:
       "cow_exclusion_radius", DEFAULT_COW_EXCLUSION_RADIUS);
     push_point_margin_ = this->declare_parameter<double>(
       "push_point_margin", DEFAULT_PUSH_POINT_MARGIN);
+    max_near_goal_objective_potential_ = this->declare_parameter<double>(
+      "max_near_goal_objective_potential",
+      DEFAULT_MAX_NEAR_GOAL_OBJECTIVE_POTENTIAL);
+    objective_priority_min_spread_ = this->declare_parameter<double>(
+      "objective_priority_min_spread",
+      DEFAULT_OBJECTIVE_PRIORITY_MIN_SPREAD);
+    objective_priority_fallback_bias_m_ = this->declare_parameter<double>(
+      "objective_priority_fallback_bias_m",
+      DEFAULT_OBJECTIVE_PRIORITY_FALLBACK_BIAS);
 
     if (total_drones_ <= 0) {
       throw std::invalid_argument("total_drones must be greater than zero");
@@ -92,6 +103,21 @@ public:
       throw std::invalid_argument(
         "cow_exclusion_radius must be positive and push_point_margin "
         "must be nonnegative");
+    }
+
+    if (
+      !std::isfinite(max_near_goal_objective_potential_) ||
+      max_near_goal_objective_potential_ < 0.0 ||
+      max_near_goal_objective_potential_ >= 1.0 ||
+      !std::isfinite(objective_priority_min_spread_) ||
+      objective_priority_min_spread_ <= 0.0 ||
+      !std::isfinite(objective_priority_fallback_bias_m_) ||
+      objective_priority_fallback_bias_m_ < 0.0)
+    {
+      throw std::invalid_argument(
+        "max_near_goal_objective_potential must be in [0, 1), "
+        "objective_priority_min_spread must be positive, and "
+        "objective_priority_fallback_bias_m must be nonnegative");
     }
 
     global_map_center_ = cv::Point2f(
@@ -130,6 +156,13 @@ public:
       cow_exclusion_radius_ + push_point_margin_,
       cow_exclusion_radius_,
       push_point_margin_);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Cow objective priority: max potential %.2f, minimum spread %.2f m, "
+      "fallback bias %.2f m",
+      max_near_goal_objective_potential_,
+      objective_priority_min_spread_,
+      objective_priority_fallback_bias_m_);
     RCLCPP_INFO(this->get_logger(), "Drone Pose Sub Topic: %s", drone_gt_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Cows Pose Sub Topic: /cows_pos");
     RCLCPP_INFO(this->get_logger(), "Drone Goto Pub Topic: %s", goto_topic.c_str());
@@ -176,6 +209,13 @@ private:
     PUSH_OBJECTIVE = 4
   };
 
+  struct PushObjective
+  {
+    cv::Point2f global_point;
+    double cow_goal_distance{0.0};
+    double boundary_potential{0.0};
+  };
+
   void drone_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
   {
     if (
@@ -190,81 +230,26 @@ private:
     received_drone_ = true;
   }
 
-  void cow_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
+  void cow_callback(
+    const geometry_msgs::msg::PoseArray::SharedPtr msg)
   {
-    // Empty and partial detections must not erase remembered APF objectives.
-    if (msg->poses.empty()) {
-      return;
-    }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!received_cows_ || !latest_cows_) {
-      auto valid_cows =
-        std::make_shared<geometry_msgs::msg::PoseArray>();
-      valid_cows->header = msg->header;
-      for (const auto& pose : msg->poses) {
-        if (
-          is_inside_global_map(
-            pose.position.x,
-            pose.position.y))
-        {
-          valid_cows->poses.push_back(pose);
-        }
-      }
-      if (valid_cows->poses.empty()) {
-        return;
-      }
-      latest_cows_ = valid_cows;
-      received_cows_ = true;
-      return;
-    }
-
-    auto merged_cows =
-      std::make_shared<geometry_msgs::msg::PoseArray>(*latest_cows_);
-    merged_cows->header = msg->header;
-    std::vector<bool> remembered_cow_updated(
-      merged_cows->poses.size(), false);
-
-    for (const auto& detected_cow : msg->poses) {
+    // Every tracker message is an authoritative snapshot. An empty array
+    // clears retired tracks; if messages stop entirely, latest_cows_ remains
+    // unchanged and the previous map continues to drive the drone.
+    auto valid_cows =
+      std::make_shared<geometry_msgs::msg::PoseArray>();
+    valid_cows->header = msg->header;
+    for (const auto& pose : msg->poses) {
       if (
-        !is_inside_global_map(
-          detected_cow.position.x,
-          detected_cow.position.y))
+        is_inside_global_map(
+          pose.position.x,
+          pose.position.y))
       {
-        continue;
-      }
-
-      double nearest_distance =
-        COW_MEMORY_ASSOCIATION_DISTANCE;
-      int nearest_index = -1;
-      for (std::size_t index = 0;
-        index < merged_cows->poses.size();
-        ++index)
-      {
-        if (remembered_cow_updated[index]) {
-          continue;
-        }
-
-        const auto& remembered_cow = merged_cows->poses[index];
-        const double distance = std::hypot(
-          detected_cow.position.x - remembered_cow.position.x,
-          detected_cow.position.y - remembered_cow.position.y);
-        if (distance <= nearest_distance) {
-          nearest_distance = distance;
-          nearest_index = static_cast<int>(index);
-        }
-      }
-
-      if (nearest_index >= 0) {
-        merged_cows->poses[nearest_index] = detected_cow;
-        remembered_cow_updated[nearest_index] = true;
-      } else {
-        merged_cows->poses.push_back(detected_cow);
-        remembered_cow_updated.push_back(true);
+        valid_cows->poses.push_back(pose);
       }
     }
-
-    latest_cows_ = merged_cows;
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_cows_ = valid_cows;
     received_cows_ = true;
   }
 
@@ -453,7 +438,8 @@ private:
 
   static cv::Mat compute_goal_distance_grid(
     const cv::Mat& is_fixed,
-    const cv::Mat& objective_mask)
+    const cv::Mat& objective_mask,
+    const cv::Mat& objective_source_cost)
   {
     using QueueEntry = std::tuple<double, int, int>;
     std::priority_queue<
@@ -472,8 +458,10 @@ private:
         if (objective_mask.at<uchar>(r, c) == 0) {
           continue;
         }
-        distance_grid.at<double>(r, c) = 0.0;
-        open_cells.emplace(0.0, r, c);
+        const double source_cost =
+          objective_source_cost.at<double>(r, c);
+        distance_grid.at<double>(r, c) = source_cost;
+        open_cells.emplace(source_cost, r, c);
       }
     }
 
@@ -626,7 +614,7 @@ private:
   {
     geometry_msgs::msg::Pose::SharedPtr drone_pose;
     geometry_msgs::msg::PoseArray::SharedPtr cows;
-    std::vector<cv::Point2f> remembered_push_points;
+    std::vector<PushObjective> remembered_push_objectives;
     bool has_drone = false;
     bool has_cows = false;
 
@@ -634,7 +622,7 @@ private:
       std::lock_guard<std::mutex> lock(mutex_);
       drone_pose = latest_drone_pose_;
       cows = latest_cows_;
-      remembered_push_points = latest_valid_push_points_global_;
+      remembered_push_objectives = latest_valid_push_objectives_;
       has_drone = received_drone_;
       has_cows = received_cows_;
     }
@@ -656,7 +644,9 @@ private:
       GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
     cv::Mat objective_mask(
       GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
-    std::vector<cv::Point2f> current_push_points;
+    cv::Mat objective_source_cost(
+      GRID_SIZE, GRID_SIZE, CV_64F, cv::Scalar(0.0));
+    std::vector<PushObjective> current_push_objectives;
     bool evaluated_at_least_one_cow = false;
 
     // The local perimeter closes the relaxation problem. Cells whose global
@@ -741,32 +731,88 @@ private:
             std::isfinite(global_push_point.x) &&
             std::isfinite(global_push_point.y))
           {
-            current_push_points.push_back(global_push_point);
+            current_push_objectives.push_back(
+              PushObjective{
+                global_push_point,
+                static_cast<double>(goal_distance),
+                0.0});
           }
         }
       }
     }
 
+    const bool authoritative_empty_cow_set =
+      has_cows &&
+      cows &&
+      cows->poses.empty();
+    const bool has_authoritative_cow_evaluation =
+      evaluated_at_least_one_cow ||
+      authoritative_empty_cow_set;
     const bool all_evaluated_cows_at_goal =
-      evaluated_at_least_one_cow &&
-      current_push_points.empty();
+      has_authoritative_cow_evaluation &&
+      current_push_objectives.empty();
 
-    // A valid remembered cow set is authoritative even when every cow has
-    // reached the goal. Objective memory is used only when no cow can be
-    // evaluated, preventing completion from reviving an old push point.
-    const std::vector<cv::Point2f>& active_push_points =
-      evaluated_at_least_one_cow ?
-      current_push_points :
-      remembered_push_points;
+    if (!current_push_objectives.empty()) {
+      const auto distance_limits = std::minmax_element(
+        current_push_objectives.begin(),
+        current_push_objectives.end(),
+        [](const PushObjective& lhs, const PushObjective& rhs) {
+          return lhs.cow_goal_distance < rhs.cow_goal_distance;
+        });
+      const double minimum_goal_distance =
+        distance_limits.first->cow_goal_distance;
+      const double maximum_goal_distance =
+        distance_limits.second->cow_goal_distance;
+      const double normalization_span = std::max(
+        maximum_goal_distance - minimum_goal_distance,
+        objective_priority_min_spread_);
+
+      for (auto& objective : current_push_objectives) {
+        objective.boundary_potential = std::clamp(
+          max_near_goal_objective_potential_ *
+          (maximum_goal_distance - objective.cow_goal_distance) /
+          normalization_span,
+          0.0,
+          max_near_goal_objective_potential_);
+      }
+
+      // Reserve the best clipped/free cells for lagging cows when multiple
+      // objectives project to the same part of the moving local grid.
+      std::sort(
+        current_push_objectives.begin(),
+        current_push_objectives.end(),
+        [](const PushObjective& lhs, const PushObjective& rhs) {
+          if (
+            std::abs(lhs.cow_goal_distance - rhs.cow_goal_distance) >
+            POTENTIAL_DESCENT_EPSILON)
+          {
+            return lhs.cow_goal_distance > rhs.cow_goal_distance;
+          }
+          if (
+            std::abs(lhs.global_point.x - rhs.global_point.x) >
+            POTENTIAL_DESCENT_EPSILON)
+          {
+            return lhs.global_point.x < rhs.global_point.x;
+          }
+          return lhs.global_point.y < rhs.global_point.y;
+        });
+    }
+
+    // A received cow snapshot is authoritative, including an empty one.
+    // Objective memory is used only before any usable tracker snapshot exists.
+    const std::vector<PushObjective>& active_push_objectives =
+      has_authoritative_cow_evaluation ?
+      current_push_objectives :
+      remembered_push_objectives;
 
     // Project each global push destination into the intersection of the local
-    // window and finite global map. Ray clipping preserves its direction from
-    // the drone and creates an intermediate edge objective when necessary.
-    for (const auto& global_push_point : active_push_points) {
+    // window and finite global map. Ray clipping preserves both its direction
+    // and its cow-distance priority at an intermediate edge objective.
+    for (const auto& push_objective : active_push_objectives) {
       cv::Point2f clipped_push_point;
       if (!clip_target_to_valid_region(
           grid_center,
-          global_push_point,
+          push_objective.global_point,
           clipped_push_point))
       {
         continue;
@@ -798,8 +844,21 @@ private:
         continue;
       }
 
+      const double boundary_potential = std::clamp(
+        push_objective.boundary_potential,
+        0.0,
+        max_near_goal_objective_potential_);
+      const double normalized_priority_cost =
+        max_near_goal_objective_potential_ >
+          POTENTIAL_DESCENT_EPSILON ?
+        boundary_potential / max_near_goal_objective_potential_ :
+        0.0;
+
       grid[objective_row][objective_col] = PUSH_OBJECTIVE;
-      potential_grid.at<double>(objective_row, objective_col) = 0.0;
+      potential_grid.at<double>(objective_row, objective_col) =
+        boundary_potential;
+      objective_source_cost.at<double>(objective_row, objective_col) =
+        normalized_priority_cost * objective_priority_fallback_bias_m_;
       is_fixed.at<uchar>(objective_row, objective_col) = 1;
       objective_mask.at<uchar>(objective_row, objective_col) = 1;
     }
@@ -846,7 +905,7 @@ private:
     cv::Mat saddle_escape_grid(
       GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
     const cv::Mat goal_distance_grid = compute_goal_distance_grid(
-      is_fixed, objective_mask);
+      is_fixed, objective_mask, objective_source_cost);
 
     if (has_push_objective) {
       for (int r = 1; r < GRID_SIZE - 1; ++r) {
@@ -1028,22 +1087,27 @@ private:
         latest_saddle_escape_grid_ = saddle_escape_grid.clone();
         latest_grid_center_ = grid_center;
         latest_grid_offset_ = grid_center - global_map_center_;
-        latest_valid_push_points_global_.clear();
+        latest_valid_push_objectives_.clear();
         has_vector_grid_ = false;
         all_cows_at_goal_ = true;
         has_last_nonzero_move_direction_ = false;
-      } else if (candidate_field_is_valid) {
-        latest_vector_grid_ = vector_grid;
-        latest_cell_grid_ = grid;
-        latest_is_fixed_grid_ = is_fixed.clone();
-        latest_saddle_escape_grid_ = saddle_escape_grid.clone();
-        latest_grid_center_ = grid_center;
-        latest_grid_offset_ = grid_center - global_map_center_;
-        if (!current_push_points.empty()) {
-          latest_valid_push_points_global_ = current_push_points;
-        }
-        has_vector_grid_ = true;
+      } else {
+        // Never retain a completed-herd hold after a current cow is observed
+        // outside the final goal. A valid previous field can remain as the
+        // movement fallback if this particular relaxation cycle is invalid.
         all_cows_at_goal_ = false;
+        if (candidate_field_is_valid) {
+          latest_vector_grid_ = vector_grid;
+          latest_cell_grid_ = grid;
+          latest_is_fixed_grid_ = is_fixed.clone();
+          latest_saddle_escape_grid_ = saddle_escape_grid.clone();
+          latest_grid_center_ = grid_center;
+          latest_grid_offset_ = grid_center - global_map_center_;
+          if (!current_push_objectives.empty()) {
+            latest_valid_push_objectives_ = current_push_objectives;
+          }
+          has_vector_grid_ = true;
+        }
       }
     }
 
@@ -1489,10 +1553,16 @@ private:
   double global_map_max_y_{50.0};
   double cow_exclusion_radius_{DEFAULT_COW_EXCLUSION_RADIUS};
   double push_point_margin_{DEFAULT_PUSH_POINT_MARGIN};
+  double max_near_goal_objective_potential_{
+    DEFAULT_MAX_NEAR_GOAL_OBJECTIVE_POTENTIAL};
+  double objective_priority_min_spread_{
+    DEFAULT_OBJECTIVE_PRIORITY_MIN_SPREAD};
+  double objective_priority_fallback_bias_m_{
+    DEFAULT_OBJECTIVE_PRIORITY_FALLBACK_BIAS};
   cv::Point2f global_map_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_offset_{0.0f, 0.0f};
-  std::vector<cv::Point2f> latest_valid_push_points_global_;
+  std::vector<PushObjective> latest_valid_push_objectives_;
   std::string drone_namespace_;
   std::string grid_name_;
   std::string occupancy_window_name_;

@@ -1,4 +1,5 @@
 import itertools
+import math
 
 import numpy as np
 
@@ -159,6 +160,8 @@ class CowTrackerManager:
         acceleration_noise_std=1.5,
         measurement_noise_std=1.5,
         initial_velocity_std=3.0,
+        reacquisition_mahalanobis_gate=16.0,
+        reacquisition_distance=5.0,
     ):
         self.default_dt = float(dt)
         self.max_lost_frames = int(max_lost_frames)
@@ -169,6 +172,11 @@ class CowTrackerManager:
         self.acceleration_noise_std = float(acceleration_noise_std)
         self.measurement_noise_std = float(measurement_noise_std)
         self.initial_velocity_std = float(initial_velocity_std)
+        self.reacquisition_mahalanobis_gate = float(
+            reacquisition_mahalanobis_gate
+        )
+        self.reacquisition_distance = float(reacquisition_distance)
+
         if self.default_dt <= 0.0:
             raise ValueError('dt must be positive')
         if self.max_lost_frames < 1:
@@ -187,11 +195,30 @@ class CowTrackerManager:
             raise ValueError('measurement_noise_std must be positive')
         if self.initial_velocity_std <= 0.0:
             raise ValueError('initial_velocity_std must be positive')
+        if self.reacquisition_mahalanobis_gate < self.mahalanobis_gate:
+            raise ValueError(
+                'reacquisition_mahalanobis_gate must be greater than or '
+                'equal to mahalanobis_gate'
+            )
+        if self.reacquisition_distance < self.max_position_distance:
+            raise ValueError(
+                'reacquisition_distance must be greater than or equal to '
+                'max_position_distance'
+            )
 
         self.tracks = []
         self.last_timestamp = None
+        self.last_diagnostics = {
+            'measurements': 0,
+            'total_tracks': 0,
+            'confirmed_tracks': 0,
+            'coasting_tracks': 0,
+            'visible_misses': 0,
+            'reacquisitions': 0,
+            'removed_tracks': 0,
+        }
 
-    def update(self, global_measurements, timestamp=None):
+    def update(self, global_measurements, timestamp=None, camera_views=None):
         dt = self._compute_dt(timestamp)
         measurements = np.asarray(global_measurements, dtype=float).reshape(-1, 2)
         measurements = measurements[np.all(np.isfinite(measurements), axis=1)]
@@ -205,32 +232,78 @@ class CowTrackerManager:
 
         matched_track_indices = set()
         matched_meas_indices = set()
+        available_measurements = set(range(len(measurements)))
+        confirmed_indices = {
+            index
+            for index, track in enumerate(self.tracks)
+            if track.confirmed
+        }
+        tentative_indices = set(range(len(self.tracks))) - confirmed_indices
 
-        if self.tracks and len(measurements) > 0:
-            cost_matrix = self._build_cost_matrix(measurements)
-            row_ind, col_ind = self._assign(cost_matrix)
+        regular_matches = self._associate(
+            confirmed_indices,
+            available_measurements,
+            measurements,
+            self.mahalanobis_gate,
+            self.max_position_distance,
+        )
+        self._apply_matches(
+            regular_matches,
+            measurements,
+            matched_track_indices,
+            matched_meas_indices,
+        )
+        available_measurements -= matched_meas_indices
 
-            for track_idx, meas_idx in zip(row_ind, col_ind):
-                if cost_matrix[track_idx, meas_idx] <= self.mahalanobis_gate:
-                    measurement = measurements[meas_idx]
-                    track = self.tracks[track_idx]
-                    innovation, _ = track.kf.innovation(measurement)
-                    track.innovation_norm = float(np.linalg.norm(innovation))
-                    track.kf.update(measurement[0], measurement[1])
-                    track.hits += 1
-                    track.hit_streak += 1
-                    track.lost_frames = 0
-                    if track.hit_streak >= track.min_hits:
-                        track.is_confirmed = True
-                    matched_track_indices.add(track_idx)
-                    matched_meas_indices.add(meas_idx)
+        # Give established, temporarily lost identities first access to a
+        # wider gate before tentative tracks can claim the measurement.
+        reacquisition_candidates = {
+            index
+            for index in confirmed_indices - matched_track_indices
+            if self.tracks[index].lost_frames > 0
+        }
+        reacquisition_matches = self._associate(
+            reacquisition_candidates,
+            available_measurements,
+            measurements,
+            self.reacquisition_mahalanobis_gate,
+            self.reacquisition_distance,
+        )
+        self._apply_matches(
+            reacquisition_matches,
+            measurements,
+            matched_track_indices,
+            matched_meas_indices,
+        )
+        available_measurements -= matched_meas_indices
 
+        tentative_matches = self._associate(
+            tentative_indices,
+            available_measurements,
+            measurements,
+            self.mahalanobis_gate,
+            self.max_position_distance,
+        )
+        self._apply_matches(
+            tentative_matches,
+            measurements,
+            matched_track_indices,
+            matched_meas_indices,
+        )
+        available_measurements -= matched_meas_indices
+
+        visible_misses = 0
         for track_idx, track in enumerate(self.tracks):
-            if track_idx not in matched_track_indices:
-                track.lost_frames += 1
-                track.hit_streak = 0
-                track.innovation_norm = float('nan')
+            if track_idx in matched_track_indices:
+                continue
 
+            track.hit_streak = 0
+            track.innovation_norm = float('nan')
+            if self._is_position_visible(track.kf.x[:2, 0], camera_views):
+                track.lost_frames += 1
+                visible_misses += 1
+
+        tracks_before_removal = len(self.tracks)
         self.tracks = [
             track
             for track in self.tracks
@@ -240,22 +313,23 @@ class CowTrackerManager:
                 else track.lost_frames == 0
             )
         ]
+        removed_tracks = tracks_before_removal - len(self.tracks)
 
-        for meas_idx, measurement in enumerate(measurements):
-            if meas_idx not in matched_meas_indices:
-                self.tracks.append(
-                    Track(
-                        self.default_dt,
-                        initial_x=measurement[0],
-                        initial_y=measurement[1],
-                        min_hits=self.min_hits,
-                        acceleration_noise_std=self.acceleration_noise_std,
-                        measurement_noise_std=self.measurement_noise_std,
-                        initial_velocity_std=self.initial_velocity_std,
-                    )
+        for meas_idx in sorted(available_measurements):
+            measurement = measurements[meas_idx]
+            self.tracks.append(
+                Track(
+                    self.default_dt,
+                    initial_x=measurement[0],
+                    initial_y=measurement[1],
+                    min_hits=self.min_hits,
+                    acceleration_noise_std=self.acceleration_noise_std,
+                    measurement_noise_std=self.measurement_noise_std,
+                    initial_velocity_std=self.initial_velocity_std,
                 )
+            )
 
-        return [
+        confirmed_tracks = [
             {
                 "id": track.track_id,
                 "x": track.kf.x[0, 0],
@@ -270,6 +344,18 @@ class CowTrackerManager:
             for track in self.tracks
             if track.confirmed
         ]
+        self.last_diagnostics = {
+            'measurements': len(measurements),
+            'total_tracks': len(self.tracks),
+            'confirmed_tracks': len(confirmed_tracks),
+            'coasting_tracks': sum(
+                track.coasting for track in self.tracks if track.confirmed
+            ),
+            'visible_misses': visible_misses,
+            'reacquisitions': len(reacquisition_matches),
+            'removed_tracks': removed_tracks,
+        }
+        return confirmed_tracks
 
     def _compute_dt(self, timestamp):
         if timestamp is None:
@@ -287,28 +373,126 @@ class CowTrackerManager:
         self.last_timestamp = timestamp
         return dt
 
-    def _build_cost_matrix(self, measurements):
+    def _associate(
+        self,
+        track_indices,
+        measurement_indices,
+        measurements,
+        mahalanobis_gate,
+        max_position_distance,
+    ):
+        track_indices = sorted(track_indices)
+        measurement_indices = sorted(measurement_indices)
+        if not track_indices or not measurement_indices:
+            return []
+
+        cost_matrix = self._build_cost_matrix(
+            track_indices,
+            measurement_indices,
+            measurements,
+            mahalanobis_gate,
+            max_position_distance,
+        )
+        row_ind, col_ind = self._assign(cost_matrix)
+        matches = []
+        for row, col in zip(row_ind, col_ind):
+            if cost_matrix[row, col] <= mahalanobis_gate:
+                matches.append(
+                    (track_indices[row], measurement_indices[col])
+                )
+        return matches
+
+    def _build_cost_matrix(
+        self,
+        track_indices,
+        measurement_indices,
+        measurements,
+        mahalanobis_gate,
+        max_position_distance,
+    ):
         forbidden_cost = 1.0e9
         cost_matrix = np.full(
-            (len(self.tracks), len(measurements)),
+            (len(track_indices), len(measurement_indices)),
             fill_value=forbidden_cost,
             dtype=float,
         )
 
-        for track_idx, track in enumerate(self.tracks):
-            for meas_idx, measurement in enumerate(measurements):
+        for row, track_idx in enumerate(track_indices):
+            track = self.tracks[track_idx]
+            for col, meas_idx in enumerate(measurement_indices):
+                measurement = measurements[meas_idx]
                 distance_sq = track.kf.mahalanobis_distance_sq(measurement)
                 predicted_position = track.kf.x[:2, 0]
                 position_distance = np.linalg.norm(
                     measurement - predicted_position
                 )
                 if (
-                    distance_sq <= self.mahalanobis_gate
-                    and position_distance <= self.max_position_distance
+                    distance_sq <= mahalanobis_gate
+                    and position_distance <= max_position_distance
                 ):
-                    cost_matrix[track_idx, meas_idx] = distance_sq
+                    cost_matrix[row, col] = distance_sq
 
         return cost_matrix
+
+    def _apply_matches(
+        self,
+        matches,
+        measurements,
+        matched_track_indices,
+        matched_meas_indices,
+    ):
+        for track_idx, meas_idx in matches:
+            measurement = measurements[meas_idx]
+            track = self.tracks[track_idx]
+            innovation, _ = track.kf.innovation(measurement)
+            track.innovation_norm = float(np.linalg.norm(innovation))
+            track.kf.update(measurement[0], measurement[1])
+            track.hits += 1
+            track.hit_streak += 1
+            track.lost_frames = 0
+            if track.hit_streak >= track.min_hits:
+                track.is_confirmed = True
+            matched_track_indices.add(track_idx)
+            matched_meas_indices.add(meas_idx)
+
+    @staticmethod
+    def _is_position_visible(position, camera_views):
+        if not camera_views:
+            return False
+
+        position_x = float(position[0])
+        position_y = float(position[1])
+        if not np.isfinite(position_x) or not np.isfinite(position_y):
+            return False
+
+        for camera in camera_views:
+            camera_x = float(camera['x'])
+            camera_y = float(camera['y'])
+            camera_yaw = float(camera['yaw'])
+            horizontal_fov = float(camera['horizontal_fov'])
+            max_range = float(camera['max_range'])
+            values = (
+                camera_x,
+                camera_y,
+                camera_yaw,
+                horizontal_fov,
+                max_range,
+            )
+            if not all(np.isfinite(value) for value in values):
+                continue
+
+            delta_x = position_x - camera_x
+            delta_y = position_y - camera_y
+            if math.hypot(delta_x, delta_y) > max_range:
+                continue
+
+            bearing_error = (
+                math.atan2(delta_y, delta_x) - camera_yaw + math.pi
+            ) % (2.0 * math.pi) - math.pi
+            if abs(bearing_error) <= horizontal_fov / 2.0:
+                return True
+
+        return False
 
     @staticmethod
     def _assign(cost_matrix):

@@ -24,6 +24,7 @@ PLOT_MAP_Y_LIMITS = (-10.0, 10.0)
 TRACKED_ANIMAL_LABELS = ('cow',)
 YOLO_CONFIDENCE_THRESHOLD = 0.45
 MAX_COW_DETECTION_DISTANCE_METERS = 20.0
+CAMERA_HORIZONTAL_FOV_RAD = 2.09
 POSE_HISTORY_LENGTH = 500
 MAX_POSE_TIME_ERROR_SECONDS = 0.25
 MULTI_CAMERA_MERGE_DISTANCE_METERS = 1.0
@@ -38,6 +39,9 @@ TRACKER_MAX_PREDICTION_STEP_SECONDS = 1.0
 TRACKER_ACCELERATION_NOISE_STD = 1.5
 TRACKER_MEASUREMENT_NOISE_STD = 1.5
 TRACKER_INITIAL_VELOCITY_STD = 3.0
+TRACKER_REACQUISITION_MAHALANOBIS_GATE = 16.0
+TRACKER_REACQUISITION_DISTANCE_METERS = 5.0
+TRACKER_DIAGNOSTIC_LOG_PERIOD_SECONDS = 5.0
 
 
 class RealtimeCowPlotter:
@@ -304,6 +308,28 @@ class YoloCowSubscriber(Node):
                 ENABLE_ANNOTATED_CAMERA_VIEW,
             ).value
         )
+        self.camera_horizontal_fov_rad = float(
+            self.declare_parameter(
+                'camera_horizontal_fov_rad',
+                CAMERA_HORIZONTAL_FOV_RAD,
+            ).value
+        )
+        self.tracker_reacquisition_distance = float(
+            self.declare_parameter(
+                'tracker_reacquisition_distance',
+                TRACKER_REACQUISITION_DISTANCE_METERS,
+            ).value
+        )
+        self.tracker_reacquisition_mahalanobis_gate = float(
+            self.declare_parameter(
+                'tracker_reacquisition_mahalanobis_gate',
+                TRACKER_REACQUISITION_MAHALANOBIS_GATE,
+            ).value
+        )
+        if not 0.0 < self.camera_horizontal_fov_rad <= 2.0 * math.pi:
+            raise ValueError(
+                'camera_horizontal_fov_rad must be in the range (0, 2*pi]'
+            )
         camera_view_state = (
             'enabled' if self.show_annotated_camera else 'disabled'
         )
@@ -340,7 +366,12 @@ class YoloCowSubscriber(Node):
             acceleration_noise_std=TRACKER_ACCELERATION_NOISE_STD,
             measurement_noise_std=TRACKER_MEASUREMENT_NOISE_STD,
             initial_velocity_std=TRACKER_INITIAL_VELOCITY_STD,
+            reacquisition_mahalanobis_gate=(
+                self.tracker_reacquisition_mahalanobis_gate
+            ),
+            reacquisition_distance=self.tracker_reacquisition_distance,
         )
+        self.last_tracker_diagnostic_log_time = None
         self.plotter = RealtimeCowPlotter() if ENABLE_REALTIME_TRACK_PLOT else None
 
         self.bridge = CvBridge()
@@ -468,7 +499,30 @@ class YoloCowSubscriber(Node):
             key=lambda batch: batch[0],
         )
         measurements = self._merge_camera_measurements(batches)
-        tracks = self.tracker.update(measurements, timestamp=timestamp)
+        camera_views = []
+        for source_name, (batch_timestamp, _, _) in batches.items():
+            drone_state = self._drone_state_at(
+                source_name, batch_timestamp
+            )
+            if drone_state is None:
+                continue
+            drone_x, drone_y, drone_yaw = drone_state
+            camera_views.append(
+                {
+                    'x': drone_x,
+                    'y': drone_y,
+                    'yaw': drone_yaw,
+                    'horizontal_fov': self.camera_horizontal_fov_rad,
+                    'max_range': MAX_COW_DETECTION_DISTANCE_METERS,
+                }
+            )
+
+        tracks = self.tracker.update(
+            measurements,
+            timestamp=timestamp,
+            camera_views=camera_views,
+        )
+        self._log_tracker_diagnostics(timestamp)
         if self.plotter is not None:
             self.plotter.update(timestamp, tracks)
 
@@ -478,6 +532,29 @@ class YoloCowSubscriber(Node):
         )
         source_drone_index = self.drone_index_by_name[source_name]
         self._publish_tracks(tracks, header, source_drone_index)
+
+    def _log_tracker_diagnostics(self, timestamp):
+        last_log_time = self.last_tracker_diagnostic_log_time
+        if (
+            last_log_time is not None
+            and timestamp >= last_log_time
+            and timestamp - last_log_time
+            < TRACKER_DIAGNOSTIC_LOG_PERIOD_SECONDS
+        ):
+            return
+
+        self.last_tracker_diagnostic_log_time = timestamp
+        diagnostics = self.tracker.last_diagnostics
+        self.get_logger().info(
+            'Cow tracker: '
+            f"measurements={diagnostics['measurements']}, "
+            f"tracks={diagnostics['total_tracks']}, "
+            f"confirmed={diagnostics['confirmed_tracks']}, "
+            f"coasting={diagnostics['coasting_tracks']}, "
+            f"visible_misses={diagnostics['visible_misses']}, "
+            f"reacquisitions={diagnostics['reacquisitions']}, "
+            f"removed={diagnostics['removed_tracks']}"
+        )
 
     @staticmethod
     def _merge_camera_measurements(batches):

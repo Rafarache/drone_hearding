@@ -38,10 +38,10 @@ class PeopleRepeller(Node):
 
         self.drone_sensing_radius = float(
             self.declare_parameter(
-                'drone_sensing_radius', 6.0).value)
+                'drone_sensing_radius', 5.0).value)
         self.drone_approach_radius = float(
             self.declare_parameter(
-                'drone_approach_radius', 3.0).value)
+                'drone_approach_radius', 4.0).value)
         self.push_point_margin = float(
             self.declare_parameter(
                 'push_point_margin', 0.2).value)

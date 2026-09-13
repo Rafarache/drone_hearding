@@ -343,7 +343,7 @@ def generate_launch_description():
     herding_radius_args = [
         DeclareLaunchArgument(
             'drone_approach_radius',
-            default_value='3.0',
+            default_value='4.0',
             description='Minimum drone distance from a cow in metres'
         ),
         DeclareLaunchArgument(
@@ -353,7 +353,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'cow_drone_sensing_radius',
-            default_value='6.0',
+            default_value='5.0',
             description='Distance at which cows react to drones in metres'
         ),
     ]
@@ -361,7 +361,7 @@ def generate_launch_description():
     objective_priority_args = [
         DeclareLaunchArgument(
             'max_near_goal_objective_potential',
-            default_value='0.5',
+            default_value='0.9',
             description=(
                 'Maximum relaxation potential assigned to the nearest '
                 'active cow objective'

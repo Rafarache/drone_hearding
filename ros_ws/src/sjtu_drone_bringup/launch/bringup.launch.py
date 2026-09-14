@@ -212,6 +212,24 @@ def drone_launch_description(context, *args, **kwargs):
     objective_priority_fallback_bias_m = float(
         LaunchConfiguration(
             'objective_priority_fallback_bias_m').perform(context))
+    drone_max_linear_velocity = float(
+        LaunchConfiguration(
+            'drone_max_linear_velocity').perform(context))
+    drone_max_linear_acceleration = float(
+        LaunchConfiguration(
+            'drone_max_linear_acceleration').perform(context))
+    drone_max_angular_velocity = float(
+        LaunchConfiguration(
+            'drone_max_angular_velocity').perform(context))
+    drone_max_angular_acceleration = float(
+        LaunchConfiguration(
+            'drone_max_angular_acceleration').perform(context))
+    drone_position_tolerance = float(
+        LaunchConfiguration(
+            'drone_position_tolerance').perform(context))
+    drone_linear_slowdown_distance = float(
+        LaunchConfiguration(
+            'drone_linear_slowdown_distance').perform(context))
 
     cow_pos = [
         [3,5],
@@ -242,7 +260,19 @@ def drone_launch_description(context, *args, **kwargs):
             launch_arguments={
                 'x': str(0),
                 'y': str(i*2),
-                'model_ns': name
+                'model_ns': name,
+                'drone_max_linear_velocity':
+                    str(drone_max_linear_velocity),
+                'drone_max_linear_acceleration':
+                    str(drone_max_linear_acceleration),
+                'drone_max_angular_velocity':
+                    str(drone_max_angular_velocity),
+                'drone_max_angular_acceleration':
+                    str(drone_max_angular_acceleration),
+                'drone_position_tolerance':
+                    str(drone_position_tolerance),
+                'drone_linear_slowdown_distance':
+                    str(drone_linear_slowdown_distance),
             }.items()
         )
 
@@ -353,7 +383,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'cow_drone_sensing_radius',
-            default_value='5.0',
+            default_value='6.0',
             description='Distance at which cows react to drones in metres'
         ),
     ]
@@ -382,6 +412,41 @@ def generate_launch_description():
                 'Maximum geodesic fallback penalty for a low-priority '
                 'cow objective in metres'
             )
+        ),
+    ]
+
+    drone_motion_smoothing_args = [
+        DeclareLaunchArgument(
+            'drone_max_linear_velocity',
+            default_value='0.4',
+            description='Maximum horizontal drone speed in metres per second'
+        ),
+        DeclareLaunchArgument(
+            'drone_max_linear_acceleration',
+            default_value='0.5',
+            description=(
+                'Maximum change in horizontal velocity per second'
+            )
+        ),
+        DeclareLaunchArgument(
+            'drone_max_angular_velocity',
+            default_value='1.0',
+            description='Maximum camera-focus yaw rate in radians per second'
+        ),
+        DeclareLaunchArgument(
+            'drone_max_angular_acceleration',
+            default_value='1.0',
+            description='Maximum change in yaw rate per second'
+        ),
+        DeclareLaunchArgument(
+            'drone_position_tolerance',
+            default_value='0.1',
+            description='Distance at which a waypoint is considered reached'
+        ),
+        DeclareLaunchArgument(
+            'drone_linear_slowdown_distance',
+            default_value='0.4',
+            description='Distance over which velocity tapers near a waypoint'
         ),
     ]
 
@@ -444,6 +509,7 @@ def generate_launch_description():
         *global_map_bound_args,
         *herding_radius_args,
         *objective_priority_args,
+        *drone_motion_smoothing_args,
         *yolo_visualization_args,
         cow_launch_function_action,
         drone_launch_function_action,

@@ -29,6 +29,24 @@ def launch_setup(context, *args, **kwargs):
     model_ns = LaunchConfiguration('model_ns').perform(context)
     x = LaunchConfiguration('x').perform(context)
     y = LaunchConfiguration('y').perform(context)
+    drone_max_linear_velocity = float(
+        LaunchConfiguration(
+            'drone_max_linear_velocity').perform(context))
+    drone_max_linear_acceleration = float(
+        LaunchConfiguration(
+            'drone_max_linear_acceleration').perform(context))
+    drone_max_angular_velocity = float(
+        LaunchConfiguration(
+            'drone_max_angular_velocity').perform(context))
+    drone_max_angular_acceleration = float(
+        LaunchConfiguration(
+            'drone_max_angular_acceleration').perform(context))
+    drone_position_tolerance = float(
+        LaunchConfiguration(
+            'drone_position_tolerance').perform(context))
+    drone_linear_slowdown_distance = float(
+        LaunchConfiguration(
+            'drone_linear_slowdown_distance').perform(context))
     use_sim_time = LaunchConfiguration("use_sim_time", default="true")
     xacro_file_name = "sjtu_drone.urdf.xacro"
     xacro_file = os.path.join(
@@ -97,6 +115,20 @@ def launch_setup(context, *args, **kwargs):
             executable="drone_position_control",
             arguments=[model_ns],
             name='sjtu_drone_control',
+            parameters=[{
+                'drone_max_linear_velocity':
+                    drone_max_linear_velocity,
+                'drone_max_linear_acceleration':
+                    drone_max_linear_acceleration,
+                'drone_max_angular_velocity':
+                    drone_max_angular_velocity,
+                'drone_max_angular_acceleration':
+                    drone_max_angular_acceleration,
+                'drone_position_tolerance':
+                    drone_position_tolerance,
+                'drone_linear_slowdown_distance':
+                    drone_linear_slowdown_distance,
+            }],
             output="screen"
         ),
     ]
@@ -139,6 +171,33 @@ def generate_launch_description():
         description='Namespace of the drone model'
     )
 
+    drone_motion_smoothing_args = [
+        DeclareLaunchArgument(
+            'drone_max_linear_velocity',
+            default_value='0.4'
+        ),
+        DeclareLaunchArgument(
+            'drone_max_linear_acceleration',
+            default_value='0.5'
+        ),
+        DeclareLaunchArgument(
+            'drone_max_angular_velocity',
+            default_value='1.0'
+        ),
+        DeclareLaunchArgument(
+            'drone_max_angular_acceleration',
+            default_value='1.0'
+        ),
+        DeclareLaunchArgument(
+            'drone_position_tolerance',
+            default_value='0.1'
+        ),
+        DeclareLaunchArgument(
+            'drone_linear_slowdown_distance',
+            default_value='0.4'
+        ),
+    ]
+
     def launch_gzclient(context, *args, **kwargs):
         if context.launch_configurations.get('use_gui') == 'true':
             return [IncludeLaunchDescription(
@@ -160,5 +219,6 @@ def generate_launch_description():
         declare_x_arg,
         declare_y_arg,
         declare_model_ns_arg,
+        *drone_motion_smoothing_args,
         opaque_function_action,
     ])

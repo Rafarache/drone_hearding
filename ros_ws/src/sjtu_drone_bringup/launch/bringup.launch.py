@@ -343,7 +343,7 @@ def generate_launch_description():
 
     declare_number_drones_arg = DeclareLaunchArgument(
         'number_of_drones',
-        default_value='1',
+        default_value='2',
         description='Number of drones argument'
     )
 
@@ -453,7 +453,7 @@ def generate_launch_description():
     yolo_visualization_args = [
         DeclareLaunchArgument(
             'show_yolo_camera',
-            default_value='true',
+            default_value='false',
             description='Show annotated cow detections from each drone camera'
         ),
         DeclareLaunchArgument(

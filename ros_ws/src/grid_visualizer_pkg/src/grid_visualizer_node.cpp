@@ -32,6 +32,8 @@ constexpr double POTENTIAL_DESCENT_EPSILON = 1.0e-10;
 constexpr bool ENABLE_SADDLE_NEIGHBOR_DESCENT = false;
 constexpr bool ENABLE_GEODESIC_FIELD_FALLBACK = true;
 constexpr int CONTROL_RECOVERY_SEARCH_RADIUS_CELLS = 8;
+constexpr bool ENABLE_OCCUPANCY_GRID_DISPLAY = false;
+constexpr bool ENABLE_VECTOR_GRID_DISPLAY = true;
 
 // Herding Constants
 const cv::Point2f GOAL_POSITION(10.0f, 10.0f);
@@ -178,6 +180,30 @@ public:
       std::bind(&OccupancyGridVisualizer::drone_callback, this, std::placeholders::_1)
     );
 
+    latest_peer_drone_poses_.resize(total_drones_);
+    for (int peer_index = 0; peer_index < total_drones_; ++peer_index) {
+      if (peer_index == drone_index_) {
+        continue;
+      }
+
+      const std::string peer_topic =
+        std::string(DRONE_NAMESPACE_PREFIX) +
+        std::to_string(peer_index) + "/gt_pose";
+      peer_drone_subs_.push_back(
+        this->create_subscription<geometry_msgs::msg::Pose>(
+          peer_topic,
+          10,
+          [this, peer_index](
+            const geometry_msgs::msg::Pose::SharedPtr msg)
+          {
+            peer_drone_callback(msg, peer_index);
+          }));
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Peer drone obstacle topic: %s",
+        peer_topic.c_str());
+    }
+
     cow_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
       "/cows_pos",
       10,
@@ -231,6 +257,24 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
     latest_drone_pose_ = msg;
     received_drone_ = true;
+  }
+
+  void peer_drone_callback(
+    const geometry_msgs::msg::Pose::SharedPtr msg,
+    int peer_index)
+  {
+    if (
+      peer_index < 0 ||
+      peer_index >= total_drones_ ||
+      peer_index == drone_index_ ||
+      !std::isfinite(msg->position.x) ||
+      !std::isfinite(msg->position.y))
+    {
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_peer_drone_poses_[peer_index] = msg;
   }
 
   void cow_callback(
@@ -617,6 +661,7 @@ private:
   {
     geometry_msgs::msg::Pose::SharedPtr drone_pose;
     geometry_msgs::msg::PoseArray::SharedPtr cows;
+    std::vector<geometry_msgs::msg::Pose::SharedPtr> peer_drone_poses;
     std::vector<PushObjective> remembered_push_objectives;
     cv::Point2f remembered_primary_push_objective;
     bool has_remembered_primary_push_objective = false;
@@ -627,6 +672,7 @@ private:
       std::lock_guard<std::mutex> lock(mutex_);
       drone_pose = latest_drone_pose_;
       cows = latest_cows_;
+      peer_drone_poses = latest_peer_drone_poses_;
       remembered_push_objectives = latest_valid_push_objectives_;
       remembered_primary_push_objective =
         latest_primary_push_objective_;
@@ -748,6 +794,42 @@ private:
           }
         }
       }
+    }
+
+    // Peer drone poses stay in global coordinates and are reprojected into
+    // this drone's moving grid. For now, each peer occupies one fixed cell
+    // with no surrounding radius.
+    for (int peer_index = 0;
+      peer_index < static_cast<int>(peer_drone_poses.size());
+      ++peer_index)
+    {
+      if (peer_index == drone_index_ || !peer_drone_poses[peer_index]) {
+        continue;
+      }
+
+      const auto& peer_pose = peer_drone_poses[peer_index];
+      if (!is_inside_global_map(
+          peer_pose->position.x,
+          peer_pose->position.y))
+      {
+        continue;
+      }
+
+      int peer_row = 0;
+      int peer_col = 0;
+      if (!global_to_grid(
+          peer_pose->position.x,
+          peer_pose->position.y,
+          grid_center,
+          peer_row,
+          peer_col))
+      {
+        continue;
+      }
+
+      grid[peer_row][peer_col] = DRONE;
+      potential_grid.at<double>(peer_row, peer_col) = 1.0;
+      is_fixed.at<uchar>(peer_row, peer_col) = 1;
     }
 
     const bool authoritative_empty_cow_set =
@@ -1208,9 +1290,13 @@ private:
 
     // Render this center-aware candidate. Remembered global objectives make
     // empty detection updates regenerate at the current drone position.
-    compute_and_display_occupancy_map(grid, grid_center);
-    compute_and_display_vector_grid(
-      grid, vector_grid, is_fixed, saddle_escape_grid, grid_center);
+    if (ENABLE_OCCUPANCY_GRID_DISPLAY) {
+      compute_and_display_occupancy_map(grid, grid_center);
+    }
+    if (ENABLE_VECTOR_GRID_DISPLAY) {
+      compute_and_display_vector_grid(
+        grid, vector_grid, is_fixed, saddle_escape_grid, grid_center);
+    }
   }
 
   void draw_final_goal(
@@ -1633,6 +1719,9 @@ private:
 
   // Subscriptions, Publishers, Timers & Mutex
   rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr drone_sub_;
+  std::vector<
+    rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr>
+    peer_drone_subs_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr cow_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr goto_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr focusin_pub_;
@@ -1667,6 +1756,8 @@ private:
 
   std::mutex mutex_;
   geometry_msgs::msg::Pose::SharedPtr latest_drone_pose_;
+  std::vector<geometry_msgs::msg::Pose::SharedPtr>
+    latest_peer_drone_poses_;
   geometry_msgs::msg::PoseArray::SharedPtr latest_cows_;
   std::vector<std::vector<cv::Point2f>> latest_vector_grid_;
   std::vector<std::vector<CellState>> latest_cell_grid_;

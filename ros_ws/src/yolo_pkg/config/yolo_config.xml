@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<yolo_config>
+  <display
+    show_realtime_track_plot="false"
+    show_annotated_camera="false"
+    plot_history_ms="10000"
+    plot_grid_m="1.0"
+    plot_min_x="-10.0"
+    plot_max_x="10.0"
+    plot_min_y="-10.0"
+    plot_max_y="10.0" />
+
+  <detector
+    model_path="yolov8n.pt"
+    tracked_labels="cow"
+    confidence_threshold="0.45"
+    max_detection_distance_m="20.0" />
+
+  <camera
+    horizontal_fov_rad="2.09"
+    pose_history_length="500"
+    max_pose_time_error_seconds="0.25"
+    multi_camera_merge_distance_m="1.0"
+    max_camera_batch_wait_seconds="0.20" />
+
+  <projection
+    minimum_box_bottom_px="206.0"
+    image_center_x_px="320.0"
+    distance_log_scale="0.7714"
+    distance_bottom_offset_px="205.31"
+    distance_log_denominator="363.34"
+    bearing_log_scale="0.01745"
+    bearing_center_offset_px="167.69"
+    bearing_log_denominator="171.46" />
+
+  <tracker
+    default_dt_seconds="0.1"
+    max_lost_frames="15"
+    mahalanobis_gate="9.21"
+    max_position_distance_m="3.0"
+    min_confirmation_hits="3"
+    max_prediction_step_seconds="1.0"
+    acceleration_noise_std="1.5"
+    measurement_noise_std="1.5"
+    initial_velocity_std="3.0"
+    reacquisition_mahalanobis_gate="16.0"
+    reacquisition_distance_m="5.0"
+    diagnostic_log_period_seconds="5.0" />
+</yolo_config>

@@ -1,5 +1,4 @@
 import math
-import sys
 import time
 
 import rclpy
@@ -7,18 +6,19 @@ from geometry_msgs.msg import Pose, Twist, Vector3
 from rclpy.node import Node
 from std_msgs.msg import Empty
 
-
-CONTROL_PERIOD_SECONDS = 0.1
-MAX_CONTROL_DT_SECONDS = 0.2
-FOCUS_DISTANCE_TOLERANCE_METERS = 0.5
-FOCUS_ANGLE_TOLERANCE_RADIANS = 0.02
+from sjtu_drone_control.config import load_drone_control_config
 
 
 class DronePositionControl(Node):
     def __init__(self):
         super().__init__('drone_position_controller')
 
-        namespace = sys.argv[1]
+        self.config = load_drone_control_config()
+        namespace = str(
+            self.declare_parameter('drone_namespace', '').value
+        )
+        if not namespace:
+            raise ValueError('drone_namespace cannot be empty')
 
         self.drone_sub = self.create_subscription(
             Pose, namespace + '/gt_pose', self.drone_callback, 10)
@@ -33,24 +33,18 @@ class DronePositionControl(Node):
         self.focusin_subscriber = self.create_subscription(
             Pose, namespace + '/focusin', self.focusin_callback, 10)
 
-        self.max_linear_velocity = float(
-            self.declare_parameter(
-                'drone_max_linear_velocity', 0.4).value)
-        self.max_linear_acceleration = float(
-            self.declare_parameter(
-                'drone_max_linear_acceleration', 0.5).value)
-        self.max_angular_velocity = float(
-            self.declare_parameter(
-                'drone_max_angular_velocity', 1.0).value)
-        self.max_angular_acceleration = float(
-            self.declare_parameter(
-                'drone_max_angular_acceleration', 1.0).value)
-        self.position_tolerance = float(
-            self.declare_parameter(
-                'drone_position_tolerance', 0.1).value)
-        self.linear_slowdown_distance = float(
-            self.declare_parameter(
-                'drone_linear_slowdown_distance', 0.4).value)
+        self.max_linear_velocity = self.config.max_linear_velocity_mps
+        self.max_linear_acceleration = (
+            self.config.max_linear_acceleration_mps2
+        )
+        self.max_angular_velocity = self.config.max_angular_velocity_radps
+        self.max_angular_acceleration = (
+            self.config.max_angular_acceleration_radps2
+        )
+        self.position_tolerance = self.config.position_tolerance_m
+        self.linear_slowdown_distance = (
+            self.config.linear_slowdown_distance_m
+        )
         self._validate_parameters()
 
         self.drone_x = None
@@ -70,7 +64,8 @@ class DronePositionControl(Node):
         self.last_control_time = None
 
         self.get_logger().info(
-            'Motion smoothing: '
+            f'Loaded drone control configuration: {self.config.source_path}; '
+            'motion smoothing: '
             f'linear={self.max_linear_velocity:.2f} m/s, '
             f'linear_accel={self.max_linear_acceleration:.2f} m/s^2, '
             f'angular={self.max_angular_velocity:.2f} rad/s, '
@@ -82,12 +77,12 @@ class DronePositionControl(Node):
         print(f'Takeoff in drone_position_controll -- {namespace}')
         self.wait_for_subscribers(
             self.takeoff_publisher, namespace + '/takeoff')
-        time.sleep(8)
+        time.sleep(self.config.takeoff_delay_seconds)
         self.takeoff_publisher.publish(Empty())
 
         self.last_control_time = time.monotonic()
         self.control_timer = self.create_timer(
-            CONTROL_PERIOD_SECONDS, self.move_to_position)
+            self.config.control_period_seconds, self.move_to_position)
 
     def _validate_parameters(self):
         positive_parameters = {
@@ -109,13 +104,16 @@ class DronePositionControl(Node):
                 'drone_position_tolerance must be finite and nonnegative'
             )
 
-    def wait_for_subscribers(self, publisher, topic_name, timeout=10.0):
+    def wait_for_subscribers(self, publisher, topic_name):
         start_time = time.time()
         while publisher.get_subscription_count() == 0:
             self.get_logger().info(
                 f'Waiting for subscribers on {topic_name}...')
-            time.sleep(0.1)
-            if time.time() - start_time > timeout:
+            time.sleep(self.config.subscriber_poll_period_seconds)
+            if (
+                time.time() - start_time
+                > self.config.subscriber_wait_timeout_seconds
+            ):
                 self.get_logger().warn(
                     f'Timeout waiting for subscribers on {topic_name}')
                 break
@@ -149,11 +147,11 @@ class DronePositionControl(Node):
         now = time.monotonic()
         if self.last_control_time is None:
             self.last_control_time = now
-            return CONTROL_PERIOD_SECONDS
+            return self.config.control_period_seconds
 
         elapsed = now - self.last_control_time
         self.last_control_time = now
-        return min(max(elapsed, 0.0), MAX_CONTROL_DT_SECONDS)
+        return min(max(elapsed, 0.0), self.config.max_control_dt_seconds)
 
     @staticmethod
     def _slew_vector(
@@ -201,14 +199,17 @@ class DronePositionControl(Node):
     def _desired_angular_velocity(self):
         focus_x = self.camera_focus_position_x - self.drone_x
         focus_y = self.camera_focus_position_y - self.drone_y
-        if math.hypot(focus_x, focus_y) <= FOCUS_DISTANCE_TOLERANCE_METERS:
+        if (
+            math.hypot(focus_x, focus_y)
+            <= self.config.focus_distance_tolerance_m
+        ):
             return 0.0
 
         angle_to_focus = math.atan2(focus_y, focus_x)
         angle_error = (
             angle_to_focus - self.drone_angle + math.pi
         ) % (2.0 * math.pi) - math.pi
-        if abs(angle_error) <= FOCUS_ANGLE_TOLERANCE_RADIANS:
+        if abs(angle_error) <= self.config.focus_angle_tolerance_rad:
             return 0.0
 
         return self.max_angular_velocity * angle_error / math.pi

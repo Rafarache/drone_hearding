@@ -12,9 +12,9 @@ class CowKalmanFilter:
         dt,
         initial_x,
         initial_y,
-        acceleration_noise_std=1.5,
-        measurement_noise_std=1.5,
-        initial_velocity_std=3.0,
+        acceleration_noise_std,
+        measurement_noise_std,
+        initial_velocity_std,
     ):
         self.dt = float(dt)
         acceleration_noise_std = float(acceleration_noise_std)
@@ -151,17 +151,17 @@ class Track:
 class CowTrackerManager:
     def __init__(
         self,
-        dt=0.1,
-        max_lost_frames=15,
-        mahalanobis_gate=9.21,
-        max_position_distance=3.0,
-        min_hits=3,
-        max_dt=1.0,
-        acceleration_noise_std=1.5,
-        measurement_noise_std=1.5,
-        initial_velocity_std=3.0,
-        reacquisition_mahalanobis_gate=16.0,
-        reacquisition_distance=5.0,
+        dt,
+        max_lost_frames,
+        mahalanobis_gate,
+        max_position_distance,
+        min_hits,
+        max_dt,
+        acceleration_noise_std,
+        measurement_noise_std,
+        initial_velocity_std,
+        reacquisition_mahalanobis_gate,
+        reacquisition_distance,
     ):
         self.default_dt = float(dt)
         self.max_lost_frames = int(max_lost_frames)

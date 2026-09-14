@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<simulation>
+  <runtime
+    world_package="sjtu_drone_description"
+    world_path="worlds/farm_no_animals.world"
+    use_gui="true"
+    controller="keyboard"
+    fixed_frame="" />
+
+  <map center_x="0.0" center_y="0.0" width_m="100.0" height_m="100.0" />
+
+  <interfaces
+    drone_namespace_prefix="/simple_drone"
+    cow_name_prefix="cow"
+    cow_positions_topic="/cows_pos" />
+
+  <herding drone_approach_radius_m="2.0" push_point_margin_m="2.0" />
+
+  <drones>
+    <drone x="0.0" y="0.0" />
+    <drone x="0.0" y="2.0" />
+  </drones>
+
+  <cows>
+    <cow x="3.0" y="0.0" z="0.01" />
+    <cow x="3.0" y="1.0" z="0.01" />
+    <cow x="3.0" y="2.0" z="0.01" />
+  </cows>
+</simulation>

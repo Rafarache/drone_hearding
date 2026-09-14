@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<opencv_storage>
+  <local_grid_extent_m>20.0</local_grid_extent_m>
+  <cell_size_m>0.5</cell_size_m>
+  <free_cell_potential>0.5</free_cell_potential>
+  <boundary_potential>1.0</boundary_potential>
+
+  <relaxation_max_iterations>1000</relaxation_max_iterations>
+  <relaxation_tolerance>1.0e-8</relaxation_tolerance>
+  <sor_relaxation_factor>1.7</sor_relaxation_factor>
+  <low_gradient_threshold>1.0e-6</low_gradient_threshold>
+  <potential_descent_epsilon>1.0e-10</potential_descent_epsilon>
+
+  <enable_saddle_neighbor_descent>0</enable_saddle_neighbor_descent>
+  <enable_geodesic_field_fallback>1</enable_geodesic_field_fallback>
+  <control_recovery_search_radius_cells>8</control_recovery_search_radius_cells>
+
+  <show_occupancy_grid>0</show_occupancy_grid>
+  <show_vector_grid>1</show_vector_grid>
+  <visualization_period_ms>200</visualization_period_ms>
+  <control_period_ms>500</control_period_ms>
+
+  <goal_x>-10.0</goal_x>
+  <goal_y>-10.0</goal_y>
+  <final_goal_reached_radius_m>2.0</final_goal_reached_radius_m>
+  <max_goto_movement_m>0.5</max_goto_movement_m>
+
+  <max_near_goal_objective_potential>0.9</max_near_goal_objective_potential>
+  <objective_priority_curve_exponent>0.25</objective_priority_curve_exponent>
+  <primary_objective_switch_margin_m>1.0</primary_objective_switch_margin_m>
+  <primary_objective_association_radius_m>2.0</primary_objective_association_radius_m>
+  <objective_priority_min_spread_m>1.0</objective_priority_min_spread_m>
+  <objective_priority_fallback_bias_m>10.0</objective_priority_fallback_bias_m>
+</opencv_storage>

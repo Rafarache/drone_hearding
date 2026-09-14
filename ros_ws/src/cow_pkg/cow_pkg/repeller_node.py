@@ -1,188 +1,222 @@
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, Twist
-from geometry_msgs.msg import PoseArray
-from geometry_msgs.msg import Pose
-from gazebo_msgs.msg import ModelStates
-from gazebo_msgs.msg import ModelState
-from gazebo_msgs.srv import SetEntityState
-from gazebo_msgs.srv import SetModelState
-from gazebo_msgs.msg import EntityState
 import math
-import sys
-import numpy as np
+
+import rclpy
+from gazebo_msgs.msg import ModelStates
+from geometry_msgs.msg import Pose, Twist
+from rclpy.node import Node
+
+from cow_pkg.config import load_cow_config
+
 
 class PeopleRepeller(Node):
     def __init__(self):
         super().__init__('cow_repeller')
 
-        namespace = sys.argv[1]
-        number_of_drones = int(sys.argv[2])
-        number_of_cows = int(sys.argv[3])
- 
-        # Subscribers
+        self.config = load_cow_config()
+        self.drone_namespace_prefix = str(
+            self.declare_parameter('drone_namespace_prefix', '').value
+        )
+        self.cow_name_prefix = str(
+            self.declare_parameter('cow_name_prefix', '').value
+        )
+        self.number_of_drones = int(
+            self.declare_parameter('number_of_drones', 0).value
+        )
+        self.number_of_cows = int(
+            self.declare_parameter('number_of_cows', 0).value
+        )
+        self.drone_approach_radius = float(
+            self.declare_parameter('drone_approach_radius', -1.0).value
+        )
+        self.push_point_margin = float(
+            self.declare_parameter('push_point_margin', -1.0).value
+        )
+        self._validate_shared_parameters()
+
         self.drone_sub_list = {}
         self.drone_pos_dir = {}
-
-        for i in range(number_of_drones):
-            name = namespace + str(i)
-            self.drone_sub_list[name] = (self.create_subscription(
-            Pose, name + '/gt_pose', lambda msg, n=name: self.drone_callback(msg, n), 10))
+        for index in range(self.number_of_drones):
+            name = self.drone_namespace_prefix + str(index)
+            self.drone_sub_list[name] = self.create_subscription(
+                Pose,
+                name + '/gt_pose',
+                lambda msg, n=name: self.drone_callback(msg, n),
+                10,
+            )
 
         self.position_sub = self.create_subscription(
-            ModelStates, '/gazebo/model_states', self.models_callback, 10)
+            ModelStates,
+            '/gazebo/model_states',
+            self.models_callback,
+            10,
+        )
 
-        # Posicao do drone
         self.cows_dict = None
         self.last_cows_dict = None
 
-        self.drone_sensing_radius = float(
-            self.declare_parameter(
-                'drone_sensing_radius', 5.0).value)
-        self.drone_approach_radius = float(
-            self.declare_parameter(
-                'drone_approach_radius', 4.0).value)
-        self.push_point_margin = float(
-            self.declare_parameter(
-                'push_point_margin', 0.2).value)
         minimum_sensing_radius = (
-            self.drone_approach_radius + self.push_point_margin)
-        if self.drone_sensing_radius <= minimum_sensing_radius:
+            self.drone_approach_radius + self.push_point_margin
+        )
+        if self.config.drone_sensing_radius_m <= minimum_sensing_radius:
             raise ValueError(
-                'drone_sensing_radius must be greater than the complete '
-                'drone approach distance')
-        self.get_logger().info(
-            f'Cow drone sensing radius={self.drone_sensing_radius:.2f} m; '
-            f'drone approach distance={minimum_sensing_radius:.2f} m')
+                'cow_config.xml drone_sensing_radius_m must be greater than '
+                'the shared drone approach radius plus push-point margin'
+            )
 
         self.publishers_dict = {}
-        for i in range(number_of_cows):
-            cow_key = 'cow' + str(i)
-            publisher = self.create_publisher(Twist, f'/{cow_key}/cmd_vel', 10)
-            self.publishers_dict[cow_key] = publisher
+        for index in range(self.number_of_cows):
+            cow_key = self.cow_name_prefix + str(index)
+            self.publishers_dict[cow_key] = self.create_publisher(
+                Twist,
+                f'/{cow_key}/cmd_vel',
+                10,
+            )
 
-        self.timer = self.create_timer(0.1, self.move_cows)
+        self.timer = self.create_timer(
+            self.config.control_period_seconds,
+            self.move_cows,
+        )
 
-    def quaternion_to_yaw(self, orientation):
-        q_w = orientation.w
-        q_x = orientation.x
-        q_y = orientation.y
-        q_z = orientation.z
-        siny_cosp = 2.0 * (q_w * q_z + q_x * q_y)
-        cosy_cosp = 1.0 - 2.0 * (q_y * q_y + q_z * q_z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        return yaw
-    
-    def invert_rad(self, rad):
-        if rad > 0:
-            return rad - math.pi
-        else:
-            return rad + math.pi
+        self.get_logger().info(
+            f'Loaded cow configuration: {self.config.source_path}; '
+            f'drones={self.number_of_drones}, cows={self.number_of_cows}, '
+            f'drone sensing={self.config.drone_sensing_radius_m:.2f} m, '
+            f'cow repulsion={self.config.cow_repulsion_radius_m:.2f} m, '
+            f'approach={minimum_sensing_radius:.2f} m'
+        )
 
-    def normalize_rad_neg_pi_to_pi(self, angle_rad):
-        pi = math.pi
-        two_pi = 2 * pi
-        normalized = (angle_rad + pi) % two_pi - pi
-        return normalized
+    def _validate_shared_parameters(self):
+        if not self.drone_namespace_prefix:
+            raise ValueError('drone_namespace_prefix cannot be empty')
+        if not self.cow_name_prefix:
+            raise ValueError('cow_name_prefix cannot be empty')
+        if self.number_of_drones < 1:
+            raise ValueError('number_of_drones must be at least one')
+        if self.number_of_cows < 1:
+            raise ValueError('number_of_cows must be at least one')
+        if (
+            not math.isfinite(self.drone_approach_radius)
+            or self.drone_approach_radius <= 0.0
+        ):
+            raise ValueError('drone_approach_radius must be positive')
+        if (
+            not math.isfinite(self.push_point_margin)
+            or self.push_point_margin < 0.0
+        ):
+            raise ValueError('push_point_margin must be nonnegative')
+
+    @staticmethod
+    def quaternion_to_yaw(orientation):
+        siny_cosp = 2.0 * (
+            orientation.w * orientation.z
+            + orientation.x * orientation.y
+        )
+        cosy_cosp = 1.0 - 2.0 * (
+            orientation.y * orientation.y
+            + orientation.z * orientation.z
+        )
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    @staticmethod
+    def normalize_rad_neg_pi_to_pi(angle_rad):
+        return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
 
     def move_cows(self):
-        if self.cows_dict is None or len(self.publishers_dict.keys()) == 0:
+        if self.cows_dict is None or not self.publishers_dict:
             return
 
-        drone_threshold = self.drone_sensing_radius
-        cow_threshold = 1.0  # metres - repulsion radius from other cows
-
         for key, value in self.cows_dict.items():
-            if value is None:
-                continue
-            if key not in self.publishers_dict:
+            if value is None or key not in self.publishers_dict:
                 continue
 
             px = value.position.x
             py = value.position.y
+            force_x = 0.0
+            force_y = 0.0
 
-            # ── Accumulate APF repulsive forces ──────────────────────────────
-            fx = 0.0
-            fy = 0.0
-
-            # Repulsion from drones
-            for drone_key, drone_pose in self.drone_pos_dir.items():
+            for drone_pose in self.drone_pos_dir.values():
                 if drone_pose is None:
                     continue
-                dx = px - drone_pose.position.x
-                dy = py - drone_pose.position.y
-                dist = math.sqrt(dx * dx + dy * dy)
-                if 0.0 < dist <= drone_threshold:
-                    # APF: force magnitude = 1/d²  (points away from drone)
-                    magnitude = 1.0 / (dist * dist)
-                    fx += magnitude * (dx / dist)
-                    fy += magnitude * (dy / dist)
+                delta_x = px - drone_pose.position.x
+                delta_y = py - drone_pose.position.y
+                distance = math.hypot(delta_x, delta_y)
+                if (
+                    0.0
+                    < distance
+                    <= self.config.drone_sensing_radius_m
+                ):
+                    magnitude = 1.0 / (distance * distance)
+                    force_x += magnitude * delta_x / distance
+                    force_y += magnitude * delta_y / distance
 
-            # Repulsion from other cows
             for other_key, other_pose in self.cows_dict.items():
                 if other_key == key or other_pose is None:
                     continue
-                dx = px - other_pose.position.x
-                dy = py - other_pose.position.y
-                dist = math.sqrt(dx * dx + dy * dy)
-                if 0.0 < dist < cow_threshold:
-                    magnitude = 1.0 / (dist * dist)
-                    fx += magnitude * (dx / dist)
-                    fy += magnitude * (dy / dist)
+                delta_x = px - other_pose.position.x
+                delta_y = py - other_pose.position.y
+                distance = math.hypot(delta_x, delta_y)
+                if (
+                    0.0
+                    < distance
+                    < self.config.cow_repulsion_radius_m
+                ):
+                    magnitude = 1.0 / (distance * distance)
+                    force_x += magnitude * delta_x / distance
+                    force_y += magnitude * delta_y / distance
 
-            # If no force acts on this cow, publish zero and move on
-            force_mag = math.sqrt(fx * fx + fy * fy)
-            if force_mag == 0.0:
+            if math.hypot(force_x, force_y) == 0.0:
                 self.publishers_dict[key].publish(Twist())
                 continue
 
-            # ── Steer toward the resultant force direction ────────────────────
-            rad = math.atan2(fy, fx)
+            target_yaw = math.atan2(force_y, force_x)
             yaw = self.quaternion_to_yaw(value.orientation)
-
-            if self.last_cows_dict is not None and key in self.last_cows_dict and self.last_cows_dict[key] is not None:
-                last_yaw = self.quaternion_to_yaw(self.last_cows_dict[key].orientation)
+            if (
+                self.last_cows_dict is not None
+                and key in self.last_cows_dict
+                and self.last_cows_dict[key] is not None
+            ):
+                last_yaw = self.quaternion_to_yaw(
+                    self.last_cows_dict[key].orientation
+                )
             else:
                 last_yaw = yaw
 
-            diff_rad      = self.normalize_rad_neg_pi_to_pi(rad - yaw)
-            last_diff_rad = self.normalize_rad_neg_pi_to_pi(rad - last_yaw)
-
-            control_p = 0.2
-            control_d = 5.0
+            yaw_error = self.normalize_rad_neg_pi_to_pi(target_yaw - yaw)
+            last_yaw_error = self.normalize_rad_neg_pi_to_pi(
+                target_yaw - last_yaw
+            )
 
             twist = Twist()
-            twist.linear.x  = 0.5
-            twist.angular.z = (diff_rad * control_p) + (control_d * (diff_rad - last_diff_rad))
-
+            twist.linear.x = self.config.linear_velocity_mps
+            twist.angular.z = (
+                yaw_error * self.config.heading_proportional_gain
+                + self.config.heading_derivative_gain
+                * (yaw_error - last_yaw_error)
+            )
             self.publishers_dict[key].publish(twist)
 
     def drone_callback(self, msg, namespace):
         self.drone_pos_dir[namespace] = msg
 
-    def models_callback(self, msg: ModelStates):
+    def models_callback(self, msg):
         dictionary = {}
         self.last_cows_dict = self.cows_dict
 
         for index, name in enumerate(msg.name):
-
-            if 'cow' not in name.lower():
+            if not name.startswith(self.cow_name_prefix):
                 continue
-
-            pose = msg.pose[index]
-            px = pose.position.x
-            py = pose.position.y
-            dictionary[name] = pose
+            dictionary[name] = msg.pose[index]
 
         self.cows_dict = dictionary
 
-            
+
 def main(args=None):
     rclpy.init(args=args)
     node = PeopleRepeller()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

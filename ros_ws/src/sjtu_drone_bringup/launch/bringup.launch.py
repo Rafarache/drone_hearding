@@ -1,528 +1,412 @@
 #!/usr/bin/env python3
-# Copyright 2023 Georg Novotny
-#
-# Licensed under the GNU GENERAL PUBLIC LICENSE, Version 3.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.gnu.org/licenses/gpl-3.0.en.html
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
+import math
 import os
+import xml.etree.ElementTree as ET
 
-import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch.substitutions import LaunchConfiguration
-from launch.substitutions import LaunchConfiguration
 
-def get_teleop_controller(context, *_, **kwargs) -> Node:
-    controller = context.launch_configurations["controller"]
-    namespace = kwargs["model_ns"]
 
-    print(namespace)
+def _required_element(root, name, source_path):
+    element = root.find(name)
+    if element is None:
+        raise ValueError(f'Missing <{name}> section in {source_path}')
+    return element
 
-    if controller == "joystick":
-        node = Node(
-            package="sjtu_drone_control",
-            executable="teleop_joystick",
-            namespace=namespace,
-            output="screen",
+
+def _required_text(element, attribute, source_path):
+    value = element.get(attribute)
+    if value is None:
+        raise ValueError(
+            f'Missing attribute {attribute!r} in {source_path}'
+        )
+    return value.strip()
+
+
+def _required_float(element, attribute, source_path):
+    raw = _required_text(element, attribute, source_path)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f'Attribute {attribute!r} must be numeric in {source_path}'
+        ) from exc
+    if not math.isfinite(value):
+        raise ValueError(
+            f'Attribute {attribute!r} must be finite in {source_path}'
+        )
+    return value
+
+
+def _required_bool(element, attribute, source_path):
+    raw = _required_text(element, attribute, source_path).lower()
+    if raw not in {'true', 'false'}:
+        raise ValueError(
+            f'Attribute {attribute!r} must be true or false in {source_path}'
+        )
+    return raw == 'true'
+
+
+def _parse_positions(parent, element_name, source_path, include_z):
+    positions = []
+    for index, element in enumerate(parent.findall(element_name)):
+        position = {
+            'x': _required_float(element, 'x', source_path),
+            'y': _required_float(element, 'y', source_path),
+        }
+        if include_z:
+            position['z'] = _required_float(element, 'z', source_path)
+        positions.append(position)
+
+    if not positions:
+        raise ValueError(
+            f'{source_path} must contain at least one <{element_name}>'
+        )
+    return positions
+
+
+def _load_simulation_config(source_path):
+    try:
+        root = ET.parse(source_path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise RuntimeError(
+            f'Unable to load simulation configuration {source_path}: {exc}'
+        ) from exc
+    if root.tag != 'simulation':
+        raise ValueError(
+            f'Expected <simulation> root in {source_path}, got <{root.tag}>'
         )
 
-    else:
-        node = Node(
-            package="sjtu_drone_control",
-            executable="teleop",
-            namespace=namespace,
-            output="screen",
-            prefix="xterm -e",
+    runtime = _required_element(root, 'runtime', source_path)
+    map_element = _required_element(root, 'map', source_path)
+    interfaces = _required_element(root, 'interfaces', source_path)
+    herding = _required_element(root, 'herding', source_path)
+    drones_element = _required_element(root, 'drones', source_path)
+    cows_element = _required_element(root, 'cows', source_path)
+
+    config = {
+        'source_path': source_path,
+        'world_package': _required_text(
+            runtime, 'world_package', source_path
+        ),
+        'world_path': _required_text(runtime, 'world_path', source_path),
+        'use_gui': _required_bool(runtime, 'use_gui', source_path),
+        'controller': _required_text(runtime, 'controller', source_path),
+        'fixed_frame': runtime.get('fixed_frame', '').strip(),
+        'map_center_x': _required_float(
+            map_element, 'center_x', source_path
+        ),
+        'map_center_y': _required_float(
+            map_element, 'center_y', source_path
+        ),
+        'map_width_m': _required_float(
+            map_element, 'width_m', source_path
+        ),
+        'map_height_m': _required_float(
+            map_element, 'height_m', source_path
+        ),
+        'drone_namespace_prefix': _required_text(
+            interfaces, 'drone_namespace_prefix', source_path
+        ),
+        'cow_name_prefix': _required_text(
+            interfaces, 'cow_name_prefix', source_path
+        ),
+        'cow_positions_topic': _required_text(
+            interfaces, 'cow_positions_topic', source_path
+        ),
+        'drone_approach_radius': _required_float(
+            herding, 'drone_approach_radius_m', source_path
+        ),
+        'push_point_margin': _required_float(
+            herding, 'push_point_margin_m', source_path
+        ),
+        'drones': _parse_positions(
+            drones_element, 'drone', source_path, include_z=False
+        ),
+        'cows': _parse_positions(
+            cows_element, 'cow', source_path, include_z=True
+        ),
+    }
+
+    if config['controller'] not in {'keyboard', 'joystick'}:
+        raise ValueError(
+            f"controller must be keyboard or joystick in {source_path}"
         )
+    if config['map_width_m'] <= 0.0 or config['map_height_m'] <= 0.0:
+        raise ValueError(f'Map dimensions must be positive in {source_path}')
+    if config['drone_approach_radius'] <= 0.0:
+        raise ValueError(
+            f'drone_approach_radius_m must be positive in {source_path}'
+        )
+    if config['push_point_margin'] < 0.0:
+        raise ValueError(
+            f'push_point_margin_m must be nonnegative in {source_path}'
+        )
+    for name in (
+        'world_package',
+        'world_path',
+        'drone_namespace_prefix',
+        'cow_name_prefix',
+        'cow_positions_topic',
+    ):
+        if not config[name]:
+            raise ValueError(f'{name} cannot be empty in {source_path}')
 
-    return [node]
+    min_x = config['map_center_x'] - config['map_width_m'] / 2.0
+    max_x = config['map_center_x'] + config['map_width_m'] / 2.0
+    min_y = config['map_center_y'] - config['map_height_m'] / 2.0
+    max_y = config['map_center_y'] + config['map_height_m'] / 2.0
+    for entity_type in ('drones', 'cows'):
+        for index, position in enumerate(config[entity_type]):
+            if not (
+                min_x <= position['x'] <= max_x
+                and min_y <= position['y'] <= max_y
+            ):
+                raise ValueError(
+                    f'{entity_type}[{index}] position is outside the map '
+                    f'in {source_path}'
+                )
 
-def rviz_node_generator(context, rviz_path):
-    """Return a Node action for RViz, omitting --fixed-frame if empty."""
-    fixed_frame_value = LaunchConfiguration('fixed_frame').perform(context)
+    return config
 
-    rviz_arguments = ['-d', rviz_path]
 
-    if fixed_frame_value:
-        rviz_arguments.extend(['--fixed-frame', fixed_frame_value])
+def _teleop_node(namespace, controller):
+    if controller == 'joystick':
+        return Node(
+            package='sjtu_drone_control',
+            executable='teleop_joystick',
+            namespace=namespace,
+            output='screen',
+        )
+    return Node(
+        package='sjtu_drone_control',
+        executable='teleop',
+        namespace=namespace,
+        output='screen',
+        prefix='xterm -e',
+    )
 
-    return [
+
+def _launch_setup(context):
+    source_path = LaunchConfiguration(
+        'simulation_config_file'
+    ).perform(context)
+    config = _load_simulation_config(source_path)
+
+    bringup_share = get_package_share_directory('sjtu_drone_bringup')
+    gazebo_share = get_package_share_directory('gazebo_ros')
+    world_share = get_package_share_directory(config['world_package'])
+    world_file = os.path.join(world_share, config['world_path'])
+    if not os.path.isfile(world_file):
+        raise ValueError(f'World file does not exist: {world_file}')
+
+    number_of_drones = len(config['drones'])
+    number_of_cows = len(config['cows'])
+    namespace_prefix = config['drone_namespace_prefix']
+    cow_name_prefix = config['cow_name_prefix']
+
+    print(
+        f"Loaded simulation configuration: {source_path}; "
+        f"drones={number_of_drones}, cows={number_of_cows}, "
+        f"map={config['map_width_m']}x{config['map_height_m']} m"
+    )
+
+    actions = [
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(gazebo_share, 'launch', 'gzserver.launch.py')
+            ),
+            launch_arguments={
+                'world': world_file,
+                'verbose': 'true',
+                'extra_gazebo_args': 'verbose',
+            }.items(),
+        ),
         Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',
-            arguments=rviz_arguments,
-            output='screen',
-        )
-    ]
-
-def cow_launch_description(context, *args, **kwargs):
-    model_folder = 'turtlebot3_burger'
-    robot_desc_path = os.path.join(get_package_share_directory("turtlebot3_gazebo"), "urdf", "turtlebot3_burger.urdf")
-    urdf_path = os.path.join(get_package_share_directory('cow_pkg'),'models',model_folder,'model.sdf')
-    with open(robot_desc_path, 'r') as infp:
-        robot_desc = infp.read()
-
-    name_default = "cow"
-    number_of_cows = LaunchConfiguration('number_of_cows').perform(context)
-    number_of_drones = LaunchConfiguration('number_of_drones').perform(context)
-    drone_approach_radius = float(
-        LaunchConfiguration('drone_approach_radius').perform(context))
-    push_point_margin = float(
-        LaunchConfiguration('push_point_margin').perform(context))
-    cow_drone_sensing_radius = float(
-        LaunchConfiguration('cow_drone_sensing_radius').perform(context))
-    show_yolo_camera_value = (
-        LaunchConfiguration('show_yolo_camera').perform(context)
-        .strip().lower()
-    )
-    if show_yolo_camera_value not in {'true', 'false'}:
-        raise ValueError('show_yolo_camera must be true or false')
-    show_yolo_camera = show_yolo_camera_value == 'true'
-    camera_horizontal_fov_rad = float(
-        LaunchConfiguration('camera_horizontal_fov_rad').perform(context))
-    tracker_reacquisition_distance = float(
-        LaunchConfiguration(
-            'tracker_reacquisition_distance').perform(context))
-    tracker_reacquisition_mahalanobis_gate = float(
-        LaunchConfiguration(
-            'tracker_reacquisition_mahalanobis_gate').perform(context))
-    if cow_drone_sensing_radius <= (
-            drone_approach_radius + push_point_margin):
-        raise ValueError(
-            'cow_drone_sensing_radius must be greater than '
-            'drone_approach_radius + push_point_margin')
-    model_ns = "/simple_drone"
-    array = []
-
-    for i in range(int(number_of_cows)):
-        name = name_default + str(i)
-
-        spawn_robot = Node(
-            package='gazebo_ros', 
-            executable='spawn_entity.py', 
-            arguments=[
-                '-entity', name, 
-                '-file', urdf_path, 
-                '-x', '3.0', 
-                '-y', str(i *1)+'.0', 
-                '-z', '0.01',
-                '-robot_namespace', name,
-            ],
-            output='screen'
-        )
-
-        robot_state_publisher = Node(
-            package='robot_state_publisher',
-            executable='robot_state_publisher',
-            name='robot_state_publisher',
-            namespace=name,
-            output='screen',
-            parameters=[{'frame_prefix': name + '/',
-                        'use_sim_time': True,
-                        'robot_description': robot_desc}]
-        )
-
-        array.append(spawn_robot)
-        array.append(robot_state_publisher)
-
-    array.append(
-        Node(
-            package="cow_pkg",
-            executable="repeller",
-            arguments=[model_ns, number_of_drones, number_of_cows],
-            name='cow_pkg',
-            parameters=[{
-                'drone_sensing_radius': cow_drone_sensing_radius,
-                'drone_approach_radius': drone_approach_radius,
-                'push_point_margin': push_point_margin,
-            }],
-            output="screen"
-        ),
-    )
-
-    array.append(
-        Node(
-            package="yolo_pkg",
-            executable="yolo_subscriber",
-            arguments=[model_ns, number_of_drones],
-            name='yolo_pkg',
-            parameters=[{
-                'show_annotated_camera': show_yolo_camera,
-                'camera_horizontal_fov_rad': camera_horizontal_fov_rad,
-                'tracker_reacquisition_distance': (
-                    tracker_reacquisition_distance
-                ),
-                'tracker_reacquisition_mahalanobis_gate': (
-                    tracker_reacquisition_mahalanobis_gate
-                ),
-            }],
-            output="screen"
-        ),
-    )
-
-    # array.append(
-    #     Node(
-    #         package="herding_pkg",
-    #         executable="herding_control_my",
-    #         arguments=[model_ns, number_of_drones],
-    #         name='herding_pkg',
-    #         output="screen"
-    #     ),
-    # )
-
-    return array
-
-def drone_launch_description(context, *args, **kwargs):
-    array = []
-    model_ns = "/simple_drone"
-    sjtu_drone_bringup_path = get_package_share_directory('sjtu_drone_bringup')
-
-    number_of_drones = LaunchConfiguration('number_of_drones').perform(context)
-    global_map_min_x = float(
-        LaunchConfiguration('global_map_min_x').perform(context))
-    global_map_max_x = float(
-        LaunchConfiguration('global_map_max_x').perform(context))
-    global_map_min_y = float(
-        LaunchConfiguration('global_map_min_y').perform(context))
-    global_map_max_y = float(
-        LaunchConfiguration('global_map_max_y').perform(context))
-    drone_approach_radius = float(
-        LaunchConfiguration('drone_approach_radius').perform(context))
-    push_point_margin = float(
-        LaunchConfiguration('push_point_margin').perform(context))
-    max_near_goal_objective_potential = float(
-        LaunchConfiguration(
-            'max_near_goal_objective_potential').perform(context))
-    objective_priority_min_spread = float(
-        LaunchConfiguration(
-            'objective_priority_min_spread').perform(context))
-    objective_priority_fallback_bias_m = float(
-        LaunchConfiguration(
-            'objective_priority_fallback_bias_m').perform(context))
-    drone_max_linear_velocity = float(
-        LaunchConfiguration(
-            'drone_max_linear_velocity').perform(context))
-    drone_max_linear_acceleration = float(
-        LaunchConfiguration(
-            'drone_max_linear_acceleration').perform(context))
-    drone_max_angular_velocity = float(
-        LaunchConfiguration(
-            'drone_max_angular_velocity').perform(context))
-    drone_max_angular_acceleration = float(
-        LaunchConfiguration(
-            'drone_max_angular_acceleration').perform(context))
-    drone_position_tolerance = float(
-        LaunchConfiguration(
-            'drone_position_tolerance').perform(context))
-    drone_linear_slowdown_distance = float(
-        LaunchConfiguration(
-            'drone_linear_slowdown_distance').perform(context))
-
-    cow_pos = [
-        [3,5],
-        [-6,7],
-        [-3,2]
-    ]
-
-    for i in range(int(number_of_drones)):
-        name = model_ns + str(i)
-
-        node = Node(
-            package='joy',
-            executable='joy_node',
-            name='joy',
-            namespace=name,
-            output='screen',
-        )
-
-        func = OpaqueFunction(
-            function=get_teleop_controller,
-            kwargs={'model_ns': name},
-        )
-
-        desc = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(sjtu_drone_bringup_path, 'launch', 'bringup_gazebo.launch.py')
+            arguments=(
+                ['-d', os.path.join(bringup_share, 'rviz', 'rviz.rviz')]
+                + (
+                    ['--fixed-frame', config['fixed_frame']]
+                    if config['fixed_frame']
+                    else []
+                )
             ),
-            launch_arguments={
-                'x': str(0),
-                'y': str(i*2),
-                'model_ns': name,
-                'drone_max_linear_velocity':
-                    str(drone_max_linear_velocity),
-                'drone_max_linear_acceleration':
-                    str(drone_max_linear_acceleration),
-                'drone_max_angular_velocity':
-                    str(drone_max_angular_velocity),
-                'drone_max_angular_acceleration':
-                    str(drone_max_angular_acceleration),
-                'drone_position_tolerance':
-                    str(drone_position_tolerance),
-                'drone_linear_slowdown_distance':
-                    str(drone_linear_slowdown_distance),
-            }.items()
-        )
+            output='screen',
+        ),
+    ]
 
-        array.append(
-            Node(
-                package="grid_visualizer_pkg",
-                executable="grid_visualizer_node",
-                namespace=name,
-                name=f"grid{i}",
-                parameters=[{
-                    "drone_index": i,
-                    "total_drones": int(number_of_drones),
-                    "global_map_min_x": global_map_min_x,
-                    "global_map_max_x": global_map_max_x,
-                    "global_map_min_y": global_map_min_y,
-                    "global_map_max_y": global_map_max_y,
-                    "cow_exclusion_radius": drone_approach_radius,
-                    "push_point_margin": push_point_margin,
-                    "max_near_goal_objective_potential":
-                        max_near_goal_objective_potential,
-                    "objective_priority_min_spread":
-                        objective_priority_min_spread,
-                    "objective_priority_fallback_bias_m":
-                        objective_priority_fallback_bias_m,
-                }],
-                output="screen",
+    if config['use_gui']:
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(gazebo_share, 'launch', 'gzclient.launch.py')
+                ),
+                launch_arguments={'verbose': 'true'}.items(),
             )
         )
 
-        array.append(node)
-        array.append(func)
-        array.append(desc)
-    
-    return array
+    cow_model_folder = 'turtlebot3_burger'
+    cow_model_path = os.path.join(
+        get_package_share_directory('cow_pkg'),
+        'models',
+        cow_model_folder,
+        'model.sdf',
+    )
+    robot_description_path = os.path.join(
+        get_package_share_directory('turtlebot3_gazebo'),
+        'urdf',
+        'turtlebot3_burger.urdf',
+    )
+    with open(robot_description_path, 'r', encoding='utf-8') as stream:
+        cow_robot_description = stream.read()
+
+    for index, position in enumerate(config['cows']):
+        name = cow_name_prefix + str(index)
+        actions.extend(
+            [
+                Node(
+                    package='gazebo_ros',
+                    executable='spawn_entity.py',
+                    arguments=[
+                        '-entity', name,
+                        '-file', cow_model_path,
+                        '-x', str(position['x']),
+                        '-y', str(position['y']),
+                        '-z', str(position['z']),
+                        '-robot_namespace', name,
+                    ],
+                    output='screen',
+                ),
+                Node(
+                    package='robot_state_publisher',
+                    executable='robot_state_publisher',
+                    name='robot_state_publisher',
+                    namespace=name,
+                    output='screen',
+                    parameters=[
+                        {
+                            'frame_prefix': name + '/',
+                            'use_sim_time': True,
+                            'robot_description': cow_robot_description,
+                        }
+                    ],
+                ),
+            ]
+        )
+
+    shared_parameters = {
+        'drone_namespace_prefix': namespace_prefix,
+        'cow_name_prefix': cow_name_prefix,
+        'number_of_drones': number_of_drones,
+        'number_of_cows': number_of_cows,
+        'drone_approach_radius': config['drone_approach_radius'],
+        'push_point_margin': config['push_point_margin'],
+    }
+    actions.append(
+        Node(
+            package='cow_pkg',
+            executable='repeller',
+            name='cow_pkg',
+            parameters=[shared_parameters],
+            output='screen',
+        )
+    )
+    actions.append(
+        Node(
+            package='yolo_pkg',
+            executable='yolo_subscriber',
+            name='yolo_pkg',
+            parameters=[
+                {
+                    'drone_namespace_prefix': namespace_prefix,
+                    'number_of_drones': number_of_drones,
+                    'cow_positions_topic': config['cow_positions_topic'],
+                }
+            ],
+            output='screen',
+        )
+    )
+
+    drone_launch = os.path.join(
+        bringup_share,
+        'launch',
+        'bringup_gazebo.launch.py',
+    )
+    for index, position in enumerate(config['drones']):
+        namespace = namespace_prefix + str(index)
+        actions.extend(
+            [
+                Node(
+                    package='joy',
+                    executable='joy_node',
+                    name='joy',
+                    namespace=namespace,
+                    output='screen',
+                ),
+                _teleop_node(namespace, config['controller']),
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(drone_launch),
+                    launch_arguments={
+                        'x': str(position['x']),
+                        'y': str(position['y']),
+                        'model_ns': namespace,
+                    }.items(),
+                ),
+                Node(
+                    package='grid_visualizer_pkg',
+                    executable='grid_visualizer_node',
+                    namespace=namespace,
+                    name=f'grid{index}',
+                    parameters=[
+                        {
+                            'drone_index': index,
+                            'total_drones': number_of_drones,
+                            'global_map_center_x': config['map_center_x'],
+                            'global_map_center_y': config['map_center_y'],
+                            'global_map_width': config['map_width_m'],
+                            'global_map_height': config['map_height_m'],
+                            'drone_namespace_prefix': namespace_prefix,
+                            'cow_positions_topic':
+                                config['cow_positions_topic'],
+                            'cow_exclusion_radius':
+                                config['drone_approach_radius'],
+                            'push_point_margin':
+                                config['push_point_margin'],
+                        }
+                    ],
+                    output='screen',
+                ),
+            ]
+        )
+
+    return actions
 
 
 def generate_launch_description():
-    pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
-
-    world_file_default = os.path.join(
-        get_package_share_directory("sjtu_drone_description"),
-        "worlds", "farm_no_animals.world"
+    default_config = os.path.join(
+        get_package_share_directory('sjtu_drone_bringup'),
+        'config',
+        'simulation.xml',
     )
-
-    world_file = LaunchConfiguration('world', default=world_file_default)
-
-    def launch_gzclient(context, *args, **kwargs):
-        if context.launch_configurations.get('use_gui') == 'true':
-            return [IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(pkg_gazebo_ros, 'launch', 'gzclient.launch.py')
-                ),
-                launch_arguments={'verbose': 'true'}.items()
-            )]
-        return []
-
-    sjtu_drone_bringup_path = get_package_share_directory('sjtu_drone_bringup')
-
-    rviz_path = os.path.join(
-        sjtu_drone_bringup_path, "rviz", "rviz.rviz"
-    )
-
-    declare_number__cows_arg = DeclareLaunchArgument(
-        'number_of_cows',
-        default_value='3',
-        description='Number of cows argument'
-    )
-
-    declare_number_drones_arg = DeclareLaunchArgument(
-        'number_of_drones',
-        default_value='2',
-        description='Number of drones argument'
-    )
-
-    global_map_bound_args = [
-        DeclareLaunchArgument(
-            'global_map_min_x',
-            default_value='-50.0',
-            description='Minimum global map X coordinate'
-        ),
-        DeclareLaunchArgument(
-            'global_map_max_x',
-            default_value='50.0',
-            description='Maximum global map X coordinate'
-        ),
-        DeclareLaunchArgument(
-            'global_map_min_y',
-            default_value='-50.0',
-            description='Minimum global map Y coordinate'
-        ),
-        DeclareLaunchArgument(
-            'global_map_max_y',
-            default_value='50.0',
-            description='Maximum global map Y coordinate'
-        ),
-    ]
-
-    herding_radius_args = [
-        DeclareLaunchArgument(
-            'drone_approach_radius',
-            default_value='3.0',
-            description='Minimum drone distance from a cow in metres'
-        ),
-        DeclareLaunchArgument(
-            'push_point_margin',
-            default_value='0.7',
-            description='Extra distance behind each cow push point'
-        ),
-        DeclareLaunchArgument(
-            'cow_drone_sensing_radius',
-            default_value='6.0',
-            description='Distance at which cows react to drones in metres'
-        ),
-    ]
-
-    objective_priority_args = [
-        DeclareLaunchArgument(
-            'max_near_goal_objective_potential',
-            default_value='0.9',
-            description=(
-                'Maximum relaxation potential assigned to the nearest '
-                'active cow objective'
-            )
-        ),
-        DeclareLaunchArgument(
-            'objective_priority_min_spread',
-            default_value='1.0',
-            description=(
-                'Minimum cow-to-goal distance spread used to normalize '
-                'objective priority in metres'
-            )
-        ),
-        DeclareLaunchArgument(
-            'objective_priority_fallback_bias_m',
-            default_value='10.0',
-            description=(
-                'Maximum geodesic fallback penalty for a low-priority '
-                'cow objective in metres'
-            )
-        ),
-    ]
-
-    drone_motion_smoothing_args = [
-        DeclareLaunchArgument(
-            'drone_max_linear_velocity',
-            default_value='0.4',
-            description='Maximum horizontal drone speed in metres per second'
-        ),
-        DeclareLaunchArgument(
-            'drone_max_linear_acceleration',
-            default_value='0.5',
-            description=(
-                'Maximum change in horizontal velocity per second'
-            )
-        ),
-        DeclareLaunchArgument(
-            'drone_max_angular_velocity',
-            default_value='1.0',
-            description='Maximum camera-focus yaw rate in radians per second'
-        ),
-        DeclareLaunchArgument(
-            'drone_max_angular_acceleration',
-            default_value='1.0',
-            description='Maximum change in yaw rate per second'
-        ),
-        DeclareLaunchArgument(
-            'drone_position_tolerance',
-            default_value='0.1',
-            description='Distance at which a waypoint is considered reached'
-        ),
-        DeclareLaunchArgument(
-            'drone_linear_slowdown_distance',
-            default_value='0.4',
-            description='Distance over which velocity tapers near a waypoint'
-        ),
-    ]
-
-    yolo_visualization_args = [
-        DeclareLaunchArgument(
-            'show_yolo_camera',
-            default_value='false',
-            description='Show annotated cow detections from each drone camera'
-        ),
-        DeclareLaunchArgument(
-            'camera_horizontal_fov_rad',
-            default_value='2.09',
-            description=(
-                'Horizontal field of view used to decide whether a missing '
-                'cow should count as a tracker miss'
-            )
-        ),
-        DeclareLaunchArgument(
-            'tracker_reacquisition_distance',
-            default_value='5.0',
-            description=(
-                'Maximum Euclidean distance for reacquiring a confirmed '
-                'cow track in metres'
-            )
-        ),
-        DeclareLaunchArgument(
-            'tracker_reacquisition_mahalanobis_gate',
-            default_value='16.0',
-            description=(
-                'Squared Mahalanobis gate used to reacquire a confirmed '
-                'cow track'
-            )
-        ),
-    ]
-
-    cow_launch_function_action = OpaqueFunction(function=cow_launch_description)
-
-    drone_launch_function_action = OpaqueFunction(function=drone_launch_description)
-
-    return LaunchDescription([
-        DeclareLaunchArgument(
-            "controller",
-            default_value="keyboard",
-            description="Type of controller: keyboard (default) or joystick",
-        ),
-
-        DeclareLaunchArgument(
-            'fixed_frame',
-            default_value='',
-            description='If provided, sets the fixed frame in RViz.'
-        ),
-
-        OpaqueFunction(
-            function=rviz_node_generator,
-            kwargs={'rviz_path': rviz_path},
-        ),
-
-        declare_number__cows_arg,
-        declare_number_drones_arg,
-        *global_map_bound_args,
-        *herding_radius_args,
-        *objective_priority_args,
-        *drone_motion_smoothing_args,
-        *yolo_visualization_args,
-        cow_launch_function_action,
-        drone_launch_function_action,
-
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(pkg_gazebo_ros, 'launch', 'gzserver.launch.py')
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                'simulation_config_file',
+                default_value=default_config,
+                description='Path to the authoritative simulation XML file',
             ),
-            launch_arguments={'world': world_file,
-                              'verbose': "true",
-                              'extra_gazebo_args': 'verbose'}.items()
-        ),
-
-        OpaqueFunction(function=launch_gzclient),
-
-    ])
+            OpaqueFunction(function=_launch_setup),
+        ]
+    )

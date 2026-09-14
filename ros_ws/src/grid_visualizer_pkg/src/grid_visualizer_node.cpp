@@ -12,72 +12,236 @@
 #include <tuple>
 
 #include "rclcpp/rclcpp.hpp"
+#include "ament_index_cpp/get_package_share_directory.hpp"
 #include "geometry_msgs/msg/pose.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
 #include <opencv2/opencv.hpp>
 
-// Constants for visualization map geometry and herding logic
-constexpr double MAP_HALF_WIDTH = 10.0; // Displays 20m x 20m map (from -10m to +10m on X and Y)
-constexpr int GRID_SIZE = 40;          // Grid resolution N x N cells
-constexpr double GRID_CELL_SIZE = (2.0 * MAP_HALF_WIDTH) / GRID_SIZE;
-constexpr int GRID_CENTER_ROW = GRID_SIZE / 2;
-constexpr int GRID_CENTER_COL = GRID_SIZE / 2;
-constexpr double LOCAL_OBJECTIVE_HALF_EXTENT =
-  MAP_HALF_WIDTH - 1.5 * GRID_CELL_SIZE;
-constexpr int RELAXATION_MAX_ITERATIONS = 1000;
-constexpr double RELAXATION_TOLERANCE = 1.0e-8;
-constexpr double SOR_RELAXATION_FACTOR = 1.7;
-constexpr double LOW_GRADIENT_THRESHOLD = 1.0e-6;
-constexpr double POTENTIAL_DESCENT_EPSILON = 1.0e-10;
-constexpr bool ENABLE_SADDLE_NEIGHBOR_DESCENT = false;
-constexpr bool ENABLE_GEODESIC_FIELD_FALLBACK = true;
-constexpr int CONTROL_RECOVERY_SEARCH_RADIUS_CELLS = 8;
-constexpr bool ENABLE_OCCUPANCY_GRID_DISPLAY = false;
-constexpr bool ENABLE_VECTOR_GRID_DISPLAY = true;
+struct GridConfig
+{
+  std::string source_path;
+  double map_half_width{0.0};
+  double cell_size{0.0};
+  int grid_size{0};
+  int grid_center_row{0};
+  int grid_center_col{0};
+  double local_objective_half_extent{0.0};
+  int relaxation_max_iterations{0};
+  double relaxation_tolerance{0.0};
+  double sor_relaxation_factor{0.0};
+  double low_gradient_threshold{0.0};
+  double potential_descent_epsilon{0.0};
+  bool enable_saddle_neighbor_descent{false};
+  bool enable_geodesic_field_fallback{false};
+  int control_recovery_search_radius_cells{0};
+  bool show_occupancy_grid{false};
+  bool show_vector_grid{false};
+  int visualization_period_ms{0};
+  int control_period_ms{0};
+  double free_cell_potential{0.0};
+  double boundary_potential{0.0};
+  cv::Point2f goal_position{0.0f, 0.0f};
+  double final_goal_reached_radius{0.0};
+  double max_goto_movement{0.0};
+  double max_near_goal_objective_potential{0.0};
+  double objective_priority_curve_exponent{0.0};
+  double primary_objective_switch_margin{0.0};
+  double primary_objective_association_radius{0.0};
+  double objective_priority_min_spread{0.0};
+  double objective_priority_fallback_bias{0.0};
+};
 
-// Herding Constants
-const cv::Point2f GOAL_POSITION(-10.0f, -10.0f);
-constexpr double DEFAULT_COW_EXCLUSION_RADIUS = 3.0;  // meters
-constexpr double DEFAULT_PUSH_POINT_MARGIN = 0.7;       // meters
-constexpr double DEFAULT_MAX_NEAR_GOAL_OBJECTIVE_POTENTIAL = 0.9;
-constexpr double OBJECTIVE_PRIORITY_CURVE_EXPONENT = 0.25;
-constexpr double PRIMARY_OBJECTIVE_SWITCH_MARGIN = 1.0;  // meters
-constexpr double PRIMARY_OBJECTIVE_ASSOCIATION_RADIUS = 2.0;  // meters
-constexpr double DEFAULT_OBJECTIVE_PRIORITY_MIN_SPREAD = 1.0;  // meters
-constexpr double DEFAULT_OBJECTIVE_PRIORITY_FALLBACK_BIAS = 10.0;  // meters
-constexpr double MAX_GOTO_MOVEMENT = 0.5;       // meters
-constexpr double FINAL_GOAL_REACHED_RADIUS = 2.0;           // meters
-constexpr const char* DRONE_NAMESPACE_PREFIX = "/simple_drone";
+template<typename T>
+T read_required(const cv::FileStorage & storage, const char * key)
+{
+  const cv::FileNode node = storage[key];
+  if (node.empty()) {
+    throw std::invalid_argument(
+      std::string("Missing grid configuration value: ") + key);
+  }
+  T value{};
+  node >> value;
+  return value;
+}
+
+GridConfig load_grid_config()
+{
+  GridConfig config;
+  config.source_path =
+    ament_index_cpp::get_package_share_directory("grid_visualizer_pkg") +
+    "/config/grid_config.xml";
+
+  cv::FileStorage storage(config.source_path, cv::FileStorage::READ);
+  if (!storage.isOpened()) {
+    throw std::runtime_error(
+      "Unable to open grid configuration: " + config.source_path);
+  }
+
+  const double local_grid_extent =
+    read_required<double>(storage, "local_grid_extent_m");
+  config.cell_size = read_required<double>(storage, "cell_size_m");
+  config.free_cell_potential =
+    read_required<double>(storage, "free_cell_potential");
+  config.boundary_potential =
+    read_required<double>(storage, "boundary_potential");
+  config.relaxation_max_iterations =
+    read_required<int>(storage, "relaxation_max_iterations");
+  config.relaxation_tolerance =
+    read_required<double>(storage, "relaxation_tolerance");
+  config.sor_relaxation_factor =
+    read_required<double>(storage, "sor_relaxation_factor");
+  config.low_gradient_threshold =
+    read_required<double>(storage, "low_gradient_threshold");
+  config.potential_descent_epsilon =
+    read_required<double>(storage, "potential_descent_epsilon");
+  config.enable_saddle_neighbor_descent =
+    read_required<int>(storage, "enable_saddle_neighbor_descent") != 0;
+  config.enable_geodesic_field_fallback =
+    read_required<int>(storage, "enable_geodesic_field_fallback") != 0;
+  config.control_recovery_search_radius_cells =
+    read_required<int>(storage, "control_recovery_search_radius_cells");
+  config.show_occupancy_grid =
+    read_required<int>(storage, "show_occupancy_grid") != 0;
+  config.show_vector_grid =
+    read_required<int>(storage, "show_vector_grid") != 0;
+  config.visualization_period_ms =
+    read_required<int>(storage, "visualization_period_ms");
+  config.control_period_ms =
+    read_required<int>(storage, "control_period_ms");
+  config.goal_position = cv::Point2f(
+    static_cast<float>(read_required<double>(storage, "goal_x")),
+    static_cast<float>(read_required<double>(storage, "goal_y")));
+  config.final_goal_reached_radius =
+    read_required<double>(storage, "final_goal_reached_radius_m");
+  config.max_goto_movement =
+    read_required<double>(storage, "max_goto_movement_m");
+  config.max_near_goal_objective_potential =
+    read_required<double>(
+      storage, "max_near_goal_objective_potential");
+  config.objective_priority_curve_exponent =
+    read_required<double>(storage, "objective_priority_curve_exponent");
+  config.primary_objective_switch_margin =
+    read_required<double>(storage, "primary_objective_switch_margin_m");
+  config.primary_objective_association_radius =
+    read_required<double>(
+      storage, "primary_objective_association_radius_m");
+  config.objective_priority_min_spread =
+    read_required<double>(storage, "objective_priority_min_spread_m");
+  config.objective_priority_fallback_bias =
+    read_required<double>(storage, "objective_priority_fallback_bias_m");
+
+  if (
+    !std::isfinite(local_grid_extent) ||
+    !std::isfinite(config.cell_size) ||
+    local_grid_extent <= 0.0 ||
+    config.cell_size <= 0.0)
+  {
+    throw std::invalid_argument(
+      "local_grid_extent_m and cell_size_m must be finite and positive");
+  }
+
+  const double exact_grid_size = local_grid_extent / config.cell_size;
+  config.grid_size = static_cast<int>(std::llround(exact_grid_size));
+  if (
+    config.grid_size < 4 ||
+    config.grid_size % 2 != 0 ||
+    std::abs(exact_grid_size - config.grid_size) > 1.0e-9)
+  {
+    throw std::invalid_argument(
+      "local_grid_extent_m must divide into an even number of cells");
+  }
+
+  config.map_half_width = local_grid_extent / 2.0;
+  config.grid_center_row = config.grid_size / 2;
+  config.grid_center_col = config.grid_size / 2;
+  config.local_objective_half_extent =
+    config.map_half_width - 1.5 * config.cell_size;
+
+  if (
+    config.relaxation_max_iterations <= 0 ||
+    !std::isfinite(config.relaxation_tolerance) ||
+    config.relaxation_tolerance <= 0.0 ||
+    !std::isfinite(config.sor_relaxation_factor) ||
+    config.sor_relaxation_factor <= 0.0 ||
+    config.sor_relaxation_factor >= 2.0 ||
+    !std::isfinite(config.low_gradient_threshold) ||
+    config.low_gradient_threshold <= 0.0 ||
+    !std::isfinite(config.potential_descent_epsilon) ||
+    config.potential_descent_epsilon <= 0.0)
+  {
+    throw std::invalid_argument(
+      "Grid relaxation values are outside their valid ranges");
+  }
+
+  if (
+    config.control_recovery_search_radius_cells < 1 ||
+    config.visualization_period_ms <= 0 ||
+    config.control_period_ms <= 0 ||
+    !std::isfinite(config.free_cell_potential) ||
+    !std::isfinite(config.boundary_potential) ||
+    config.boundary_potential <= config.free_cell_potential)
+  {
+    throw std::invalid_argument(
+      "Grid timing, recovery, or potential values are invalid");
+  }
+
+  if (
+    !std::isfinite(config.goal_position.x) ||
+    !std::isfinite(config.goal_position.y) ||
+    !std::isfinite(config.final_goal_reached_radius) ||
+    config.final_goal_reached_radius <= 0.0 ||
+    !std::isfinite(config.max_goto_movement) ||
+    config.max_goto_movement <= 0.0 ||
+    !std::isfinite(config.max_near_goal_objective_potential) ||
+    config.max_near_goal_objective_potential < 0.0 ||
+    config.max_near_goal_objective_potential >= config.boundary_potential ||
+    !std::isfinite(config.objective_priority_curve_exponent) ||
+    config.objective_priority_curve_exponent <= 0.0 ||
+    !std::isfinite(config.primary_objective_switch_margin) ||
+    config.primary_objective_switch_margin < 0.0 ||
+    !std::isfinite(config.primary_objective_association_radius) ||
+    config.primary_objective_association_radius <= 0.0 ||
+    !std::isfinite(config.objective_priority_min_spread) ||
+    config.objective_priority_min_spread <= 0.0 ||
+    !std::isfinite(config.objective_priority_fallback_bias) ||
+    config.objective_priority_fallback_bias < 0.0)
+  {
+    throw std::invalid_argument(
+      "Grid goal and objective-priority values are invalid");
+  }
+
+  return config;
+}
 
 class OccupancyGridVisualizer : public rclcpp::Node
 {
 public:
   OccupancyGridVisualizer()
-  : Node("occupancy_grid_visualizer")
+  : Node("occupancy_grid_visualizer"), config_(load_grid_config())
   {
-    drone_index_ = this->declare_parameter<int>("drone_index", 0);
-    total_drones_ = this->declare_parameter<int>("total_drones", 1);
-    global_map_min_x_ =
-      this->declare_parameter<double>("global_map_min_x", -50.0);
-    global_map_max_x_ =
-      this->declare_parameter<double>("global_map_max_x", 50.0);
-    global_map_min_y_ =
-      this->declare_parameter<double>("global_map_min_y", -50.0);
-    global_map_max_y_ =
-      this->declare_parameter<double>("global_map_max_y", 50.0);
+    drone_index_ = this->declare_parameter<int>("drone_index", -1);
+    total_drones_ = this->declare_parameter<int>("total_drones", 0);
+    global_map_center_x_ = this->declare_parameter<double>(
+      "global_map_center_x", std::numeric_limits<double>::quiet_NaN());
+    global_map_center_y_ = this->declare_parameter<double>(
+      "global_map_center_y", std::numeric_limits<double>::quiet_NaN());
+    global_map_width_ = this->declare_parameter<double>(
+      "global_map_width", -1.0);
+    global_map_height_ = this->declare_parameter<double>(
+      "global_map_height", -1.0);
+    drone_namespace_prefix_ = this->declare_parameter<std::string>(
+      "drone_namespace_prefix", "");
+    cows_position_topic_ = this->declare_parameter<std::string>(
+      "cow_positions_topic", "");
     cow_exclusion_radius_ = this->declare_parameter<double>(
-      "cow_exclusion_radius", DEFAULT_COW_EXCLUSION_RADIUS);
+      "cow_exclusion_radius", -1.0);
     push_point_margin_ = this->declare_parameter<double>(
-      "push_point_margin", DEFAULT_PUSH_POINT_MARGIN);
-    max_near_goal_objective_potential_ = this->declare_parameter<double>(
-      "max_near_goal_objective_potential",
-      DEFAULT_MAX_NEAR_GOAL_OBJECTIVE_POTENTIAL);
-    objective_priority_min_spread_ = this->declare_parameter<double>(
-      "objective_priority_min_spread",
-      DEFAULT_OBJECTIVE_PRIORITY_MIN_SPREAD);
-    objective_priority_fallback_bias_m_ = this->declare_parameter<double>(
-      "objective_priority_fallback_bias_m",
-      DEFAULT_OBJECTIVE_PRIORITY_FALLBACK_BIAS);
+      "push_point_margin", -1.0);
+
+    global_map_min_x_ = global_map_center_x_ - global_map_width_ / 2.0;
+    global_map_max_x_ = global_map_center_x_ + global_map_width_ / 2.0;
+    global_map_min_y_ = global_map_center_y_ - global_map_height_ / 2.0;
+    global_map_max_y_ = global_map_center_y_ + global_map_height_ / 2.0;
 
     if (total_drones_ <= 0) {
       throw std::invalid_argument("total_drones must be greater than zero");
@@ -87,16 +251,17 @@ public:
         "drone_index must be in the range [0, total_drones)");
     }
     if (
-      !std::isfinite(global_map_min_x_) ||
-      !std::isfinite(global_map_max_x_) ||
-      !std::isfinite(global_map_min_y_) ||
-      !std::isfinite(global_map_max_y_) ||
-      global_map_min_x_ >= global_map_max_x_ ||
-      global_map_min_y_ >= global_map_max_y_)
+      !std::isfinite(global_map_center_x_) ||
+      !std::isfinite(global_map_center_y_) ||
+      !std::isfinite(global_map_width_) ||
+      !std::isfinite(global_map_height_) ||
+      global_map_width_ <= 0.0 ||
+      global_map_height_ <= 0.0 ||
+      drone_namespace_prefix_.empty() ||
+      cows_position_topic_.empty())
     {
       throw std::invalid_argument(
-        "global map bounds must be finite and each minimum must be "
-        "smaller than its maximum");
+        "global map geometry and topic parameters are invalid");
     }
 
     if (
@@ -110,27 +275,12 @@ public:
         "must be nonnegative");
     }
 
-    if (
-      !std::isfinite(max_near_goal_objective_potential_) ||
-      max_near_goal_objective_potential_ < 0.0 ||
-      max_near_goal_objective_potential_ >= 1.0 ||
-      !std::isfinite(objective_priority_min_spread_) ||
-      objective_priority_min_spread_ <= 0.0 ||
-      !std::isfinite(objective_priority_fallback_bias_m_) ||
-      objective_priority_fallback_bias_m_ < 0.0)
-    {
-      throw std::invalid_argument(
-        "max_near_goal_objective_potential must be in [0, 1), "
-        "objective_priority_min_spread must be positive, and "
-        "objective_priority_fallback_bias_m must be nonnegative");
-    }
-
     global_map_center_ = cv::Point2f(
-      static_cast<float>((global_map_min_x_ + global_map_max_x_) / 2.0),
-      static_cast<float>((global_map_min_y_ + global_map_max_y_) / 2.0));
+      static_cast<float>(global_map_center_x_),
+      static_cast<float>(global_map_center_y_));
 
     drone_namespace_ =
-      std::string(DRONE_NAMESPACE_PREFIX) + std::to_string(drone_index_);
+      std::string(drone_namespace_prefix_) + std::to_string(drone_index_);
     grid_name_ = "grid" + std::to_string(drone_index_);
     occupancy_window_name_ = "Occupancy Grid - " + grid_name_;
     vector_window_name_ = "Vector Movement Grid - " + grid_name_;
@@ -165,11 +315,18 @@ public:
       this->get_logger(),
       "Cow objective priority: max potential %.2f, minimum spread %.2f m, "
       "fallback bias %.2f m",
-      max_near_goal_objective_potential_,
-      objective_priority_min_spread_,
-      objective_priority_fallback_bias_m_);
+      config_.max_near_goal_objective_potential,
+      config_.objective_priority_min_spread,
+      config_.objective_priority_fallback_bias);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Loaded grid configuration: %s (%d x %d cells, %.2f m/cell)",
+      config_.source_path.c_str(), config_.grid_size, config_.grid_size,
+      config_.cell_size);
     RCLCPP_INFO(this->get_logger(), "Drone Pose Sub Topic: %s", drone_gt_topic.c_str());
-    RCLCPP_INFO(this->get_logger(), "Cows Pose Sub Topic: /cows_pos");
+    RCLCPP_INFO(
+      this->get_logger(), "Cows Pose Sub Topic: %s",
+      cows_position_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "Drone Goto Pub Topic: %s", goto_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Drone Focus Pub Topic: %s", focus_topic.c_str());
 
@@ -187,7 +344,7 @@ public:
       }
 
       const std::string peer_topic =
-        std::string(DRONE_NAMESPACE_PREFIX) +
+        std::string(drone_namespace_prefix_) +
         std::to_string(peer_index) + "/gt_pose";
       peer_drone_subs_.push_back(
         this->create_subscription<geometry_msgs::msg::Pose>(
@@ -205,7 +362,7 @@ public:
     }
 
     cow_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
-      "/cows_pos",
+      cows_position_topic_,
       10,
       std::bind(&OccupancyGridVisualizer::cow_callback, this, std::placeholders::_1)
     );
@@ -214,19 +371,22 @@ public:
     goto_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(goto_topic, 10);
     focusin_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(focus_topic, 10);
 
-    // Initialize 5Hz visualization timer (200ms)
+    // Initialize the configured visualization timer.
     timer_5hz_ = this->create_wall_timer(
-      std::chrono::milliseconds(200),
+      std::chrono::milliseconds(config_.visualization_period_ms),
       std::bind(&OccupancyGridVisualizer::timer_5hz_callback, this)
     );
 
-    // Initialize 2Hz movement control timer (500ms)
+    // Initialize the configured movement-control timer.
     timer_2hz_ = this->create_wall_timer(
-      std::chrono::milliseconds(500),
+      std::chrono::milliseconds(config_.control_period_ms),
       std::bind(&OccupancyGridVisualizer::timer_2hz_callback, this)
     );
 
-    RCLCPP_INFO(this->get_logger(), "Node initialized with 5Hz UI and 2Hz Control Timers.");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Node initialized with UI period %d ms and control period %d ms.",
+      config_.visualization_period_ms, config_.control_period_ms);
   }
 
 private:
@@ -304,48 +464,48 @@ private:
   // HELPER MAPPING FUNCTIONS
   // -------------------------------------------------------------
 
-  static bool local_to_grid(double x, double y, int& row, int& col)
+  bool local_to_grid(double x, double y, int& row, int& col) const
   {
     if (
       !std::isfinite(x) ||
       !std::isfinite(y) ||
-      x < -MAP_HALF_WIDTH ||
-      x > MAP_HALF_WIDTH ||
-      y < -MAP_HALF_WIDTH ||
-      y > MAP_HALF_WIDTH)
+      x < -config_.map_half_width ||
+      x > config_.map_half_width ||
+      y < -config_.map_half_width ||
+      y > config_.map_half_width)
     {
       return false;
     }
 
     const double norm_x =
-      (x + MAP_HALF_WIDTH) / (2.0 * MAP_HALF_WIDTH);
+      (x + config_.map_half_width) / (2.0 * config_.map_half_width);
     const double norm_y =
-      (MAP_HALF_WIDTH - y) / (2.0 * MAP_HALF_WIDTH);
+      (config_.map_half_width - y) / (2.0 * config_.map_half_width);
 
-    col = static_cast<int>(std::floor(norm_x * GRID_SIZE));
-    row = static_cast<int>(std::floor(norm_y * GRID_SIZE));
+    col = static_cast<int>(std::floor(norm_x * config_.grid_size));
+    row = static_cast<int>(std::floor(norm_y * config_.grid_size));
 
-    col = std::clamp(col, 0, GRID_SIZE - 1);
-    row = std::clamp(row, 0, GRID_SIZE - 1);
+    col = std::clamp(col, 0, config_.grid_size - 1);
+    row = std::clamp(row, 0, config_.grid_size - 1);
     return true;
   }
 
-  static cv::Point2f grid_to_local(int row, int col)
+  cv::Point2f grid_to_local(int row, int col) const
   {
-    const float norm_x = (col + 0.5f) / GRID_SIZE;
-    const float norm_y = (row + 0.5f) / GRID_SIZE;
+    const float norm_x = (col + 0.5f) / config_.grid_size;
+    const float norm_y = (row + 0.5f) / config_.grid_size;
 
     const float x =
-      norm_x * (2.0f * MAP_HALF_WIDTH) - MAP_HALF_WIDTH;
+      norm_x * (2.0f * config_.map_half_width) - config_.map_half_width;
     const float y =
-      MAP_HALF_WIDTH - norm_y * (2.0f * MAP_HALF_WIDTH);
+      config_.map_half_width - norm_y * (2.0f * config_.map_half_width);
     return cv::Point2f(x, y);
   }
 
-  static cv::Point2f grid_to_global(
+  cv::Point2f grid_to_global(
     int row,
     int col,
-    const cv::Point2f& grid_center)
+    const cv::Point2f& grid_center) const
   {
     return grid_center + grid_to_local(row, col);
   }
@@ -381,16 +541,16 @@ private:
     cv::Point2f& clipped_target) const
   {
     const double valid_min_x = std::max(
-      static_cast<double>(grid_center.x) - LOCAL_OBJECTIVE_HALF_EXTENT,
+      static_cast<double>(grid_center.x) - config_.local_objective_half_extent,
       global_map_min_x_);
     const double valid_max_x = std::min(
-      static_cast<double>(grid_center.x) + LOCAL_OBJECTIVE_HALF_EXTENT,
+      static_cast<double>(grid_center.x) + config_.local_objective_half_extent,
       global_map_max_x_);
     const double valid_min_y = std::max(
-      static_cast<double>(grid_center.y) - LOCAL_OBJECTIVE_HALF_EXTENT,
+      static_cast<double>(grid_center.y) - config_.local_objective_half_extent,
       global_map_min_y_);
     const double valid_max_y = std::min(
-      static_cast<double>(grid_center.y) + LOCAL_OBJECTIVE_HALF_EXTENT,
+      static_cast<double>(grid_center.y) + config_.local_objective_half_extent,
       global_map_max_y_);
 
     if (
@@ -407,31 +567,31 @@ private:
     const double direction_x = target.x - grid_center.x;
     const double direction_y = target.y - grid_center.y;
     if (
-      std::abs(direction_x) <= POTENTIAL_DESCENT_EPSILON &&
-      std::abs(direction_y) <= POTENTIAL_DESCENT_EPSILON)
+      std::abs(direction_x) <= config_.potential_descent_epsilon &&
+      std::abs(direction_y) <= config_.potential_descent_epsilon)
     {
       clipped_target = grid_center;
       return true;
     }
 
     double scale = 1.0;
-    if (direction_x > POTENTIAL_DESCENT_EPSILON) {
+    if (direction_x > config_.potential_descent_epsilon) {
       scale = std::min(
         scale, (valid_max_x - grid_center.x) / direction_x);
-    } else if (direction_x < -POTENTIAL_DESCENT_EPSILON) {
+    } else if (direction_x < -config_.potential_descent_epsilon) {
       scale = std::min(
         scale, (valid_min_x - grid_center.x) / direction_x);
     }
-    if (direction_y > POTENTIAL_DESCENT_EPSILON) {
+    if (direction_y > config_.potential_descent_epsilon) {
       scale = std::min(
         scale, (valid_max_y - grid_center.y) / direction_y);
-    } else if (direction_y < -POTENTIAL_DESCENT_EPSILON) {
+    } else if (direction_y < -config_.potential_descent_epsilon) {
       scale = std::min(
         scale, (valid_min_y - grid_center.y) / direction_y);
     }
 
     scale = std::clamp(scale, 0.0, 1.0);
-    if (scale <= POTENTIAL_DESCENT_EPSILON) {
+    if (scale <= config_.potential_descent_epsilon) {
       return false;
     }
 
@@ -443,19 +603,19 @@ private:
       std::isfinite(clipped_target.y);
   }
 
-  static bool find_nearest_free_interior_cell(
+  bool find_nearest_free_interior_cell(
     const cv::Mat& is_fixed,
     int desired_row,
     int desired_col,
     int& result_row,
-    int& result_col)
+    int& result_col) const
   {
     double best_distance_sq = std::numeric_limits<double>::infinity();
     result_row = -1;
     result_col = -1;
 
-    for (int r = 1; r < GRID_SIZE - 1; ++r) {
-      for (int c = 1; c < GRID_SIZE - 1; ++c) {
+    for (int r = 1; r < config_.grid_size - 1; ++r) {
+      for (int c = 1; c < config_.grid_size - 1; ++c) {
         if (is_fixed.at<uchar>(r, c) == 1) {
           continue;
         }
@@ -483,10 +643,10 @@ private:
     return result_row >= 0;
   }
 
-  static cv::Mat compute_goal_distance_grid(
+  cv::Mat compute_goal_distance_grid(
     const cv::Mat& is_fixed,
     const cv::Mat& objective_mask,
-    const cv::Mat& objective_source_cost)
+    const cv::Mat& objective_source_cost) const
   {
     using QueueEntry = std::tuple<double, int, int>;
     std::priority_queue<
@@ -495,13 +655,13 @@ private:
       std::greater<QueueEntry>> open_cells;
 
     cv::Mat distance_grid(
-      GRID_SIZE,
-      GRID_SIZE,
+      config_.grid_size,
+      config_.grid_size,
       CV_64F,
       cv::Scalar(std::numeric_limits<double>::infinity()));
 
-    for (int r = 1; r < GRID_SIZE - 1; ++r) {
-      for (int c = 1; c < GRID_SIZE - 1; ++c) {
+    for (int r = 1; r < config_.grid_size - 1; ++r) {
+      for (int c = 1; c < config_.grid_size - 1; ++c) {
         if (objective_mask.at<uchar>(r, c) == 0) {
           continue;
         }
@@ -529,9 +689,9 @@ private:
           const int neighbor_col = col + col_offset;
           if (
             neighbor_row <= 0 ||
-            neighbor_row >= GRID_SIZE - 1 ||
+            neighbor_row >= config_.grid_size - 1 ||
             neighbor_col <= 0 ||
-            neighbor_col >= GRID_SIZE - 1)
+            neighbor_col >= config_.grid_size - 1)
           {
             continue;
           }
@@ -558,14 +718,14 @@ private:
             }
           }
 
-          const double step_distance = GRID_CELL_SIZE *
+          const double step_distance = config_.cell_size *
             std::hypot(
               static_cast<double>(row_offset),
               static_cast<double>(col_offset));
           const double candidate_distance = distance + step_distance;
           double& stored_distance =
             distance_grid.at<double>(neighbor_row, neighbor_col);
-          if (candidate_distance + POTENTIAL_DESCENT_EPSILON < stored_distance) {
+          if (candidate_distance + config_.potential_descent_epsilon < stored_distance) {
             stored_distance = candidate_distance;
             open_cells.emplace(
               candidate_distance, neighbor_row, neighbor_col);
@@ -577,7 +737,7 @@ private:
     return distance_grid;
   }
 
-  static bool find_local_recovery_direction(
+  bool find_local_recovery_direction(
     double drone_x,
     double drone_y,
     int drone_row,
@@ -585,20 +745,20 @@ private:
     const std::vector<std::vector<cv::Point2f>>& vector_grid,
     const cv::Mat& is_fixed,
     const cv::Point2f& grid_center,
-    cv::Point2f& recovery_direction)
+    cv::Point2f& recovery_direction) const
   {
     double best_distance_sq = std::numeric_limits<double>::infinity();
     int best_row = -1;
     int best_col = -1;
 
     for (int radius = 1;
-      radius <= CONTROL_RECOVERY_SEARCH_RADIUS_CELLS;
+      radius <= config_.control_recovery_search_radius_cells;
       ++radius)
     {
       const int min_row = std::max(1, drone_row - radius);
-      const int max_row = std::min(GRID_SIZE - 2, drone_row + radius);
+      const int max_row = std::min(config_.grid_size - 2, drone_row + radius);
       const int min_col = std::max(1, drone_col - radius);
-      const int max_col = std::min(GRID_SIZE - 2, drone_col + radius);
+      const int max_col = std::min(config_.grid_size - 2, drone_col + radius);
 
       for (int row = min_row; row <= max_row; ++row) {
         for (int col = min_col; col <= max_col; ++col) {
@@ -643,7 +803,7 @@ private:
     const double direction_x = recovery_target.x - drone_x;
     const double direction_y = recovery_target.y - drone_y;
     const double magnitude = std::hypot(direction_x, direction_y);
-    if (magnitude <= POTENTIAL_DESCENT_EPSILON) {
+    if (magnitude <= config_.potential_descent_epsilon) {
       return false;
     }
 
@@ -691,36 +851,36 @@ private:
       static_cast<float>(drone_pose->position.y));
 
     std::vector<std::vector<CellState>> grid(
-      GRID_SIZE,
-      std::vector<CellState>(GRID_SIZE, EMPTY));
+      config_.grid_size,
+      std::vector<CellState>(config_.grid_size, EMPTY));
     cv::Mat potential_grid(
-      GRID_SIZE, GRID_SIZE, CV_64F, cv::Scalar(0.5));
+      config_.grid_size, config_.grid_size, CV_64F, cv::Scalar(config_.free_cell_potential));
     cv::Mat is_fixed(
-      GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
+      config_.grid_size, config_.grid_size, CV_8UC1, cv::Scalar(0));
     cv::Mat objective_mask(
-      GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
+      config_.grid_size, config_.grid_size, CV_8UC1, cv::Scalar(0));
     cv::Mat objective_source_cost(
-      GRID_SIZE, GRID_SIZE, CV_64F, cv::Scalar(0.0));
+      config_.grid_size, config_.grid_size, CV_64F, cv::Scalar(0.0));
     std::vector<PushObjective> current_push_objectives;
     bool evaluated_at_least_one_cow = false;
 
     // The local perimeter closes the relaxation problem. Cells whose global
     // centers lie outside the finite map are also unavailable.
-    for (int row = 0; row < GRID_SIZE; ++row) {
-      for (int col = 0; col < GRID_SIZE; ++col) {
+    for (int row = 0; row < config_.grid_size; ++row) {
+      for (int col = 0; col < config_.grid_size; ++col) {
         const cv::Point2f global_cell =
           grid_to_global(row, col, grid_center);
         const bool is_local_perimeter =
           row == 0 ||
-          row == GRID_SIZE - 1 ||
+          row == config_.grid_size - 1 ||
           col == 0 ||
-          col == GRID_SIZE - 1;
+          col == config_.grid_size - 1;
         if (
           is_local_perimeter ||
           !is_inside_global_map(global_cell.x, global_cell.y))
         {
           grid[row][col] = EXCLUSION;
-          potential_grid.at<double>(row, col) = 1.0;
+          potential_grid.at<double>(row, col) = config_.boundary_potential;
           is_fixed.at<uchar>(row, col) = 1;
         }
       }
@@ -747,8 +907,8 @@ private:
 
         // A cow outside the visible window can still affect cells where its
         // exclusion circle overlaps the window.
-        for (int row = 0; row < GRID_SIZE; ++row) {
-          for (int col = 0; col < GRID_SIZE; ++col) {
+        for (int row = 0; row < config_.grid_size; ++row) {
+          for (int col = 0; col < config_.grid_size; ++col) {
             const cv::Point2f global_cell =
               grid_to_global(row, col, grid_center);
             const double distance = std::hypot(
@@ -758,7 +918,7 @@ private:
               if (grid[row][col] != COW) {
                 grid[row][col] = EXCLUSION;
               }
-              potential_grid.at<double>(row, col) = 1.0;
+              potential_grid.at<double>(row, col) = config_.boundary_potential;
               is_fixed.at<uchar>(row, col) = 1;
             }
           }
@@ -766,14 +926,14 @@ private:
 
         const cv::Point2f cow_point(cow_x, cow_y);
         const cv::Point2f direction_to_goal =
-          GOAL_POSITION - cow_point;
+          config_.goal_position - cow_point;
         const float goal_distance = std::hypot(
           direction_to_goal.x,
           direction_to_goal.y);
 
         // A cow inside the final goal radius no longer needs a behind-cow
         // push objective. The objective is generated again if it leaves.
-        if (goal_distance > FINAL_GOAL_REACHED_RADIUS) {
+        if (goal_distance > config_.final_goal_reached_radius) {
           const cv::Point2f normalized_direction(
             direction_to_goal.x / goal_distance,
             direction_to_goal.y / goal_distance);
@@ -828,7 +988,7 @@ private:
       }
 
       grid[peer_row][peer_col] = DRONE;
-      potential_grid.at<double>(peer_row, peer_col) = 1.0;
+      potential_grid.at<double>(peer_row, peer_col) = config_.boundary_potential;
       is_fixed.at<uchar>(peer_row, peer_col) = 1;
     }
 
@@ -849,7 +1009,7 @@ private:
       const auto distance_limits = std::minmax_element(
         current_push_objectives.begin(),
         current_push_objectives.end(),
-        [](const PushObjective& lhs, const PushObjective& rhs) {
+        [this](const PushObjective& lhs, const PushObjective& rhs) {
           return lhs.cow_goal_distance < rhs.cow_goal_distance;
         });
       const double minimum_goal_distance =
@@ -858,7 +1018,7 @@ private:
         distance_limits.second->cow_goal_distance;
       const double normalization_span = std::max(
         maximum_goal_distance - minimum_goal_distance,
-        objective_priority_min_spread_);
+        config_.objective_priority_min_spread);
 
       // Select a deterministic lagging cow, then retain that choice while it
       // stays within the switch margin of the furthest cow. This prevents
@@ -872,11 +1032,11 @@ private:
         const auto& selected = current_push_objectives[primary_index];
         const bool candidate_is_farther =
           candidate.cow_goal_distance >
-          selected.cow_goal_distance + POTENTIAL_DESCENT_EPSILON;
+          selected.cow_goal_distance + config_.potential_descent_epsilon;
         const bool equal_distance_with_stable_order =
           std::abs(
             candidate.cow_goal_distance -
-            selected.cow_goal_distance) <= POTENTIAL_DESCENT_EPSILON &&
+            selected.cow_goal_distance) <= config_.potential_descent_epsilon &&
           (
             candidate.global_point.x < selected.global_point.x ||
             (
@@ -889,7 +1049,7 @@ private:
 
       if (has_remembered_primary_push_objective) {
         double nearest_distance =
-          PRIMARY_OBJECTIVE_ASSOCIATION_RADIUS;
+          config_.primary_objective_association_radius;
         std::size_t associated_index = current_push_objectives.size();
         for (std::size_t index = 0;
           index < current_push_objectives.size();
@@ -910,7 +1070,7 @@ private:
         if (
           associated_index < current_push_objectives.size() &&
           current_push_objectives[associated_index].cow_goal_distance >=
-            maximum_goal_distance - PRIMARY_OBJECTIVE_SWITCH_MARGIN)
+            maximum_goal_distance - config_.primary_objective_switch_margin)
         {
           primary_index = associated_index;
         }
@@ -927,19 +1087,19 @@ private:
           0.0,
           1.0);
         objective.boundary_potential =
-          max_near_goal_objective_potential_ *
+          config_.max_near_goal_objective_potential *
           std::pow(
             normalized_priority,
-            OBJECTIVE_PRIORITY_CURVE_EXPONENT);
+            config_.objective_priority_curve_exponent);
 
         if (index == primary_index) {
           objective.boundary_potential = 0.0;
         } else if (
           objective.cow_goal_distance >=
-            maximum_goal_distance - PRIMARY_OBJECTIVE_SWITCH_MARGIN)
+            maximum_goal_distance - config_.primary_objective_switch_margin)
         {
           objective.boundary_potential =
-            max_near_goal_objective_potential_;
+            config_.max_near_goal_objective_potential;
         }
       }
 
@@ -952,16 +1112,16 @@ private:
       std::sort(
         current_push_objectives.begin(),
         current_push_objectives.end(),
-        [](const PushObjective& lhs, const PushObjective& rhs) {
+        [this](const PushObjective& lhs, const PushObjective& rhs) {
           if (
             std::abs(lhs.cow_goal_distance - rhs.cow_goal_distance) >
-            POTENTIAL_DESCENT_EPSILON)
+            config_.potential_descent_epsilon)
           {
             return lhs.cow_goal_distance > rhs.cow_goal_distance;
           }
           if (
             std::abs(lhs.global_point.x - rhs.global_point.x) >
-            POTENTIAL_DESCENT_EPSILON)
+            config_.potential_descent_epsilon)
           {
             return lhs.global_point.x < rhs.global_point.x;
           }
@@ -1000,8 +1160,8 @@ private:
       {
         continue;
       }
-      desired_row = std::clamp(desired_row, 1, GRID_SIZE - 2);
-      desired_col = std::clamp(desired_col, 1, GRID_SIZE - 2);
+      desired_row = std::clamp(desired_row, 1, config_.grid_size - 2);
+      desired_col = std::clamp(desired_col, 1, config_.grid_size - 2);
 
       int objective_row = -1;
       int objective_col = -1;
@@ -1018,18 +1178,18 @@ private:
       const double boundary_potential = std::clamp(
         push_objective.boundary_potential,
         0.0,
-        max_near_goal_objective_potential_);
+        config_.max_near_goal_objective_potential);
       const double normalized_priority_cost =
-        max_near_goal_objective_potential_ >
-          POTENTIAL_DESCENT_EPSILON ?
-        boundary_potential / max_near_goal_objective_potential_ :
+        config_.max_near_goal_objective_potential >
+          config_.potential_descent_epsilon ?
+        boundary_potential / config_.max_near_goal_objective_potential :
         0.0;
 
       grid[objective_row][objective_col] = PUSH_OBJECTIVE;
       potential_grid.at<double>(objective_row, objective_col) =
         boundary_potential;
       objective_source_cost.at<double>(objective_row, objective_col) =
-        normalized_priority_cost * objective_priority_fallback_bias_m_;
+        normalized_priority_cost * config_.objective_priority_fallback_bias;
       is_fixed.at<uchar>(objective_row, objective_col) = 1;
       objective_mask.at<uchar>(objective_row, objective_col) = 1;
     }
@@ -1039,10 +1199,10 @@ private:
 
     // Solve Laplace's equation with in-place SOR until the field converges.
     if (has_push_objective) {
-      for (int iter = 0; iter < RELAXATION_MAX_ITERATIONS; ++iter) {
+      for (int iter = 0; iter < config_.relaxation_max_iterations; ++iter) {
         double max_change = 0.0;
-        for (int r = 1; r < GRID_SIZE - 1; ++r) {
-          for (int c = 1; c < GRID_SIZE - 1; ++c) {
+        for (int r = 1; r < config_.grid_size - 1; ++r) {
+          for (int c = 1; c < config_.grid_size - 1; ++c) {
             if (is_fixed.at<uchar>(r, c) == 1) {
               continue;
             }
@@ -1054,14 +1214,14 @@ private:
               potential_grid.at<double>(r - 1, c) +
               potential_grid.at<double>(r + 1, c)) / 4.0;
             const double new_value = old_value +
-              SOR_RELAXATION_FACTOR * (neighbor_average - old_value);
+              config_.sor_relaxation_factor * (neighbor_average - old_value);
 
             potential_grid.at<double>(r, c) = new_value;
             max_change = std::max(max_change, std::abs(new_value - old_value));
           }
         }
 
-        if (max_change < RELAXATION_TOLERANCE) {
+        if (max_change < config_.relaxation_tolerance) {
           break;
         }
       }
@@ -1070,17 +1230,17 @@ private:
     // Store unit movement directions. When the centered gradient cancels at a
     // saddle, descend to the steepest lower neighbor in the same potential grid.
     std::vector<std::vector<cv::Point2f>> vector_grid(
-      GRID_SIZE,
+      config_.grid_size,
       std::vector<cv::Point2f>(
-        GRID_SIZE, cv::Point2f(0.0f, 0.0f)));
+        config_.grid_size, cv::Point2f(0.0f, 0.0f)));
     cv::Mat saddle_escape_grid(
-      GRID_SIZE, GRID_SIZE, CV_8UC1, cv::Scalar(0));
+      config_.grid_size, config_.grid_size, CV_8UC1, cv::Scalar(0));
     const cv::Mat goal_distance_grid = compute_goal_distance_grid(
       is_fixed, objective_mask, objective_source_cost);
 
     if (has_push_objective) {
-      for (int r = 1; r < GRID_SIZE - 1; ++r) {
-        for (int c = 1; c < GRID_SIZE - 1; ++c) {
+      for (int r = 1; r < config_.grid_size - 1; ++r) {
+        for (int c = 1; c < config_.grid_size - 1; ++c) {
           if (is_fixed.at<uchar>(r, c) == 1) {
             continue;
           }
@@ -1090,20 +1250,20 @@ private:
           const double up = potential_grid.at<double>(r - 1, c);
           const double down = potential_grid.at<double>(r + 1, c);
           const double vector_x =
-            (left - right) / (2.0 * GRID_CELL_SIZE);
+            (left - right) / (2.0 * config_.cell_size);
           const double vector_y =
-            (down - up) / (2.0 * GRID_CELL_SIZE);
+            (down - up) / (2.0 * config_.cell_size);
           const double magnitude = std::hypot(vector_x, vector_y);
 
-          if (magnitude >= LOW_GRADIENT_THRESHOLD) {
+          if (magnitude >= config_.low_gradient_threshold) {
             vector_grid[r][c] = cv::Point2f(
               static_cast<float>(vector_x / magnitude),
               static_cast<float>(vector_y / magnitude));
             continue;
           }
 
-          if (!ENABLE_SADDLE_NEIGHBOR_DESCENT) {
-            if (!ENABLE_GEODESIC_FIELD_FALLBACK) {
+          if (!config_.enable_saddle_neighbor_descent) {
+            if (!config_.enable_geodesic_field_fallback) {
               continue;
             }
 
@@ -1139,7 +1299,7 @@ private:
                   goal_distance_grid.at<double>(
                     neighbor_row, neighbor_col);
                 if (
-                  neighbor_distance + POTENTIAL_DESCENT_EPSILON <
+                  neighbor_distance + config_.potential_descent_epsilon <
                   best_distance)
                 {
                   best_distance = neighbor_distance;
@@ -1165,7 +1325,7 @@ private:
 
           const double current_potential =
             potential_grid.at<double>(r, c);
-          double best_descent = POTENTIAL_DESCENT_EPSILON;
+          double best_descent = config_.potential_descent_epsilon;
           int best_row = -1;
           int best_col = -1;
 
@@ -1188,7 +1348,7 @@ private:
 
               const double neighbor_potential =
                 potential_grid.at<double>(neighbor_row, neighbor_col);
-              const double neighbor_distance = GRID_CELL_SIZE *
+              const double neighbor_distance = config_.cell_size *
                 std::hypot(
                   static_cast<double>(row_offset),
                   static_cast<double>(col_offset));
@@ -1198,11 +1358,11 @@ private:
 
               const bool stronger_descent =
                 descent >
-                best_descent + POTENTIAL_DESCENT_EPSILON;
+                best_descent + config_.potential_descent_epsilon;
               const bool deterministic_tie =
                 std::abs(descent - best_descent) <=
-                  POTENTIAL_DESCENT_EPSILON &&
-                descent > POTENTIAL_DESCENT_EPSILON &&
+                  config_.potential_descent_epsilon &&
+                descent > config_.potential_descent_epsilon &&
                 (
                   best_row < 0 ||
                   neighbor_row < best_row ||
@@ -1290,10 +1450,10 @@ private:
 
     // Render this center-aware candidate. Remembered global objectives make
     // empty detection updates regenerate at the current drone position.
-    if (ENABLE_OCCUPANCY_GRID_DISPLAY) {
+    if (config_.show_occupancy_grid) {
       compute_and_display_occupancy_map(grid, grid_center);
     }
-    if (ENABLE_VECTOR_GRID_DISPLAY) {
+    if (config_.show_vector_grid) {
       compute_and_display_vector_grid(
         grid, vector_grid, is_fixed, saddle_escape_grid, grid_center);
     }
@@ -1303,13 +1463,13 @@ private:
     cv::Mat& image,
     const cv::Point2f& grid_center) const
   {
-    const double local_x = GOAL_POSITION.x - grid_center.x;
-    const double local_y = GOAL_POSITION.y - grid_center.y;
+    const double local_x = config_.goal_position.x - grid_center.x;
+    const double local_y = config_.goal_position.y - grid_center.y;
     const bool goal_is_inside_local_grid =
-      local_x >= -MAP_HALF_WIDTH &&
-      local_x <= MAP_HALF_WIDTH &&
-      local_y >= -MAP_HALF_WIDTH &&
-      local_y <= MAP_HALF_WIDTH;
+      local_x >= -config_.map_half_width &&
+      local_x <= config_.map_half_width &&
+      local_y >= -config_.map_half_width &&
+      local_y <= config_.map_half_width;
 
     // A moving local grid cannot show the true position of an off-screen
     // global goal. Keep a marker on the map edge along the ray toward it so
@@ -1317,7 +1477,7 @@ private:
     double displayed_local_x = local_x;
     double displayed_local_y = local_y;
     if (!goal_is_inside_local_grid) {
-      const double marker_extent = MAP_HALF_WIDTH - GRID_CELL_SIZE;
+      const double marker_extent = config_.map_half_width - config_.cell_size;
       const double x_scale = std::abs(local_x) > marker_extent ?
         marker_extent / std::abs(local_x) : 1.0;
       const double y_scale = std::abs(local_y) > marker_extent ?
@@ -1329,15 +1489,15 @@ private:
 
     const int pixel_x = std::clamp(
       static_cast<int>(std::lround(
-        (displayed_local_x + MAP_HALF_WIDTH) /
-        (2.0 * MAP_HALF_WIDTH) *
+        (displayed_local_x + config_.map_half_width) /
+        (2.0 * config_.map_half_width) *
         (image.cols - 1))),
       0,
       image.cols - 1);
     const int pixel_y = std::clamp(
       static_cast<int>(std::lround(
-        (MAP_HALF_WIDTH - displayed_local_y) /
-        (2.0 * MAP_HALF_WIDTH) *
+        (config_.map_half_width - displayed_local_y) /
+        (2.0 * config_.map_half_width) *
         (image.rows - 1))),
       0,
       image.rows - 1);
@@ -1430,9 +1590,9 @@ private:
     const std::vector<std::vector<CellState>>& grid,
     const cv::Point2f& grid_center)
   {
-    cv::Mat display_img(GRID_SIZE, GRID_SIZE, CV_8UC3, cv::Scalar(255, 255, 255));
-    for (int r = 0; r < GRID_SIZE; ++r) {
-      for (int c = 0; c < GRID_SIZE; ++c) {
+    cv::Mat display_img(config_.grid_size, config_.grid_size, CV_8UC3, cv::Scalar(255, 255, 255));
+    for (int r = 0; r < config_.grid_size; ++r) {
+      for (int c = 0; c < config_.grid_size; ++c) {
         if (grid[r][c] == DRONE) {
           display_img.at<cv::Vec3b>(r, c) = cv::Vec3b(255, 0, 0);     // Blue
         } else if (grid[r][c] == COW) {
@@ -1456,7 +1616,7 @@ private:
 
     draw_final_goal(enlarged_img, grid_center);
 
-    // GRID_SIZE is even, so draw the drone at the exact geometric center
+    // config_.grid_size is even, so draw the drone at the exact geometric center
     // instead of offsetting it into one of the four central cells.
     cv::circle(
       enlarged_img,
@@ -1497,12 +1657,12 @@ private:
     const cv::Point2f& grid_center)
   {
     const int CANVAS_SIZE = 600;
-    const float cell_size = static_cast<float>(CANVAS_SIZE) / GRID_SIZE;
+    const float cell_size = static_cast<float>(CANVAS_SIZE) / config_.grid_size;
 
     cv::Mat vector_img(CANVAS_SIZE, CANVAS_SIZE, CV_8UC3, cv::Scalar(255, 255, 255));
 
-    for (int r = 0; r < GRID_SIZE; ++r) {
-      for (int c = 0; c < GRID_SIZE; ++c) {
+    for (int r = 0; r < config_.grid_size; ++r) {
+      for (int c = 0; c < config_.grid_size; ++c) {
         float center_x = (c + 0.5f) * cell_size;
         float center_y = (r + 0.5f) * cell_size;
         cv::Point2f center(center_x, center_y);
@@ -1615,11 +1775,13 @@ private:
       goto_pub_->publish(hold_msg);
     } else if (
       has_grid &&
-      vector_grid.size() == GRID_SIZE &&
-      vector_grid[GRID_CENTER_ROW].size() == GRID_SIZE)
+      vector_grid.size() ==
+        static_cast<std::size_t>(config_.grid_size) &&
+      vector_grid[config_.grid_center_row].size() ==
+        static_cast<std::size_t>(config_.grid_size))
     {
-      const int drone_row = GRID_CENTER_ROW;
-      const int drone_col = GRID_CENTER_COL;
+      const int drone_row = config_.grid_center_row;
+      const int drone_col = config_.grid_center_col;
       cv::Point2f vector = vector_grid[drone_row][drone_col];
       float magnitude = std::hypot(vector.x, vector.y);
 
@@ -1668,9 +1830,9 @@ private:
       if (magnitude > 0.5f) {
         movement = cv::Point2f(
           (vector.x / magnitude) *
-            static_cast<float>(MAX_GOTO_MOVEMENT),
+            static_cast<float>(config_.max_goto_movement),
           (vector.y / magnitude) *
-            static_cast<float>(MAX_GOTO_MOVEMENT));
+            static_cast<float>(config_.max_goto_movement));
         {
           std::lock_guard<std::mutex> lock(mutex_);
           last_nonzero_move_direction_ = cv::Point2f(
@@ -1729,20 +1891,21 @@ private:
   rclcpp::TimerBase::SharedPtr timer_5hz_;
   rclcpp::TimerBase::SharedPtr timer_2hz_;
 
-  int drone_index_{0};
-  int total_drones_{1};
-  double global_map_min_x_{-50.0};
-  double global_map_max_x_{50.0};
-  double global_map_min_y_{-50.0};
-  double global_map_max_y_{50.0};
-  double cow_exclusion_radius_{DEFAULT_COW_EXCLUSION_RADIUS};
-  double push_point_margin_{DEFAULT_PUSH_POINT_MARGIN};
-  double max_near_goal_objective_potential_{
-    DEFAULT_MAX_NEAR_GOAL_OBJECTIVE_POTENTIAL};
-  double objective_priority_min_spread_{
-    DEFAULT_OBJECTIVE_PRIORITY_MIN_SPREAD};
-  double objective_priority_fallback_bias_m_{
-    DEFAULT_OBJECTIVE_PRIORITY_FALLBACK_BIAS};
+  GridConfig config_;
+  int drone_index_{-1};
+  int total_drones_{0};
+  double global_map_center_x_{0.0};
+  double global_map_center_y_{0.0};
+  double global_map_width_{0.0};
+  double global_map_height_{0.0};
+  double global_map_min_x_{0.0};
+  double global_map_max_x_{0.0};
+  double global_map_min_y_{0.0};
+  double global_map_max_y_{0.0};
+  double cow_exclusion_radius_{0.0};
+  double push_point_margin_{0.0};
+  std::string drone_namespace_prefix_;
+  std::string cows_position_topic_;
   cv::Point2f global_map_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_offset_{0.0f, 0.0f};

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<cow_config>
+  <interaction drone_sensing_radius_m="6.0" cow_repulsion_radius_m="1.0" />
+  <motion linear_velocity_mps="0.5" heading_proportional_gain="0.2" heading_derivative_gain="5.0" />
+  <timing control_period_seconds="0.1" />
+</cow_config>

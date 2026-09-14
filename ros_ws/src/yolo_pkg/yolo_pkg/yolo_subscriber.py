@@ -1,5 +1,4 @@
 import math
-import sys
 from collections import deque
 
 import cv2
@@ -12,50 +11,18 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
+from yolo_pkg.config import load_yolo_config
 from yolo_pkg.cow_tracker import CowTrackerManager
 
 
-ENABLE_REALTIME_TRACK_PLOT = False
-ENABLE_ANNOTATED_CAMERA_VIEW = False
-PLOT_HISTORY_MS = 10000
-PLOT_POSITION_GRID_METERS = 1.0
-PLOT_MAP_X_LIMITS = (-10.0, 10.0)
-PLOT_MAP_Y_LIMITS = (-10.0, 10.0)
-TRACKED_ANIMAL_LABELS = ('cow',)
-YOLO_CONFIDENCE_THRESHOLD = 0.45
-MAX_COW_DETECTION_DISTANCE_METERS = 20.0
-CAMERA_HORIZONTAL_FOV_RAD = 2.09
-POSE_HISTORY_LENGTH = 500
-MAX_POSE_TIME_ERROR_SECONDS = 0.25
-MULTI_CAMERA_MERGE_DISTANCE_METERS = 1.0
-MAX_CAMERA_BATCH_WAIT_SECONDS = 0.20
-
-TRACKER_DEFAULT_DT_SECONDS = 0.1
-TRACKER_MAX_LOST_FRAMES = 15
-TRACKER_MAHALANOBIS_GATE = 9.21
-TRACKER_MAX_POSITION_DISTANCE_METERS = 3.0
-TRACKER_MIN_CONFIRMATION_HITS = 3
-TRACKER_MAX_PREDICTION_STEP_SECONDS = 1.0
-TRACKER_ACCELERATION_NOISE_STD = 1.5
-TRACKER_MEASUREMENT_NOISE_STD = 1.5
-TRACKER_INITIAL_VELOCITY_STD = 3.0
-TRACKER_REACQUISITION_MAHALANOBIS_GATE = 16.0
-TRACKER_REACQUISITION_DISTANCE_METERS = 5.0
-TRACKER_DIAGNOSTIC_LOG_PERIOD_SECONDS = 5.0
-
-
 class RealtimeCowPlotter:
-    def __init__(
-        self,
-        history_ms=PLOT_HISTORY_MS,
-        grid_meters=PLOT_POSITION_GRID_METERS,
-        map_x_limits=PLOT_MAP_X_LIMITS,
-        map_y_limits=PLOT_MAP_Y_LIMITS,
-    ):
-        self.history_seconds = max(float(history_ms) / 1000.0, 0.1)
-        self.grid_meters = max(float(grid_meters), 0.1)
-        self.map_x_limits = tuple(float(value) for value in map_x_limits)
-        self.map_y_limits = tuple(float(value) for value in map_y_limits)
+    def __init__(self, config):
+        self.history_seconds = max(
+            float(config.plot_history_ms) / 1000.0, 0.1
+        )
+        self.grid_meters = max(float(config.plot_grid_m), 0.1)
+        self.map_x_limits = (config.plot_min_x, config.plot_max_x)
+        self.map_y_limits = (config.plot_min_y, config.plot_max_y)
         self.history = {}
         self.window_name = 'Cow tracker debug'
         self.canvas_width = 1100
@@ -292,8 +259,22 @@ class YoloCowSubscriber(Node):
     def __init__(self):
         super().__init__('yolo_pkg')
 
-        self.namespace = sys.argv[1]
-        number_of_drones = int(sys.argv[2])
+        self.config = load_yolo_config()
+        self.namespace = str(
+            self.declare_parameter('drone_namespace_prefix', '').value
+        )
+        number_of_drones = int(
+            self.declare_parameter('number_of_drones', 0).value
+        )
+        self.cow_positions_topic = str(
+            self.declare_parameter('cow_positions_topic', '').value
+        )
+        if not self.namespace:
+            raise ValueError('drone_namespace_prefix cannot be empty')
+        if number_of_drones < 1:
+            raise ValueError('number_of_drones must be at least one')
+        if not self.cow_positions_topic:
+            raise ValueError('cow_positions_topic cannot be empty')
 
         self.drone_image_sub_list = {}
         self.drone_pos_sub_list = {}
@@ -302,46 +283,27 @@ class YoloCowSubscriber(Node):
         self.expected_camera_names = set()
         self.pending_detection_batches = {}
         self.pending_batch_start_timestamp = None
-        self.show_annotated_camera = bool(
-            self.declare_parameter(
-                'show_annotated_camera',
-                ENABLE_ANNOTATED_CAMERA_VIEW,
-            ).value
+        self.show_annotated_camera = self.config.show_annotated_camera
+        self.camera_horizontal_fov_rad = self.config.horizontal_fov_rad
+        self.tracker_reacquisition_distance = (
+            self.config.tracker_reacquisition_distance_m
         )
-        self.camera_horizontal_fov_rad = float(
-            self.declare_parameter(
-                'camera_horizontal_fov_rad',
-                CAMERA_HORIZONTAL_FOV_RAD,
-            ).value
+        self.tracker_reacquisition_mahalanobis_gate = (
+            self.config.tracker_reacquisition_mahalanobis_gate
         )
-        self.tracker_reacquisition_distance = float(
-            self.declare_parameter(
-                'tracker_reacquisition_distance',
-                TRACKER_REACQUISITION_DISTANCE_METERS,
-            ).value
-        )
-        self.tracker_reacquisition_mahalanobis_gate = float(
-            self.declare_parameter(
-                'tracker_reacquisition_mahalanobis_gate',
-                TRACKER_REACQUISITION_MAHALANOBIS_GATE,
-            ).value
-        )
-        if not 0.0 < self.camera_horizontal_fov_rad <= 2.0 * math.pi:
-            raise ValueError(
-                'camera_horizontal_fov_rad must be in the range (0, 2*pi]'
-            )
         camera_view_state = (
             'enabled' if self.show_annotated_camera else 'disabled'
         )
         self.get_logger().info(
-            f'Annotated YOLO camera view is {camera_view_state}'
+            f'Loaded YOLO configuration: {self.config.source_path}; '
+            f'annotated camera view is {camera_view_state}'
         )
 
         for i in range(number_of_drones):
             name = self.namespace + str(i)
             self.drone_index_by_name[name] = i
             self.expected_camera_names.add(name)
-            self.drone_pose_history[name] = deque(maxlen=POSE_HISTORY_LENGTH)
+            self.drone_pose_history[name] = deque(maxlen=self.config.pose_history_length)
             self.drone_image_sub_list[name] = self.create_subscription(
                 Image,
                 name + '/front/image_raw',
@@ -355,27 +317,31 @@ class YoloCowSubscriber(Node):
                 10,
             )
 
-        self.publisher = self.create_publisher(PoseArray, '/cows_pos', 10)
+        self.publisher = self.create_publisher(PoseArray, self.cow_positions_topic, 10)
         self.tracker = CowTrackerManager(
-            dt=TRACKER_DEFAULT_DT_SECONDS,
-            max_lost_frames=TRACKER_MAX_LOST_FRAMES,
-            mahalanobis_gate=TRACKER_MAHALANOBIS_GATE,
-            max_position_distance=TRACKER_MAX_POSITION_DISTANCE_METERS,
-            min_hits=TRACKER_MIN_CONFIRMATION_HITS,
-            max_dt=TRACKER_MAX_PREDICTION_STEP_SECONDS,
-            acceleration_noise_std=TRACKER_ACCELERATION_NOISE_STD,
-            measurement_noise_std=TRACKER_MEASUREMENT_NOISE_STD,
-            initial_velocity_std=TRACKER_INITIAL_VELOCITY_STD,
+            dt=self.config.tracker_default_dt_seconds,
+            max_lost_frames=self.config.tracker_max_lost_frames,
+            mahalanobis_gate=self.config.tracker_mahalanobis_gate,
+            max_position_distance=self.config.tracker_max_position_distance_m,
+            min_hits=self.config.tracker_min_confirmation_hits,
+            max_dt=self.config.tracker_max_prediction_step_seconds,
+            acceleration_noise_std=self.config.tracker_acceleration_noise_std,
+            measurement_noise_std=self.config.tracker_measurement_noise_std,
+            initial_velocity_std=self.config.tracker_initial_velocity_std,
             reacquisition_mahalanobis_gate=(
                 self.tracker_reacquisition_mahalanobis_gate
             ),
             reacquisition_distance=self.tracker_reacquisition_distance,
         )
         self.last_tracker_diagnostic_log_time = None
-        self.plotter = RealtimeCowPlotter() if ENABLE_REALTIME_TRACK_PLOT else None
+        self.plotter = (
+            RealtimeCowPlotter(self.config)
+            if self.config.show_realtime_track_plot
+            else None
+        )
 
         self.bridge = CvBridge()
-        self.model = YOLO('yolov8n.pt')
+        self.model = YOLO(self.config.model_path)
 
     def drone_callback(self, msg, namespace):
         timestamp = self._stamp_to_seconds(msg.header.stamp)
@@ -399,7 +365,7 @@ class YoloCowSubscriber(Node):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         results = self.model(
             frame,
-            conf=YOLO_CONFIDENCE_THRESHOLD,
+            conf=self.config.confidence_threshold,
             verbose=False,
         )
         detections = results[0].boxes
@@ -414,28 +380,41 @@ class YoloCowSubscriber(Node):
         for box in detections:
             cls_id = int(box.cls[0])
             label = self.model.names[cls_id]
-            if label not in TRACKED_ANIMAL_LABELS:
+            if label not in self.config.tracked_labels:
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            if y2 < 206:
+            if y2 < self.config.minimum_box_bottom_px:
                 continue
 
-            distance_1 = -(1.0 / 0.7714) * np.log((y2 - 205.31) / 363.34)
+            distance_1 = -(1.0 / self.config.distance_log_scale) * np.log(
+                (y2 - self.config.distance_bottom_offset_px)
+                / self.config.distance_log_denominator
+            )
             center_x = ((x2 - x1) / 2.0) + x1
-            image_angle = (1.0 / 0.01745) * np.log(
-                (abs(center_x - 320.0) + 167.69) / 171.46
+            image_angle = (
+                1.0 / self.config.bearing_log_scale
+            ) * np.log(
+                (
+                    abs(center_x - self.config.image_center_x_px)
+                    + self.config.bearing_center_offset_px
+                )
+                / self.config.bearing_log_denominator
             )
             full_distance = abs(distance_1 / np.cos(image_angle * (np.pi / 180.0)))
 
             if (
                 not np.isfinite(full_distance)
                 or full_distance <= 0.0
-                or full_distance > MAX_COW_DETECTION_DISTANCE_METERS
+                or full_distance > self.config.max_detection_distance_m
             ):
                 continue
 
-            sign = 1.0 if center_x >= 320.0 else -1.0
+            sign = (
+                1.0
+                if center_x >= self.config.image_center_x_px
+                else -1.0
+            )
             bearing_offset = sign * image_angle * (np.pi / 180.0)
             world_bearing = drone_yaw - bearing_offset
             cow_x = drone_x + math.cos(world_bearing) * full_distance
@@ -483,7 +462,7 @@ class YoloCowSubscriber(Node):
             return
         if (
             timestamp - self.pending_batch_start_timestamp
-            >= MAX_CAMERA_BATCH_WAIT_SECONDS
+            >= self.config.max_camera_batch_wait_seconds
         ):
             self._process_detection_batch()
 
@@ -513,7 +492,7 @@ class YoloCowSubscriber(Node):
                     'y': drone_y,
                     'yaw': drone_yaw,
                     'horizontal_fov': self.camera_horizontal_fov_rad,
-                    'max_range': MAX_COW_DETECTION_DISTANCE_METERS,
+                    'max_range': self.config.max_detection_distance_m,
                 }
             )
 
@@ -539,7 +518,7 @@ class YoloCowSubscriber(Node):
             last_log_time is not None
             and timestamp >= last_log_time
             and timestamp - last_log_time
-            < TRACKER_DIAGNOSTIC_LOG_PERIOD_SECONDS
+            < self.config.tracker_diagnostic_log_period_seconds
         ):
             return
 
@@ -556,8 +535,7 @@ class YoloCowSubscriber(Node):
             f"removed={diagnostics['removed_tracks']}"
         )
 
-    @staticmethod
-    def _merge_camera_measurements(batches):
+    def _merge_camera_measurements(self, batches):
         clusters = []
         for source_name, (_, measurements, _) in batches.items():
             for measurement in measurements:
@@ -570,7 +548,7 @@ class YoloCowSubscriber(Node):
                 candidates = [
                     item
                     for item in candidates
-                    if item[0] <= MULTI_CAMERA_MERGE_DISTANCE_METERS
+                    if item[0] <= self.config.multi_camera_merge_distance_m
                 ]
 
                 if candidates:
@@ -598,13 +576,13 @@ class YoloCowSubscriber(Node):
 
         if timestamp <= history[0][0]:
             nearest = history[0]
-            if nearest[0] - timestamp > MAX_POSE_TIME_ERROR_SECONDS:
+            if nearest[0] - timestamp > self.config.max_pose_time_error_seconds:
                 return None
             return nearest[1], nearest[2], nearest[3]
 
         if timestamp >= history[-1][0]:
             nearest = history[-1]
-            if timestamp - nearest[0] > MAX_POSE_TIME_ERROR_SECONDS:
+            if timestamp - nearest[0] > self.config.max_pose_time_error_seconds:
                 return None
             return nearest[1], nearest[2], nearest[3]
 

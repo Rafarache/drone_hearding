@@ -9,6 +9,7 @@ endif()
 # Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 
@@ -26,6 +27,7 @@ target_include_directories(grid_visualizer_node PRIVATE
 # Dependencies linking (ROS 2 style helper)
 ament_target_dependencies(grid_visualizer_node
   "rclcpp"
+  "ament_index_cpp"
   "geometry_msgs"
 )
 
@@ -38,6 +40,10 @@ target_link_libraries(grid_visualizer_node
 install(TARGETS
   grid_visualizer_node
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME}
 )
 
 ament_package()

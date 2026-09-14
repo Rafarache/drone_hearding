@@ -7,6 +7,8 @@
   <maintainer email="georg.novtony@aon.at">Georg Novotny</maintainer>
   <license>TODO: License declaration</license>
 
+  <depend>ament_index_python</depend>
+
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>rclpy</depend>

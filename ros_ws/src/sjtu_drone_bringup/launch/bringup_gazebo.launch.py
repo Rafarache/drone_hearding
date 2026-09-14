@@ -1,224 +1,108 @@
 #!/usr/bin/env python3
-# Copyright 2023 Georg Novotny
-#
-# Licensed under the GNU GENERAL PUBLIC LICENSE, Version 3.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.gnu.org/licenses/gpl-3.0.en.html
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import os
-import yaml
 
+import xacro
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-import xml.etree.ElementTree as ET
-import xacro
 
-def launch_setup(context, *args, **kwargs):
-    model_ns = LaunchConfiguration('model_ns').perform(context)
+
+def _launch_setup(context):
+    model_namespace = LaunchConfiguration('model_ns').perform(context)
     x = LaunchConfiguration('x').perform(context)
     y = LaunchConfiguration('y').perform(context)
-    drone_max_linear_velocity = float(
-        LaunchConfiguration(
-            'drone_max_linear_velocity').perform(context))
-    drone_max_linear_acceleration = float(
-        LaunchConfiguration(
-            'drone_max_linear_acceleration').perform(context))
-    drone_max_angular_velocity = float(
-        LaunchConfiguration(
-            'drone_max_angular_velocity').perform(context))
-    drone_max_angular_acceleration = float(
-        LaunchConfiguration(
-            'drone_max_angular_acceleration').perform(context))
-    drone_position_tolerance = float(
-        LaunchConfiguration(
-            'drone_position_tolerance').perform(context))
-    drone_linear_slowdown_distance = float(
-        LaunchConfiguration(
-            'drone_linear_slowdown_distance').perform(context))
-    use_sim_time = LaunchConfiguration("use_sim_time", default="true")
-    xacro_file_name = "sjtu_drone.urdf.xacro"
-    xacro_file = os.path.join(
-        get_package_share_directory("sjtu_drone_description"),
-        "urdf", xacro_file_name
+
+    description_share = get_package_share_directory(
+        'sjtu_drone_description'
     )
-    yaml_file_path = os.path.join(
-        get_package_share_directory('sjtu_drone_bringup'),
-        'config', 'drone.yaml'
-    )   
-    
-    robot_description_config = xacro.process_file(xacro_file, mappings={"params_path": yaml_file_path})
-    robot_desc = robot_description_config.toxml()
+    bringup_share = get_package_share_directory('sjtu_drone_bringup')
+    xacro_path = os.path.join(
+        description_share,
+        'urdf',
+        'sjtu_drone.urdf.xacro',
+    )
+    vehicle_config_path = os.path.join(
+        bringup_share,
+        'config',
+        'drone.yaml',
+    )
 
-    robot_description_config = xacro.process_file(xacro_file, mappings={"params_path": yaml_file_path})
-    namespace_tags = robot_description_config.getElementsByTagName('namespace')
-
+    robot_description_config = xacro.process_file(
+        xacro_path,
+        mappings={'params_path': vehicle_config_path},
+    )
+    namespace_tags = robot_description_config.getElementsByTagName(
+        'namespace'
+    )
     for tag in namespace_tags:
         if tag.firstChild:
-            tag.firstChild.nodeValue = model_ns
+            tag.firstChild.nodeValue = model_namespace
         else:
-            new_text = robot_description_config.createTextNode(model_ns)
-            tag.appendChild(new_text)
+            tag.appendChild(
+                robot_description_config.createTextNode(model_namespace)
+            )
+    robot_description = robot_description_config.toxml()
 
-    robot_desc = robot_description_config.toxml()
-
-    #print(robot_desc)
-
-    array = [
+    return [
         Node(
-            package="robot_state_publisher",
-            executable="robot_state_publisher",
-            name="robot_state_publisher",
-            namespace=model_ns,
-            output="screen",
-            parameters=[{"use_sim_time": use_sim_time, "robot_description": robot_desc, "frame_prefix": model_ns + "/"}],
-            arguments=[robot_desc]
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            namespace=model_namespace,
+            output='screen',
+            parameters=[
+                {
+                    'use_sim_time': True,
+                    'robot_description': robot_description,
+                    'frame_prefix': model_namespace + '/',
+                }
+            ],
+            arguments=[robot_description],
         ),
-
         Node(
             package='joint_state_publisher',
             executable='joint_state_publisher',
             name='joint_state_publisher',
-            namespace=model_ns,
-            output='screen'
+            namespace=model_namespace,
+            output='screen',
         ),
-
         Node(
-            package="sjtu_drone_bringup",
-            executable="spawn_drone_script",
-            arguments=[robot_desc, model_ns, x, y],
-            namespace=model_ns,
-            output="screen"
+            package='sjtu_drone_bringup',
+            executable='spawn_drone_script',
+            arguments=[robot_description, model_namespace, x, y],
+            namespace=model_namespace,
+            output='screen',
         ),
-
         Node(
-            package="tf2_ros",
-            executable="static_transform_publisher",
-            namespace=model_ns,
-            arguments=["0", "0", "0", "0", "0", "0", "world", f"{model_ns}/odom"],
-            output="screen"
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            namespace=model_namespace,
+            arguments=[
+                '0', '0', '0', '0', '0', '0',
+                'world', f'{model_namespace}/odom',
+            ],
+            output='screen',
         ),
-
         Node(
-            package="sjtu_drone_control",
-            executable="drone_position_control",
-            arguments=[model_ns],
+            package='sjtu_drone_control',
+            executable='drone_position_control',
             name='sjtu_drone_control',
-            parameters=[{
-                'drone_max_linear_velocity':
-                    drone_max_linear_velocity,
-                'drone_max_linear_acceleration':
-                    drone_max_linear_acceleration,
-                'drone_max_angular_velocity':
-                    drone_max_angular_velocity,
-                'drone_max_angular_acceleration':
-                    drone_max_angular_acceleration,
-                'drone_position_tolerance':
-                    drone_position_tolerance,
-                'drone_linear_slowdown_distance':
-                    drone_linear_slowdown_distance,
-            }],
-            output="screen"
+            namespace=model_namespace,
+            parameters=[{'drone_namespace': model_namespace}],
+            output='screen',
         ),
     ]
 
-    return array
 
 def generate_launch_description():
-    use_gui = DeclareLaunchArgument("use_gui", default_value="true", choices=["true", "false"],
-                                    description="Whether to execute gzclient")
-    pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
-
-    world_file_default = os.path.join(
-        get_package_share_directory("sjtu_drone_description"),
-        "worlds", "farm_no_animals.world"
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument('x'),
+            DeclareLaunchArgument('y'),
+            DeclareLaunchArgument('model_ns'),
+            OpaqueFunction(function=_launch_setup),
+        ]
     )
-
-    world_file = LaunchConfiguration('world', default=world_file_default)
-
-    world = DeclareLaunchArgument(
-        name='world',
-        default_value=world_file_default,
-        description='Full path to world file to load'
-    )
-
-    declare_x_arg = DeclareLaunchArgument(
-        'x',
-        default_value='0.0',
-        description='X position of the drone'
-    )
-
-    declare_y_arg = DeclareLaunchArgument(
-        'y',
-        default_value='0.0',
-        description='Y position of the drone'
-    )
-
-    declare_model_ns_arg = DeclareLaunchArgument(
-        'model_ns',
-        default_value='drone',
-        description='Namespace of the drone model'
-    )
-
-    drone_motion_smoothing_args = [
-        DeclareLaunchArgument(
-            'drone_max_linear_velocity',
-            default_value='0.4'
-        ),
-        DeclareLaunchArgument(
-            'drone_max_linear_acceleration',
-            default_value='0.5'
-        ),
-        DeclareLaunchArgument(
-            'drone_max_angular_velocity',
-            default_value='1.0'
-        ),
-        DeclareLaunchArgument(
-            'drone_max_angular_acceleration',
-            default_value='1.0'
-        ),
-        DeclareLaunchArgument(
-            'drone_position_tolerance',
-            default_value='0.1'
-        ),
-        DeclareLaunchArgument(
-            'drone_linear_slowdown_distance',
-            default_value='0.4'
-        ),
-    ]
-
-    def launch_gzclient(context, *args, **kwargs):
-        if context.launch_configurations.get('use_gui') == 'true':
-            return [IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(pkg_gazebo_ros, 'launch', 'gzclient.launch.py')
-                ),
-                launch_arguments={'verbose': 'true'}.items()
-            )]
-        return []
-
-    opaque_function_action = OpaqueFunction(function=launch_setup)
-
-    # Log the world file being used
-    print("Loading world file: ", world_file_default)
-
-    return LaunchDescription([
-        world,
-        use_gui,
-        declare_x_arg,
-        declare_y_arg,
-        declare_model_ns_arg,
-        *drone_motion_smoothing_args,
-        opaque_function_action,
-    ])

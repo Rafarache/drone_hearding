@@ -373,12 +373,12 @@ def generate_launch_description():
     herding_radius_args = [
         DeclareLaunchArgument(
             'drone_approach_radius',
-            default_value='4.0',
+            default_value='3.0',
             description='Minimum drone distance from a cow in metres'
         ),
         DeclareLaunchArgument(
             'push_point_margin',
-            default_value='0.2',
+            default_value='0.7',
             description='Extra distance behind each cow push point'
         ),
         DeclareLaunchArgument(

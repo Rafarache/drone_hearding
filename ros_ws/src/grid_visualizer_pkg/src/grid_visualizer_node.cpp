@@ -36,9 +36,9 @@ constexpr bool ENABLE_OCCUPANCY_GRID_DISPLAY = false;
 constexpr bool ENABLE_VECTOR_GRID_DISPLAY = true;
 
 // Herding Constants
-const cv::Point2f GOAL_POSITION(10.0f, 10.0f);
-constexpr double DEFAULT_COW_EXCLUSION_RADIUS = 4.0;  // meters
-constexpr double DEFAULT_PUSH_POINT_MARGIN = 0.2;       // meters
+const cv::Point2f GOAL_POSITION(-10.0f, -10.0f);
+constexpr double DEFAULT_COW_EXCLUSION_RADIUS = 3.0;  // meters
+constexpr double DEFAULT_PUSH_POINT_MARGIN = 0.7;       // meters
 constexpr double DEFAULT_MAX_NEAR_GOAL_OBJECTIVE_POTENTIAL = 0.9;
 constexpr double OBJECTIVE_PRIORITY_CURVE_EXPONENT = 0.25;
 constexpr double PRIMARY_OBJECTIVE_SWITCH_MARGIN = 1.0;  // meters

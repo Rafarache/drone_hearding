@@ -138,6 +138,10 @@ class Track:
         self.lost_frames = 0
         self.is_confirmed = min_hits <= 1
         self.innovation_norm = float('nan')
+        self.last_observed_position = np.array(
+            [initial_x, initial_y], dtype=float
+        )
+        self.unobserved = False
 
     @property
     def confirmed(self):
@@ -145,7 +149,7 @@ class Track:
 
     @property
     def coasting(self):
-        return self.lost_frames > 0
+        return self.unobserved
 
 
 class CowTrackerManager:
@@ -223,12 +227,25 @@ class CowTrackerManager:
         measurements = np.asarray(global_measurements, dtype=float).reshape(-1, 2)
         measurements = measurements[np.all(np.isfinite(measurements), axis=1)]
 
-        prediction_steps = max(1, int(np.ceil(dt / self.max_dt)))
-        prediction_dt = dt / prediction_steps
-        for track in self.tracks:
+        predicted_states = {}
+        for index, track in enumerate(self.tracks):
+            track.age += 1
+            if (
+                track.unobserved
+                or not self._is_position_visible(
+                    track.last_observed_position, camera_views
+                )
+            ):
+                track.unobserved = True
+                continue
+
+            # Prediction is provisional until a detection matches this cow.
+            # A missed detection must not move its remembered position.
+            predicted_states[index] = (track.kf.x.copy(), track.kf.P.copy())
+            prediction_steps = max(1, int(np.ceil(dt / self.max_dt)))
+            prediction_dt = dt / prediction_steps
             for _ in range(prediction_steps):
                 track.kf.predict(prediction_dt)
-            track.age += 1
 
         matched_track_indices = set()
         matched_meas_indices = set()
@@ -239,9 +256,13 @@ class CowTrackerManager:
             if track.confirmed
         }
         tentative_indices = set(range(len(self.tracks))) - confirmed_indices
+        active_confirmed_indices = {
+            index for index in confirmed_indices
+            if not self.tracks[index].unobserved
+        }
 
         regular_matches = self._associate(
-            confirmed_indices,
+            active_confirmed_indices,
             available_measurements,
             measurements,
             self.mahalanobis_gate,
@@ -260,7 +281,7 @@ class CowTrackerManager:
         reacquisition_candidates = {
             index
             for index in confirmed_indices - matched_track_indices
-            if self.tracks[index].lost_frames > 0
+            if self.tracks[index].unobserved
         }
         reacquisition_matches = self._associate(
             reacquisition_candidates,
@@ -299,7 +320,12 @@ class CowTrackerManager:
 
             track.hit_streak = 0
             track.innovation_norm = float('nan')
-            if self._is_position_visible(track.kf.x[:2, 0], camera_views):
+            if track_idx in predicted_states:
+                track.kf.x, track.kf.P = predicted_states[track_idx]
+            track.unobserved = True
+            if self._is_position_visible(
+                track.last_observed_position, camera_views
+            ):
                 track.lost_frames += 1
                 visible_misses += 1
 
@@ -332,10 +358,16 @@ class CowTrackerManager:
         confirmed_tracks = [
             {
                 "id": track.track_id,
-                "x": track.kf.x[0, 0],
-                "y": track.kf.x[1, 0],
-                "vx": track.kf.x[2, 0],
-                "vy": track.kf.x[3, 0],
+                "x": (
+                    track.last_observed_position[0]
+                    if track.unobserved else track.kf.x[0, 0]
+                ),
+                "y": (
+                    track.last_observed_position[1]
+                    if track.unobserved else track.kf.x[1, 0]
+                ),
+                "vx": 0.0 if track.unobserved else track.kf.x[2, 0],
+                "vy": 0.0 if track.unobserved else track.kf.x[3, 0],
                 "coasting": track.coasting,
                 "confirmed": track.confirmed,
                 "lost_frames": track.lost_frames,
@@ -421,11 +453,24 @@ class CowTrackerManager:
             track = self.tracks[track_idx]
             for col, meas_idx in enumerate(measurement_indices):
                 measurement = measurements[meas_idx]
-                distance_sq = track.kf.mahalanobis_distance_sq(measurement)
-                predicted_position = track.kf.x[:2, 0]
-                position_distance = np.linalg.norm(
-                    measurement - predicted_position
-                )
+                if track.unobserved:
+                    predicted_position = track.last_observed_position
+                    position_distance = np.linalg.norm(
+                        measurement - predicted_position
+                    )
+                    # Reacquire by remembered position only; the frozen
+                    # Kalman state does not influence unseen cows.
+                    distance_sq = (
+                        position_distance / max_position_distance
+                    ) ** 2 * mahalanobis_gate
+                else:
+                    predicted_position = track.kf.x[:2, 0]
+                    distance_sq = track.kf.mahalanobis_distance_sq(
+                        measurement
+                    )
+                    position_distance = np.linalg.norm(
+                        measurement - predicted_position
+                    )
                 if (
                     distance_sq <= mahalanobis_gate
                     and position_distance <= max_position_distance
@@ -444,9 +489,24 @@ class CowTrackerManager:
         for track_idx, meas_idx in matches:
             measurement = measurements[meas_idx]
             track = self.tracks[track_idx]
-            innovation, _ = track.kf.innovation(measurement)
-            track.innovation_norm = float(np.linalg.norm(innovation))
-            track.kf.update(measurement[0], measurement[1])
+            if track.unobserved:
+                track.innovation_norm = float(np.linalg.norm(
+                    measurement - track.last_observed_position
+                ))
+                track.kf = CowKalmanFilter(
+                    self.default_dt,
+                    measurement[0],
+                    measurement[1],
+                    acceleration_noise_std=self.acceleration_noise_std,
+                    measurement_noise_std=self.measurement_noise_std,
+                    initial_velocity_std=self.initial_velocity_std,
+                )
+            else:
+                innovation, _ = track.kf.innovation(measurement)
+                track.innovation_norm = float(np.linalg.norm(innovation))
+                track.kf.update(measurement[0], measurement[1])
+            track.last_observed_position = measurement.copy()
+            track.unobserved = False
             track.hits += 1
             track.hit_streak += 1
             track.lost_frames = 0

@@ -36,6 +36,14 @@ target_link_libraries(grid_visualizer_node
   ${OpenCV_LIBRARIES}
 )
 
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(test_goal_quiet_zone test/test_goal_quiet_zone.cpp)
+  target_compile_features(test_goal_quiet_zone PUBLIC cxx_std_17)
+  target_include_directories(test_goal_quiet_zone PRIVATE include)
+  add_test(NAME test_goal_quiet_zone COMMAND test_goal_quiet_zone)
+endif()
+
 # Install executable
 install(TARGETS
   grid_visualizer_node

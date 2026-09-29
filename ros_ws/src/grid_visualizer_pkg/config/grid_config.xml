@@ -23,6 +23,8 @@
   <goal_x>-10.0</goal_x>
   <goal_y>-10.0</goal_y>
   <final_goal_reached_radius_m>2.0</final_goal_reached_radius_m>
+  <goal_quiet_radius_m>4.0</goal_quiet_radius_m>
+  <goal_quiet_duration_seconds>5.0</goal_quiet_duration_seconds>
   <max_goto_movement_m>0.5</max_goto_movement_m>
 
   <max_near_goal_objective_potential>0.9</max_near_goal_objective_potential>

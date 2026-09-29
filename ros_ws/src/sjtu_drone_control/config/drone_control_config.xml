@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <drone_control_config>
   <motion
-    max_linear_velocity_mps="0.4"
+    max_linear_velocity_mps="0.6"
     max_linear_acceleration_mps2="0.5"
-    max_angular_velocity_radps="1.0"
+    max_angular_velocity_radps="1.5"
     max_angular_acceleration_radps2="1.0"
     position_tolerance_m="0.1"
     linear_slowdown_distance_m="0.4" />

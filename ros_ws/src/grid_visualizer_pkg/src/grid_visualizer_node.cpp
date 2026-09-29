@@ -15,6 +15,7 @@
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "geometry_msgs/msg/pose.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
+#include "grid_visualizer_pkg/goal_quiet_zone.hpp"
 #include <opencv2/opencv.hpp>
 
 struct GridConfig
@@ -42,6 +43,8 @@ struct GridConfig
   double boundary_potential{0.0};
   cv::Point2f goal_position{0.0f, 0.0f};
   double final_goal_reached_radius{0.0};
+  double goal_quiet_radius{0.0};
+  double goal_quiet_duration_seconds{0.0};
   double max_goto_movement{0.0};
   double max_near_goal_objective_potential{0.0};
   double objective_priority_curve_exponent{0.0};
@@ -113,6 +116,10 @@ GridConfig load_grid_config()
     static_cast<float>(read_required<double>(storage, "goal_y")));
   config.final_goal_reached_radius =
     read_required<double>(storage, "final_goal_reached_radius_m");
+  config.goal_quiet_radius =
+    read_required<double>(storage, "goal_quiet_radius_m");
+  config.goal_quiet_duration_seconds =
+    read_required<double>(storage, "goal_quiet_duration_seconds");
   config.max_goto_movement =
     read_required<double>(storage, "max_goto_movement_m");
   config.max_near_goal_objective_potential =
@@ -190,6 +197,10 @@ GridConfig load_grid_config()
     !std::isfinite(config.goal_position.y) ||
     !std::isfinite(config.final_goal_reached_radius) ||
     config.final_goal_reached_radius <= 0.0 ||
+    !std::isfinite(config.goal_quiet_radius) ||
+    config.goal_quiet_radius <= config.final_goal_reached_radius ||
+    !std::isfinite(config.goal_quiet_duration_seconds) ||
+    config.goal_quiet_duration_seconds <= 0.0 ||
     !std::isfinite(config.max_goto_movement) ||
     config.max_goto_movement <= 0.0 ||
     !std::isfinite(config.max_near_goal_objective_potential) ||
@@ -217,7 +228,13 @@ class OccupancyGridVisualizer : public rclcpp::Node
 {
 public:
   OccupancyGridVisualizer()
-  : Node("occupancy_grid_visualizer"), config_(load_grid_config())
+  : Node("occupancy_grid_visualizer"), config_(load_grid_config()),
+    goal_quiet_zone_(
+      {config_.goal_position.x, config_.goal_position.y},
+      config_.final_goal_reached_radius,
+      config_.goal_quiet_radius,
+      config_.goal_quiet_duration_seconds),
+    latest_effective_goal_radius_(config_.final_goal_reached_radius)
   {
     drone_index_ = this->declare_parameter<int>("drone_index", -1);
     total_drones_ = this->declare_parameter<int>("total_drones", 0);
@@ -311,6 +328,12 @@ public:
       cow_exclusion_radius_ + push_point_margin_,
       cow_exclusion_radius_,
       push_point_margin_);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Goal quiet zone: %.2f m for %.2f s after a cow reaches %.2f m",
+      config_.goal_quiet_radius,
+      config_.goal_quiet_duration_seconds,
+      config_.final_goal_reached_radius);
     RCLCPP_INFO(
       this->get_logger(),
       "Cow objective priority: max potential %.2f, minimum spread %.2f m, "
@@ -850,6 +873,18 @@ private:
       static_cast<float>(drone_pose->position.x),
       static_cast<float>(drone_pose->position.y));
 
+    std::vector<grid_visualizer_pkg::CowPoint> cow_points;
+    if (has_cows && cows) {
+      cow_points.reserve(cows->poses.size());
+      for (const auto & cow_pose : cows->poses) {
+        if (is_inside_global_map(cow_pose.position.x, cow_pose.position.y)) {
+          cow_points.push_back({cow_pose.position.x, cow_pose.position.y});
+        }
+      }
+    }
+    const double effective_goal_radius = goal_quiet_zone_.update(
+      cow_points, grid_visualizer_pkg::GoalQuietZone::Clock::now());
+
     std::vector<std::vector<CellState>> grid(
       config_.grid_size,
       std::vector<CellState>(config_.grid_size, EMPTY));
@@ -931,9 +966,9 @@ private:
           direction_to_goal.x,
           direction_to_goal.y);
 
-        // A cow inside the final goal radius no longer needs a behind-cow
-        // push objective. The objective is generated again if it leaves.
-        if (goal_distance > config_.final_goal_reached_radius) {
+        // The goal radius widens for five seconds after a cow arrives.
+        // Cows inside the active radius cannot create push objectives.
+        if (goal_distance > effective_goal_radius) {
           const cv::Point2f normalized_direction(
             direction_to_goal.x / goal_distance,
             direction_to_goal.y / goal_distance);
@@ -1411,6 +1446,7 @@ private:
     // coordinate frame. Never reinterpret an old raster at a new center.
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      latest_effective_goal_radius_ = effective_goal_radius;
       if (all_evaluated_cows_at_goal) {
         latest_vector_grid_ = vector_grid;
         latest_cell_grid_ = grid;
@@ -1424,9 +1460,9 @@ private:
         all_cows_at_goal_ = true;
         has_last_nonzero_move_direction_ = false;
       } else {
-        // Never retain a completed-herd hold after a current cow is observed
-        // outside the final goal. A valid previous field can remain as the
-        // movement fallback if this particular relaxation cycle is invalid.
+        // Resume herding when a cow is outside the current goal radius.
+        // A valid previous field can remain as the movement fallback if
+        // this particular relaxation cycle is invalid.
         all_cows_at_goal_ = false;
         if (candidate_field_is_valid) {
           latest_vector_grid_ = vector_grid;
@@ -1744,6 +1780,7 @@ private:
     bool has_grid = false;
     bool has_last_move_direction = false;
     bool all_cows_at_goal = false;
+    double effective_goal_radius = config_.final_goal_reached_radius;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1759,6 +1796,7 @@ private:
       has_grid = has_vector_grid_;
       has_last_move_direction = has_last_nonzero_move_direction_;
       all_cows_at_goal = all_cows_at_goal_;
+      effective_goal_radius = latest_effective_goal_radius_;
     }
 
     if (!has_drone || !drone_pose) {
@@ -1768,8 +1806,8 @@ private:
     double drone_x = drone_pose->position.x;
     double drone_y = drone_pose->position.y;
 
-    // 1. Goto Calculation. Hold position once every remembered cow is
-    // inside the final goal radius; movement resumes if any cow leaves.
+    // 1. Goto Calculation. Hold when every cow is inside the current
+    // goal radius; movement resumes if any cow leaves it.
     if (all_cows_at_goal) {
       geometry_msgs::msg::Pose hold_msg = *drone_pose;
       goto_pub_->publish(hold_msg);
@@ -1862,20 +1900,44 @@ private:
       }
     }
 
-    // 2. Focus Calculation (Closest Cow)
+    // 2. Focus on the nearest cow outside the active goal radius.
     if (has_cows && cows && !cows->poses.empty()) {
-      double min_dist = std::numeric_limits<double>::max();
-      geometry_msgs::msg::Pose closest_cow_pose = cows->poses[0];
-
-      for (const auto& cow_pose : cows->poses) {
-        double dist = std::hypot(cow_pose.position.x - drone_x, cow_pose.position.y - drone_y);
-        if (dist < min_dist) {
-          min_dist = dist;
-          closest_cow_pose = cow_pose;
-        }
+      std::vector<grid_visualizer_pkg::CowPoint> cow_points;
+      cow_points.reserve(cows->poses.size());
+      for (const auto & cow_pose : cows->poses) {
+        cow_points.push_back({cow_pose.position.x, cow_pose.position.y});
       }
+      const std::size_t closest_index =
+        grid_visualizer_pkg::closest_cow_outside_goal(
+        cow_points,
+        {drone_x, drone_y},
+        {config_.goal_position.x, config_.goal_position.y},
+        effective_goal_radius);
 
-      focusin_pub_->publish(closest_cow_pose);
+      if (closest_index < cows->poses.size()) {
+        focusin_pub_->publish(cows->poses[closest_index]);
+      } else {
+        geometry_msgs::msg::Pose focus_pose;
+        if (all_cows_at_goal) {
+          // Continue watching the goal area while holding position.
+          focus_pose.position.x = config_.goal_position.x;
+          focus_pose.position.y = config_.goal_position.y;
+        } else {
+          // A previous movement command may still be active. Aim away from
+          // the goal rather than at a cow inside the quiet zone.
+          double direction_x = drone_x - config_.goal_position.x;
+          double direction_y = drone_y - config_.goal_position.y;
+          double magnitude = std::hypot(direction_x, direction_y);
+          if (magnitude < 1.0e-6) {
+            direction_x = 1.0;
+            direction_y = 0.0;
+            magnitude = 1.0;
+          }
+          focus_pose.position.x = drone_x + 10.0 * direction_x / magnitude;
+          focus_pose.position.y = drone_y + 10.0 * direction_y / magnitude;
+        }
+        focusin_pub_->publish(focus_pose);
+      }
     }
   }
 
@@ -1892,6 +1954,8 @@ private:
   rclcpp::TimerBase::SharedPtr timer_2hz_;
 
   GridConfig config_;
+  grid_visualizer_pkg::GoalQuietZone goal_quiet_zone_;
+  double latest_effective_goal_radius_{0.0};
   int drone_index_{-1};
   int total_drones_{0};
   double global_map_center_x_{0.0};

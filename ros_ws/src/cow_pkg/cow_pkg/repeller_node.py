@@ -6,6 +6,8 @@ from geometry_msgs.msg import Pose, Twist
 from rclpy.node import Node
 
 from cow_pkg.config import load_cow_config
+from cow_pkg.interaction import cow_interaction_vector
+from cow_pkg.motion import force_to_velocity
 
 
 class PeopleRepeller(Node):
@@ -81,8 +83,10 @@ class PeopleRepeller(Node):
             f'Loaded cow configuration: {self.config.source_path}; '
             f'drones={self.number_of_drones}, cows={self.number_of_cows}, '
             f'drone sensing={self.config.drone_sensing_radius_m:.2f} m, '
-            f'cow repulsion={self.config.cow_repulsion_radius_m:.2f} m, '
-            f'approach={minimum_sensing_radius:.2f} m'
+            f'cow equilibrium={self.config.cow_equilibrium_distance_m:.2f} m, '
+            f'cow cutoff={self.config.cow_cutoff_distance_m:.2f} m, '
+            f'approach={minimum_sensing_radius:.2f} m, '
+            f'force updates={1.0 / self.config.control_period_seconds:.1f} Hz'
         )
 
     def _validate_shared_parameters(self):
@@ -152,23 +156,16 @@ class PeopleRepeller(Node):
             for other_key, other_pose in self.cows_dict.items():
                 if other_key == key or other_pose is None:
                     continue
-                delta_x = px - other_pose.position.x
-                delta_y = py - other_pose.position.y
-                distance = math.hypot(delta_x, delta_y)
-                if (
-                    0.0
-                    < distance
-                    < self.config.cow_repulsion_radius_m
-                ):
-                    magnitude = 1.0 / (distance * distance)
-                    force_x += magnitude * delta_x / distance
-                    force_y += magnitude * delta_y / distance
+                # The signed curve uses the direction toward the other cow:
+                # negative pushes away, positive pulls toward it.
+                cow_force_x, cow_force_y = cow_interaction_vector(
+                    other_pose.position.x - px,
+                    other_pose.position.y - py,
+                    self.config,
+                )
+                force_x += cow_force_x
+                force_y += cow_force_y
 
-            if math.hypot(force_x, force_y) == 0.0:
-                self.publishers_dict[key].publish(Twist())
-                continue
-
-            target_yaw = math.atan2(force_y, force_x)
             yaw = self.quaternion_to_yaw(value.orientation)
             if (
                 self.last_cows_dict is not None
@@ -181,17 +178,9 @@ class PeopleRepeller(Node):
             else:
                 last_yaw = yaw
 
-            yaw_error = self.normalize_rad_neg_pi_to_pi(target_yaw - yaw)
-            last_yaw_error = self.normalize_rad_neg_pi_to_pi(
-                target_yaw - last_yaw
-            )
-
             twist = Twist()
-            twist.linear.x = self.config.linear_velocity_mps
-            twist.angular.z = (
-                yaw_error * self.config.heading_proportional_gain
-                + self.config.heading_derivative_gain
-                * (yaw_error - last_yaw_error)
+            twist.linear.x, twist.angular.z = force_to_velocity(
+                force_x, force_y, yaw, last_yaw, self.config
             )
             self.publishers_dict[key].publish(twist)
 

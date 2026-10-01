@@ -12,7 +12,7 @@ from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
 from yolo_pkg.config import load_yolo_config
-from yolo_pkg.cow_tracker import CowTrackerManager
+from yolo_pkg.tracker_factory import create_cow_tracker
 
 
 class RealtimeCowPlotter:
@@ -79,7 +79,7 @@ class RealtimeCowPlotter:
         self._draw_axes(
             canvas,
             self.position_rect,
-            'Filtered cow positions - fixed -10 to +10 map',
+            'Mapped cow positions - fixed -10 to +10 map',
             'X [m]',
             'Y [m]',
         )
@@ -285,12 +285,6 @@ class YoloCowSubscriber(Node):
         self.pending_batch_start_timestamp = None
         self.show_annotated_camera = self.config.show_annotated_camera
         self.camera_horizontal_fov_rad = self.config.horizontal_fov_rad
-        self.tracker_reacquisition_distance = (
-            self.config.tracker_reacquisition_distance_m
-        )
-        self.tracker_reacquisition_mahalanobis_gate = (
-            self.config.tracker_reacquisition_mahalanobis_gate
-        )
         camera_view_state = (
             'enabled' if self.show_annotated_camera else 'disabled'
         )
@@ -318,20 +312,9 @@ class YoloCowSubscriber(Node):
             )
 
         self.publisher = self.create_publisher(PoseArray, self.cow_positions_topic, 10)
-        self.tracker = CowTrackerManager(
-            dt=self.config.tracker_default_dt_seconds,
-            max_lost_frames=self.config.tracker_max_lost_frames,
-            mahalanobis_gate=self.config.tracker_mahalanobis_gate,
-            max_position_distance=self.config.tracker_max_position_distance_m,
-            min_hits=self.config.tracker_min_confirmation_hits,
-            max_dt=self.config.tracker_max_prediction_step_seconds,
-            acceleration_noise_std=self.config.tracker_acceleration_noise_std,
-            measurement_noise_std=self.config.tracker_measurement_noise_std,
-            initial_velocity_std=self.config.tracker_initial_velocity_std,
-            reacquisition_mahalanobis_gate=(
-                self.tracker_reacquisition_mahalanobis_gate
-            ),
-            reacquisition_distance=self.tracker_reacquisition_distance,
+        self.tracker = create_cow_tracker(self.config)
+        self.get_logger().info(
+            f'Cow tracker implementation: {type(self.tracker).__module__}'
         )
         self.last_tracker_diagnostic_log_time = None
         self.plotter = (

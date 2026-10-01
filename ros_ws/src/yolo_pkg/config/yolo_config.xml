@@ -33,7 +33,11 @@
     bearing_center_offset_px="167.69"
     bearing_log_denominator="171.46" />
 
+  <!-- max_lost_frames expires tracks after that many visible misses.
+       Out-of-view updates do not count; min_confirmation_hits counts
+       associated detections across gaps shorter than max_lost_frames. -->
   <tracker
+    use_kalman_filter="false"
     default_dt_seconds="0.1"
     max_lost_frames="15"
     mahalanobis_gate="9.21"

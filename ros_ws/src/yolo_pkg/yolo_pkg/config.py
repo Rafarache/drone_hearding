@@ -46,6 +46,7 @@ class YoloConfig:
     tracker_reacquisition_mahalanobis_gate: float
     tracker_reacquisition_distance_m: float
     tracker_diagnostic_log_period_seconds: float
+    tracker_use_kalman_filter: bool = False
 
 
 def _required(element, attribute, source_path):
@@ -186,6 +187,10 @@ def load_yolo_config():
         ),
         bearing_log_denominator=_required_float(
             projection, 'bearing_log_denominator', source_path
+        ),
+        tracker_use_kalman_filter=(
+            _required_bool(tracker, 'use_kalman_filter', source_path)
+            if tracker.get('use_kalman_filter') is not None else False
         ),
         tracker_default_dt_seconds=_required_float(
             tracker, 'default_dt_seconds', source_path

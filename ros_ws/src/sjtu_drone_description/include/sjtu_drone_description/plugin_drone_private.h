@@ -21,6 +21,8 @@
 #include "gazebo/physics/World.hh"
 #include "sdf/sdf.hh"
 
+#include <atomic>
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/callback_group.hpp>
 
@@ -132,6 +134,10 @@ private:
     PIDController pos_y;
     PIDController pos_z;
   };
+
+  std::atomic<bool> simulation_stopped_{false};
+  std::recursive_mutex command_mutex_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_subscriber_;
 
   // ROS Interfaces
   geometry_msgs::msg::Twist cmd_vel;

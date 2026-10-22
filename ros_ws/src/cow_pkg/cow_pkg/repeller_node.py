@@ -3,6 +3,8 @@ import math
 import rclpy
 from gazebo_msgs.msg import ModelStates
 from geometry_msgs.msg import Pose, Twist
+from std_msgs.msg import Empty
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.node import Node
 
 from cow_pkg.config import load_cow_config
@@ -14,6 +16,11 @@ class PeopleRepeller(Node):
     def __init__(self):
         super().__init__('cow_repeller')
 
+        self.stopped = False
+        self.stop_subscription = self.create_subscription(
+            Empty, '/simulation/stop', self.stop,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.config = load_cow_config()
         self.drone_namespace_prefix = str(
             self.declare_parameter('drone_namespace_prefix', '').value
@@ -125,7 +132,15 @@ class PeopleRepeller(Node):
     def normalize_rad_neg_pi_to_pi(angle_rad):
         return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
 
+    def stop(self, _msg):
+        self.stopped = True
+        for publisher in self.publishers_dict.values():
+            publisher.publish(Twist())
+
     def move_cows(self):
+        if self.stopped:
+            self.stop(None)
+            return
         if self.cows_dict is None or not self.publishers_dict:
             return
 

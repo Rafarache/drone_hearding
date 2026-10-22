@@ -10,11 +10,15 @@
 #include <queue>
 #include <stdexcept>
 #include <tuple>
+#include <map>
 
 #include "rclcpp/rclcpp.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "geometry_msgs/msg/pose.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
+#include "geometry_msgs/msg/polygon_stamped.hpp"
+#include "std_msgs/msg/empty.hpp"
+#include "grid_visualizer_pkg/search_coverage.hpp"
 #include "grid_visualizer_pkg/goal_quiet_zone.hpp"
 #include <opencv2/opencv.hpp>
 
@@ -37,6 +41,8 @@ struct GridConfig
   int control_recovery_search_radius_cells{0};
   bool show_occupancy_grid{false};
   bool show_vector_grid{false};
+  bool show_coverage_map{false};
+  bool search_border_first{true};
   int visualization_period_ms{0};
   int control_period_ms{0};
   double free_cell_potential{0.0};
@@ -107,15 +113,16 @@ GridConfig load_grid_config()
     read_required<int>(storage, "show_occupancy_grid") != 0;
   config.show_vector_grid =
     read_required<int>(storage, "show_vector_grid") != 0;
+  config.show_coverage_map =
+    read_required<int>(storage, "show_coverage_map") != 0;
+  config.search_border_first =
+    read_required<int>(storage, "search_border_first") != 0;
   config.visualization_period_ms =
     read_required<int>(storage, "visualization_period_ms");
   config.control_period_ms =
     read_required<int>(storage, "control_period_ms");
-  config.goal_position = cv::Point2f(
-    static_cast<float>(read_required<double>(storage, "goal_x")),
-    static_cast<float>(read_required<double>(storage, "goal_y")));
-  config.final_goal_reached_radius =
-    read_required<double>(storage, "final_goal_reached_radius_m");
+  // Goal values are supplied by the authoritative simulation launch.
+  config.final_goal_reached_radius = 2.0;
   config.goal_quiet_radius =
     read_required<double>(storage, "goal_quiet_radius_m");
   config.goal_quiet_duration_seconds =
@@ -228,14 +235,36 @@ class OccupancyGridVisualizer : public rclcpp::Node
 {
 public:
   OccupancyGridVisualizer()
-  : Node("occupancy_grid_visualizer"), config_(load_grid_config()),
-    goal_quiet_zone_(
-      {config_.goal_position.x, config_.goal_position.y},
-      config_.final_goal_reached_radius,
-      config_.goal_quiet_radius,
-      config_.goal_quiet_duration_seconds),
-    latest_effective_goal_radius_(config_.final_goal_reached_radius)
+  : Node("occupancy_grid_visualizer"), config_(load_grid_config())
   {
+    config_.goal_position = cv::Point2f(
+      declare_parameter<double>("goal_x", -10.0), declare_parameter<double>("goal_y", -10.0));
+    config_.final_goal_reached_radius = declare_parameter<double>("final_goal_reached_radius", 2.0);
+    if (!std::isfinite(config_.goal_position.x) || !std::isfinite(config_.goal_position.y) ||
+      !std::isfinite(config_.final_goal_reached_radius) || config_.final_goal_reached_radius <= 0 ||
+      config_.goal_quiet_radius <= config_.final_goal_reached_radius) {
+      throw std::invalid_argument("Invalid goal parameters");
+    }
+    goal_quiet_zone_ = std::make_unique<grid_visualizer_pkg::GoalQuietZone>(
+      grid_visualizer_pkg::CowPoint{config_.goal_position.x, config_.goal_position.y},
+      config_.final_goal_reached_radius, config_.goal_quiet_radius, config_.goal_quiet_duration_seconds);
+    latest_effective_goal_radius_ = config_.final_goal_reached_radius;
+    config_.show_vector_grid = declare_parameter<bool>("show_vector_grid", config_.show_vector_grid);
+    config_.show_occupancy_grid = declare_parameter<bool>("show_occupancy_grid", config_.show_occupancy_grid);
+    config_.show_coverage_map = declare_parameter<bool>("show_coverage_map", config_.show_coverage_map);
+    config_.search_border_first = declare_parameter<bool>("search_border_first", config_.search_border_first);
+    search_near_ = declare_parameter<double>("search_near_m", 2.0);
+    search_far_ = declare_parameter<double>("search_far_m", 10.0);
+    search_fov_ = declare_parameter<double>("search_fov_rad", 2.09);
+    search_planning_period_ = declare_parameter<double>("search_planning_period_s", 1.0);
+    if (!std::isfinite(search_planning_period_) || search_planning_period_ <= 0) {
+      throw std::runtime_error("search_planning_period_s must be finite and positive");
+    }
+    if (!std::isfinite(search_near_) || !std::isfinite(search_far_) ||
+      !std::isfinite(search_fov_) || search_near_ < 0 || search_near_ >= 5 ||
+      search_far_ <= 5 || search_fov_ <= 0 || search_fov_ > 2*std::acos(-1.0)) {
+      throw std::invalid_argument("Search range must contain the 5 m observation viewpoint");
+    }
     drone_index_ = this->declare_parameter<int>("drone_index", -1);
     total_drones_ = this->declare_parameter<int>("total_drones", 0);
     global_map_center_x_ = this->declare_parameter<double>(
@@ -298,9 +327,12 @@ public:
 
     drone_namespace_ =
       std::string(drone_namespace_prefix_) + std::to_string(drone_index_);
+    coverage_ = std::make_unique<grid_visualizer_pkg::SearchCoverage>(
+      global_map_min_x_, global_map_min_y_, global_map_width_, global_map_height_, config_.cell_size);
     grid_name_ = "grid" + std::to_string(drone_index_);
     occupancy_window_name_ = "Occupancy Grid - " + grid_name_;
     vector_window_name_ = "Vector Movement Grid - " + grid_name_;
+    coverage_window_name_ = "Visited Areas - " + drone_namespace_;
 
     // The index parameter owns topic selection. The ROS namespace only
     // organizes the node in the graph and cannot redirect another drone.
@@ -353,6 +385,27 @@ public:
     RCLCPP_INFO(this->get_logger(), "Drone Goto Pub Topic: %s", goto_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Drone Focus Pub Topic: %s", focus_topic.c_str());
 
+    auto stop_qos = rclcpp::QoS(1).reliable().transient_local();
+    stop_sub_ = create_subscription<std_msgs::msg::Empty>("/simulation/stop", stop_qos,
+      [this](std_msgs::msg::Empty::SharedPtr) {stopped_ = true; has_vector_grid_ = false;});
+    auto coverage_qos = rclcpp::QoS(50).reliable().durability_volatile();
+    searched_pub_ = create_publisher<geometry_msgs::msg::PolygonStamped>(
+      drone_namespace_ + "/searched_area", coverage_qos);
+    observation_sub_ = create_subscription<geometry_msgs::msg::PolygonStamped>(
+      drone_namespace_ + "/processed_view", coverage_qos,
+      [this](geometry_msgs::msg::PolygonStamped::SharedPtr msg) {
+        if (apply_observation(*msg) && !stopped_) {
+          has_own_observation_ = true;
+          searched_pub_->publish(*msg);
+          record_view_observation();
+        }
+      });
+    for (int i = 0; i < total_drones_; ++i) {
+      if (i == drone_index_) {continue;}
+      coverage_subs_.push_back(create_subscription<geometry_msgs::msg::PolygonStamped>(
+        drone_namespace_prefix_ + std::to_string(i) + "/searched_area", coverage_qos,
+        [this](geometry_msgs::msg::PolygonStamped::SharedPtr msg) {apply_observation(*msg);}));
+    }
     // Initialize subscriptions
     drone_sub_ = this->create_subscription<geometry_msgs::msg::Pose>(
       drone_gt_topic,
@@ -418,7 +471,9 @@ private:
     DRONE = 1,
     COW = 2,
     EXCLUSION = 3,
-    PUSH_OBJECTIVE = 4
+    PUSH_OBJECTIVE = 4,
+    SEARCH_OBJECTIVE = 5,
+    SEARCHED = 6
   };
 
   struct PushObjective
@@ -426,6 +481,9 @@ private:
     cv::Point2f global_point;
     double cow_goal_distance{0.0};
     double boundary_potential{0.0};
+    double strength{0.0};
+    bool is_search{false};
+    cv::Point2f look_at{0,0};
   };
 
   void drone_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
@@ -460,12 +518,44 @@ private:
     latest_peer_drone_poses_[peer_index] = msg;
   }
 
+  bool apply_observation(const geometry_msgs::msg::PolygonStamped& msg)
+  {
+    if (msg.header.frame_id != "map" || msg.polygon.points.size() < 3) {return false;}
+    std::vector<grid_visualizer_pkg::SearchPoint> polygon;
+    for (const auto& p : msg.polygon.points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {return false;}
+      polygon.push_back({p.x, p.y});
+    }
+    last_observation_gain_ = coverage_->observe(polygon);
+    return true;
+  }
+
+  void record_view_observation()
+  {
+    if (!latest_drone_pose_) {return;}
+    const auto& p = *latest_drone_pose_;
+    const double yaw = std::atan2(2*(p.orientation.w*p.orientation.z+p.orientation.x*p.orientation.y),
+      1-2*(p.orientation.y*p.orientation.y+p.orientation.z*p.orientation.z));
+    for (const auto& view : latest_search_views_) {
+      if (grid_visualizer_pkg::distance({p.position.x,p.position.y},view.position) > 0.75) {continue;}
+      const double heading = std::atan2(view.look_at.y-p.position.y,view.look_at.x-p.position.x);
+      if (std::abs(grid_visualizer_pkg::angle_difference(heading,yaw)) > 0.15) {continue;}
+      int key = coverage_->index(view.position);
+      int& misses = failed_observations_[key];
+      misses = last_observation_gain_ ? 0 : misses+1;
+      if (misses >= 3) {
+        failed_views_.push_back({view.position,now().seconds()+10.0});
+        misses = 0;
+      }
+    }
+  }
+
   void cow_callback(
     const geometry_msgs::msg::PoseArray::SharedPtr msg)
   {
-    // Every tracker message is an authoritative snapshot. An empty array
-    // clears retired tracks; if messages stop entirely, latest_cows_ remains
-    // unchanged and the previous map continues to drive the drone.
+    // The tracker publishes the full persistent map of confirmed cows, even
+    // when none are currently visible. Keep global positions here: clipping
+    // for this drone's moving local grid must never modify this snapshot.
     auto valid_cows =
       std::make_shared<geometry_msgs::msg::PoseArray>();
     valid_cows->header = msg->header;
@@ -842,10 +932,12 @@ private:
 
   void timer_5hz_callback()
   {
+    // Keep the coverage view responsive before takeoff and after mission stop.
+    update_coverage_map_window();
+    if (stopped_) {return;}
     geometry_msgs::msg::Pose::SharedPtr drone_pose;
     geometry_msgs::msg::PoseArray::SharedPtr cows;
     std::vector<geometry_msgs::msg::Pose::SharedPtr> peer_drone_poses;
-    std::vector<PushObjective> remembered_push_objectives;
     cv::Point2f remembered_primary_push_objective;
     bool has_remembered_primary_push_objective = false;
     bool has_drone = false;
@@ -856,7 +948,6 @@ private:
       drone_pose = latest_drone_pose_;
       cows = latest_cows_;
       peer_drone_poses = latest_peer_drone_poses_;
-      remembered_push_objectives = latest_valid_push_objectives_;
       remembered_primary_push_objective =
         latest_primary_push_objective_;
       has_remembered_primary_push_objective =
@@ -882,7 +973,7 @@ private:
         }
       }
     }
-    const double effective_goal_radius = goal_quiet_zone_.update(
+    const double effective_goal_radius = goal_quiet_zone_->update(
       cow_points, grid_visualizer_pkg::GoalQuietZone::Clock::now());
 
     std::vector<std::vector<CellState>> grid(
@@ -892,12 +983,12 @@ private:
       config_.grid_size, config_.grid_size, CV_64F, cv::Scalar(config_.free_cell_potential));
     cv::Mat is_fixed(
       config_.grid_size, config_.grid_size, CV_8UC1, cv::Scalar(0));
+    cv::Mat absorption(config_.grid_size, config_.grid_size, CV_64F, cv::Scalar(0));
     cv::Mat objective_mask(
       config_.grid_size, config_.grid_size, CV_8UC1, cv::Scalar(0));
     cv::Mat objective_source_cost(
       config_.grid_size, config_.grid_size, CV_64F, cv::Scalar(0.0));
     std::vector<PushObjective> current_push_objectives;
-    bool evaluated_at_least_one_cow = false;
 
     // The local perimeter closes the relaxation problem. Cells whose global
     // centers lie outside the finite map are also unavailable.
@@ -905,6 +996,7 @@ private:
       for (int col = 0; col < config_.grid_size; ++col) {
         const cv::Point2f global_cell =
           grid_to_global(row, col, grid_center);
+        if (coverage_->seen({global_cell.x, global_cell.y})) {grid[row][col] = SEARCHED;}
         const bool is_local_perimeter =
           row == 0 ||
           row == config_.grid_size - 1 ||
@@ -930,7 +1022,6 @@ private:
         if (!is_inside_global_map(cow_x, cow_y)) {
           continue;
         }
-        evaluated_at_least_one_cow = true;
 
         int cow_row = 0;
         int cow_col = 0;
@@ -1026,17 +1117,6 @@ private:
       potential_grid.at<double>(peer_row, peer_col) = config_.boundary_potential;
       is_fixed.at<uchar>(peer_row, peer_col) = 1;
     }
-
-    const bool authoritative_empty_cow_set =
-      has_cows &&
-      cows &&
-      cows->poses.empty();
-    const bool has_authoritative_cow_evaluation =
-      evaluated_at_least_one_cow ||
-      authoritative_empty_cow_set;
-    const bool all_evaluated_cows_at_goal =
-      has_authoritative_cow_evaluation &&
-      current_push_objectives.empty();
 
     cv::Point2f current_primary_push_objective;
     bool has_current_primary_push_objective = false;
@@ -1164,16 +1244,84 @@ private:
         });
     }
 
-    // A received cow snapshot is authoritative, including an empty one.
-    // Objective memory is used only before any usable tracker snapshot exists.
-    const std::vector<PushObjective>& active_push_objectives =
-      has_authoritative_cow_evaluation ?
-      current_push_objectives :
-      remembered_push_objectives;
+    // Search and pushing coexist: build positive scores for both groups.
+    std::vector<grid_visualizer_pkg::SearchPoint> peers, cow_locations;
+    for (const auto& peer : peer_drone_poses) {
+      if (peer) {peers.push_back({peer->position.x, peer->position.y});}
+    }
+    if (cows) {for (const auto& cow : cows->poses) {
+      cow_locations.push_back({cow.position.x, cow.position.y});
+    }}
+    auto blocked = [&](grid_visualizer_pkg::SearchPoint p) {
+      if (!is_inside_global_map(p.x, p.y)) {return true;}
+      for (auto cow : cow_locations) {
+        if (grid_visualizer_pkg::distance(p, cow) <= cow_exclusion_radius_) {return true;}
+      }
+      for (auto peer : peers) {
+        if (grid_visualizer_pkg::distance(p, peer) <= config_.cell_size) {return true;}
+      }
+      return false;
+    };
+    const double sim_now = now().seconds();
+    failed_views_.erase(std::remove_if(failed_views_.begin(), failed_views_.end(),
+      [sim_now](const auto& failure) {return sim_now >= failure.second;}), failed_views_.end());
+    auto retired = [&](auto p) {return std::any_of(failed_views_.begin(), failed_views_.end(),
+      [&](const auto& failure) {return grid_visualizer_pkg::distance(p,failure.first)<config_.cell_size;});};
+    // Keep local obstacle/field updates at 5 Hz; global destination selection is
+    // much more expensive and only needs to run at the observation cadence.
+    if (has_own_observation_ && (!search_plan_initialized_ || sim_now < last_search_plan_ ||
+      sim_now-last_search_plan_ >= search_planning_period_)) {
+      latest_search_views_ = coverage_->views(
+        {grid_center.x, grid_center.y}, peers, blocked, search_near_, search_far_, search_fov_,
+        12, retired, config_.search_border_first);
+      last_search_plan_ = sim_now;
+      search_plan_initialized_ = true;
+    }
+    auto search_views = latest_search_views_;
+    // Moving cows/peers and newly covered/retired targets invalidate cached
+    // destinations immediately, without waiting for the next global plan.
+    search_views.erase(std::remove_if(search_views.begin(), search_views.end(),
+      [&](const auto& view) {
+        return blocked(view.position) || retired(view.position) || coverage_->gain(
+          view.position, std::atan2(view.look_at.y-view.position.y,view.look_at.x-view.position.x),
+          search_near_,search_far_,search_fov_,view.max_border_depth)==0;
+      }), search_views.end());
+    active_search_max_depth_ = search_views.empty() ? std::numeric_limits<double>::infinity() :
+      search_views.front().max_border_depth;
+    const auto weights = balance_.update(now().seconds(), coverage_->count(), cow_locations,
+      {config_.goal_position.x, config_.goal_position.y}, !search_views.empty(), !current_push_objectives.empty());
+    search_weight_ = weights.first; herd_weight_ = weights.second;
+    double search_sum = 0, herd_sum = 0;
+    for (const auto& view : search_views) {search_sum += view.score;}
+    for (const auto& objective : current_push_objectives) {
+      double priority = config_.max_near_goal_objective_potential > 0 ?
+        1-objective.boundary_potential/config_.max_near_goal_objective_potential : 1;
+      herd_sum += (0.1+0.9*priority)/(1+cv::norm(objective.global_point-grid_center)/search_far_);
+    }
+    std::vector<PushObjective> active_push_objectives;
+    for (auto objective : current_push_objectives) {
+      double priority = config_.max_near_goal_objective_potential > 0 ?
+        1-objective.boundary_potential/config_.max_near_goal_objective_potential : 1;
+      double score = (0.1+0.9*priority)/(1+cv::norm(objective.global_point-grid_center)/search_far_);
+      objective.strength = herd_sum > 0 ? herd_weight_*score/herd_sum : 0;
+      active_push_objectives.push_back(objective);
+    }
+    latest_search_views_ = search_views;
+    for (const auto& view : search_views) {
+      PushObjective objective;
+      objective.global_point = cv::Point2f(view.position.x, view.position.y);
+      objective.strength = search_sum > 0 ? search_weight_*view.score/search_sum : 0;
+      objective.is_search = true;
+      objective.look_at = cv::Point2f(view.look_at.x, view.look_at.y);
+      active_push_objectives.push_back(objective);
+    }
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+      "coverage=%.1f%% search=%.2f herd=%.2f objectives=%zu/%zu",
+      100*coverage_->fraction(), search_weight_, herd_weight_, search_views.size(), current_push_objectives.size());
 
-    // Project each global push destination into the intersection of the local
-    // window and finite global map. Ray clipping preserves both its direction
-    // and its cow-distance priority at an intermediate edge objective.
+    // Project each global destination into the current local window without
+    // modifying the cow map or the real global push destination. This temporary
+    // edge objective is regenerated when the drone searches somewhere else.
     for (const auto& push_objective : active_push_objectives) {
       cv::Point2f clipped_push_point;
       if (!clip_target_to_valid_region(
@@ -1184,6 +1332,12 @@ private:
         continue;
       }
 
+      // A clipped intermediate waypoint is navigation, not a claimed observation.
+      const bool is_final_view = cv::norm(clipped_push_point-push_objective.global_point) < config_.cell_size;
+      if (push_objective.is_search && is_final_view &&
+        coverage_->gain({clipped_push_point.x, clipped_push_point.y},
+          std::atan2(push_objective.look_at.y-clipped_push_point.y, push_objective.look_at.x-clipped_push_point.x),
+          search_near_, search_far_, search_fov_) == 0) {continue;}
       int desired_row = -1;
       int desired_col = -1;
       if (!global_to_grid(
@@ -1210,29 +1364,27 @@ private:
         continue;
       }
 
-      const double boundary_potential = std::clamp(
-        push_objective.boundary_potential,
-        0.0,
-        config_.max_near_goal_objective_potential);
-      const double normalized_priority_cost =
-        config_.max_near_goal_objective_potential >
-          config_.potential_descent_epsilon ?
-        boundary_potential / config_.max_near_goal_objective_potential :
-        0.0;
-
-      grid[objective_row][objective_col] = PUSH_OBJECTIVE;
-      potential_grid.at<double>(objective_row, objective_col) =
-        boundary_potential;
+      if (push_objective.is_search && is_final_view) {
+        auto placed = grid_to_global(objective_row,objective_col,grid_center);
+        if (coverage_->gain({placed.x,placed.y},
+          std::atan2(push_objective.look_at.y-placed.y,push_objective.look_at.x-placed.x),
+          search_near_,search_far_,search_fov_) == 0) {continue;}
+      }
+      const double budget = 32.0*std::pow(config_.cell_size/0.5, 2);
+      absorption.at<double>(objective_row, objective_col) = std::min(2*budget,
+        absorption.at<double>(objective_row, objective_col)+budget*push_objective.strength);
+      grid[objective_row][objective_col] = push_objective.is_search ? SEARCH_OBJECTIVE : PUSH_OBJECTIVE;
       objective_source_cost.at<double>(objective_row, objective_col) =
-        normalized_priority_cost * config_.objective_priority_fallback_bias;
-      is_fixed.at<uchar>(objective_row, objective_col) = 1;
+        config_.objective_priority_fallback_bias*(1-std::min(1.0,
+          absorption.at<double>(objective_row, objective_col)/budget));
       objective_mask.at<uchar>(objective_row, objective_col) = 1;
     }
 
     const bool has_push_objective =
-      cv::countNonZero(objective_mask) > 0;
+      has_own_observation_ && cv::countNonZero(objective_mask) > 0;
 
-    // Solve Laplace's equation with in-place SOR until the field converges.
+    // Laplace between targets, positive absorption at targets: one scalar solve.
+    bool converged = false;
     if (has_push_objective) {
       for (int iter = 0; iter < config_.relaxation_max_iterations; ++iter) {
         double max_change = 0.0;
@@ -1243,11 +1395,11 @@ private:
             }
 
             const double old_value = potential_grid.at<double>(r, c);
-            const double neighbor_average = (
+            const double neighbor_average = grid_visualizer_pkg::absorbing_value(
               potential_grid.at<double>(r, c - 1) +
               potential_grid.at<double>(r, c + 1) +
               potential_grid.at<double>(r - 1, c) +
-              potential_grid.at<double>(r + 1, c)) / 4.0;
+              potential_grid.at<double>(r + 1, c), absorption.at<double>(r,c));
             const double new_value = old_value +
               config_.sor_relaxation_factor * (neighbor_average - old_value);
 
@@ -1257,7 +1409,16 @@ private:
         }
 
         if (max_change < config_.relaxation_tolerance) {
-          break;
+          double residual = 0;
+          for (int r=1; r<config_.grid_size-1; ++r) {for (int c=1; c<config_.grid_size-1; ++c) {
+            if (is_fixed.at<uchar>(r,c)) {continue;}
+            double sum=potential_grid.at<double>(r-1,c)+potential_grid.at<double>(r+1,c)+
+              potential_grid.at<double>(r,c-1)+potential_grid.at<double>(r,c+1);
+            residual=std::max(residual, std::abs(potential_grid.at<double>(r,c)-
+              grid_visualizer_pkg::absorbing_value(sum,absorption.at<double>(r,c))));
+          }}
+          converged = residual < config_.relaxation_tolerance;
+          if (converged) {break;}
         }
       }
     }
@@ -1438,60 +1599,156 @@ private:
       }
     }
     const bool candidate_field_is_valid =
-      has_push_objective &&
+      has_push_objective && converged &&
       usable_vector_count > 0 &&
       cv::checkRange(potential_grid);
 
-    // Commit vectors together with the global center that defined their
-    // coordinate frame. Never reinterpret an old raster at a new center.
+    // Commit this cycle only: never continue toward obsolete search/cow targets.
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      has_primary_push_objective_ = has_current_primary_push_objective;
+      if (has_current_primary_push_objective) {latest_primary_push_objective_ = current_primary_push_objective;}
       latest_effective_goal_radius_ = effective_goal_radius;
-      if (all_evaluated_cows_at_goal) {
-        latest_vector_grid_ = vector_grid;
-        latest_cell_grid_ = grid;
-        latest_is_fixed_grid_ = is_fixed.clone();
-        latest_saddle_escape_grid_ = saddle_escape_grid.clone();
-        latest_grid_center_ = grid_center;
-        latest_grid_offset_ = grid_center - global_map_center_;
-        latest_valid_push_objectives_.clear();
-        has_primary_push_objective_ = false;
-        has_vector_grid_ = false;
-        all_cows_at_goal_ = true;
-        has_last_nonzero_move_direction_ = false;
-      } else {
-        // Resume herding when a cow is outside the current goal radius.
-        // A valid previous field can remain as the movement fallback if
-        // this particular relaxation cycle is invalid.
-        all_cows_at_goal_ = false;
-        if (candidate_field_is_valid) {
-          latest_vector_grid_ = vector_grid;
-          latest_cell_grid_ = grid;
-          latest_is_fixed_grid_ = is_fixed.clone();
-          latest_saddle_escape_grid_ = saddle_escape_grid.clone();
-          latest_grid_center_ = grid_center;
-          latest_grid_offset_ = grid_center - global_map_center_;
-          if (!current_push_objectives.empty()) {
-            latest_valid_push_objectives_ = current_push_objectives;
-          }
-          if (has_current_primary_push_objective) {
-            latest_primary_push_objective_ =
-              current_primary_push_objective;
-            has_primary_push_objective_ = true;
-          }
-          has_vector_grid_ = true;
-        }
-      }
+      latest_vector_grid_ = vector_grid;
+      latest_cell_grid_ = grid;
+      latest_is_fixed_grid_ = is_fixed.clone();
+      latest_saddle_escape_grid_ = saddle_escape_grid.clone();
+      latest_grid_center_ = grid_center;
+      has_vector_grid_ = candidate_field_is_valid;
+      has_no_objectives_ = !has_push_objective;
     }
 
-    // Render this center-aware candidate. Remembered global objectives make
-    // empty detection updates regenerate at the current drone position.
+    // Render this cycle at its current global center.
     if (config_.show_occupancy_grid) {
       compute_and_display_occupancy_map(grid, grid_center);
     }
     if (config_.show_vector_grid) {
       compute_and_display_vector_grid(
         grid, vector_grid, is_fixed, saddle_escape_grid, grid_center);
+    }
+  }
+
+  void update_coverage_map_window()
+  {
+    // Read the parameter each cycle so each drone can toggle its view at runtime.
+    if (!get_parameter("show_coverage_map").as_bool()) {
+      if (coverage_window_open_) {
+        cv::destroyWindow(coverage_window_name_);
+        cv::waitKey(1);
+        coverage_window_open_ = false;
+      }
+      return;
+    }
+
+    const auto display_now = std::chrono::steady_clock::now();
+    if (coverage_window_open_ && display_now-last_coverage_display_ < std::chrono::seconds(1)) {
+      cv::waitKey(1);  // Keep the window responsive between image updates.
+      return;
+    }
+    last_coverage_display_ = display_now;
+    const cv::Vec3b visited_color(190, 225, 190);
+    if (coverage_cells_.empty() || rendered_coverage_count_ != coverage_->count()) {
+      coverage_cells_ = cv::Mat(coverage_->rows(), coverage_->cols(), CV_8UC3, cv::Scalar(255, 255, 255));
+      for (int row = 0; row < coverage_cells_.rows; ++row) {
+        for (int col = 0; col < coverage_cells_.cols; ++col) {
+          if (coverage_->seen_cell(row, col)) {
+            // Coverage rows increase in world Y; display north at the top.
+            coverage_cells_.at<cv::Vec3b>(coverage_cells_.rows - 1 - row, col) = visited_color;
+          }
+        }
+      }
+      rendered_coverage_count_ = coverage_->count();
+    }
+
+    constexpr int max_extent = 600;
+    const double scale = max_extent / std::max(global_map_width_, global_map_height_);
+    const int width = std::max(1, cvRound(global_map_width_ * scale));
+    const int height = std::max(1, cvRound(global_map_height_ * scale));
+    constexpr int margin = 16;
+    constexpr int top = 58;
+    cv::Mat image(height + top + 64, std::max(500, width + 2 * margin),
+      CV_8UC3, cv::Scalar(245, 245, 245));
+    const cv::Rect plot(margin, top, width, height);
+    cv::Mat scaled_cells;
+    cv::resize(coverage_cells_, scaled_cells, plot.size(), 0, 0, cv::INTER_NEAREST);
+    scaled_cells.copyTo(image(plot));
+    cv::rectangle(image, plot, cv::Scalar(80, 80, 80), 1);
+    // These are detector/tracker positions, not Gazebo ground-truth cows.
+    geometry_msgs::msg::PoseArray::SharedPtr detected_cows;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      detected_cows = latest_cows_;
+    }
+    if (detected_cows) {
+      for (const auto& cow : detected_cows->poses) {
+        if (!is_inside_global_map(cow.position.x, cow.position.y)) {continue;}
+        const int x = plot.x + cvRound(
+          (cow.position.x - global_map_min_x_) / global_map_width_ * (width - 1));
+        const int y = plot.y + cvRound(
+          (global_map_max_y_ - cow.position.y) / global_map_height_ * (height - 1));
+        cv::circle(image, cv::Point(x, y), 4, cv::Scalar(0, 0, 255), cv::FILLED, cv::LINE_AA);
+      }
+    }
+    cv::putText(image,
+      cv::format("%s | visited %.1f%%", drone_namespace_.c_str(), 100 * coverage_->fraction()),
+      cv::Point(margin, 23), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+    cv::putText(image, cv::format("Whole map %.1f x %.1f m | +Y up, +X right",
+        global_map_width_, global_map_height_),
+      cv::Point(margin, 44), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(60, 60, 60), 1, cv::LINE_AA);
+    cv::putText(image, cv::format("X [%.1f, %.1f]  Y [%.1f, %.1f]",
+        global_map_min_x_, global_map_max_x_, global_map_min_y_, global_map_max_y_),
+      cv::Point(margin, top + height + 22), cv::FONT_HERSHEY_SIMPLEX, 0.4,
+      cv::Scalar(60, 60, 60), 1, cv::LINE_AA);
+    const int legend_y = top + height + 37;
+    cv::rectangle(image, cv::Rect(margin, legend_y, 14, 14), cv::Scalar(190, 225, 190), cv::FILLED);
+    cv::putText(image, "Visited (own + received)", cv::Point(margin + 20, legend_y + 12),
+      cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+    cv::rectangle(image, cv::Rect(margin + 230, legend_y, 14, 14), cv::Scalar(255, 255, 255), cv::FILLED);
+    cv::putText(image, "Unvisited", cv::Point(margin + 250, legend_y + 12),
+      cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+    cv::circle(image, cv::Point(margin + 357, legend_y + 7), 4,
+      cv::Scalar(0, 0, 255), cv::FILLED, cv::LINE_AA);
+    cv::putText(image, "Detected cows", cv::Point(margin + 370, legend_y + 12),
+      cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+
+    cv::imshow(coverage_window_name_, image);
+    coverage_window_open_ = true;
+    cv::waitKey(1);
+  }
+
+  void draw_off_map_cows(cv::Mat& image, const cv::Point2f& grid_center)
+  {
+    geometry_msgs::msg::PoseArray::SharedPtr cows;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      cows = latest_cows_;
+    }
+    if (!cows) {return;}
+    for (const auto& cow : cows->poses) {
+      const cv::Point2f global_cow(cow.position.x, cow.position.y);
+      const cv::Point2f offset = global_cow - grid_center;
+      if (std::abs(offset.x) <= config_.map_half_width &&
+        std::abs(offset.y) <= config_.map_half_width) {continue;}
+      cv::Point2f intermediate;
+      if (!clip_target_to_valid_region(grid_center, global_cow, intermediate)) {continue;}
+      const cv::Point2f local = intermediate - grid_center;
+      const cv::Point marker(
+        cvRound((local.x + config_.map_half_width) / (2 * config_.map_half_width) * (image.cols - 1)),
+        cvRound((config_.map_half_width - local.y) / (2 * config_.map_half_width) * (image.rows - 1)));
+      // A hollow marker is only a visual proxy. It is not a cow obstacle at
+      // this position, and never replaces the cow's true global coordinates.
+      cv::circle(image, marker, 5, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+      const std::string label = cv::format("OFF COW %.1fm", cv::norm(offset));
+      const double font_scale = image.cols >= 600 ? 0.35 : 0.30;
+      int baseline = 0;
+      const cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX,
+        font_scale, 1, &baseline);
+      const cv::Point origin(
+        std::clamp(marker.x + 8, 2, std::max(2, image.cols - text_size.width - 2)),
+        std::clamp(marker.y - 8, text_size.height + 2,
+          std::max(text_size.height + 2, image.rows - baseline - 2)));
+      cv::putText(image, label, origin, cv::FONT_HERSHEY_SIMPLEX,
+        font_scale, cv::Scalar(0, 0, 210), 1, cv::LINE_AA);
     }
   }
 
@@ -1629,7 +1886,11 @@ private:
     cv::Mat display_img(config_.grid_size, config_.grid_size, CV_8UC3, cv::Scalar(255, 255, 255));
     for (int r = 0; r < config_.grid_size; ++r) {
       for (int c = 0; c < config_.grid_size; ++c) {
-        if (grid[r][c] == DRONE) {
+        if (grid[r][c] == SEARCHED) {
+          display_img.at<cv::Vec3b>(r,c) = cv::Vec3b(235,235,215);
+        } else if (grid[r][c] == SEARCH_OBJECTIVE) {
+          display_img.at<cv::Vec3b>(r,c) = cv::Vec3b(0,180,255);
+        } else if (grid[r][c] == DRONE) {
           display_img.at<cv::Vec3b>(r, c) = cv::Vec3b(255, 0, 0);     // Blue
         } else if (grid[r][c] == COW) {
           display_img.at<cv::Vec3b>(r, c) = cv::Vec3b(0, 0, 255);     // Red
@@ -1651,6 +1912,7 @@ private:
       cv::INTER_NEAREST);
 
     draw_final_goal(enlarged_img, grid_center);
+    draw_off_map_cows(enlarged_img, grid_center);
 
     // config_.grid_size is even, so draw the drone at the exact geometric center
     // instead of offsetting it into one of the four central cells.
@@ -1703,6 +1965,11 @@ private:
         float center_y = (r + 0.5f) * cell_size;
         cv::Point2f center(center_x, center_y);
 
+        if (grid[r][c] == SEARCHED || grid[r][c] == SEARCH_OBJECTIVE) {
+          cv::rectangle(vector_img, cv::Point(c*cell_size,r*cell_size),
+            cv::Point((c+1)*cell_size,(r+1)*cell_size),
+            grid[r][c] == SEARCH_OBJECTIVE ? cv::Scalar(0,180,255) : cv::Scalar(235,235,215), cv::FILLED);
+        }
         if (grid[r][c] == COW) {
           cv::rectangle(vector_img, cv::Point(c * cell_size, r * cell_size), cv::Point((c + 1) * cell_size, (r + 1) * cell_size), cv::Scalar(0, 0, 255), cv::FILLED);
           continue;
@@ -1734,6 +2001,7 @@ private:
     }
 
     draw_final_goal(vector_img, grid_center);
+    draw_off_map_cows(vector_img, grid_center);
 
     cv::circle(
       vector_img,
@@ -1768,18 +2036,16 @@ private:
 
   void timer_2hz_callback()
   {
+    if (stopped_) {return;}
     geometry_msgs::msg::Pose::SharedPtr drone_pose;
     geometry_msgs::msg::PoseArray::SharedPtr cows;
     std::vector<std::vector<cv::Point2f>> vector_grid;
     std::vector<std::vector<CellState>> cell_grid;
     cv::Mat is_fixed_grid;
     cv::Point2f grid_center;
-    cv::Point2f last_move_direction;
     bool has_drone = false;
-    bool has_cows = false;
     bool has_grid = false;
-    bool has_last_move_direction = false;
-    bool all_cows_at_goal = false;
+    bool has_no_objectives = false;
     double effective_goal_radius = config_.final_goal_reached_radius;
 
     {
@@ -1790,12 +2056,9 @@ private:
       cell_grid = latest_cell_grid_;
       is_fixed_grid = latest_is_fixed_grid_.clone();
       grid_center = latest_grid_center_;
-      last_move_direction = last_nonzero_move_direction_;
       has_drone = received_drone_;
-      has_cows = received_cows_;
       has_grid = has_vector_grid_;
-      has_last_move_direction = has_last_nonzero_move_direction_;
-      all_cows_at_goal = all_cows_at_goal_;
+      has_no_objectives = has_no_objectives_;
       effective_goal_radius = latest_effective_goal_radius_;
     }
 
@@ -1806,9 +2069,8 @@ private:
     double drone_x = drone_pose->position.x;
     double drone_y = drone_pose->position.y;
 
-    // 1. Goto Calculation. Hold when every cow is inside the current
-    // goal radius; movement resumes if any cow leaves it.
-    if (all_cows_at_goal) {
+    // Hold explicitly until there is a valid current search/pushing field.
+    if (has_no_objectives || !has_grid) {
       geometry_msgs::msg::Pose hold_msg = *drone_pose;
       goto_pub_->publish(hold_msg);
     } else if (
@@ -1839,7 +2101,8 @@ private:
 
       const bool is_push_objective =
         !cell_grid.empty() &&
-        cell_grid[drone_row][drone_col] == PUSH_OBJECTIVE;
+        (cell_grid[drone_row][drone_col] == PUSH_OBJECTIVE ||
+          cell_grid[drone_row][drone_col] == SEARCH_OBJECTIVE);
 
       if (magnitude <= 0.5f && !is_push_objective) {
         cv::Point2f recovery_direction;
@@ -1857,34 +2120,22 @@ private:
         {
           vector = recovery_direction;
           magnitude = 1.0f;
-        } else if (has_last_move_direction) {
-          vector = last_move_direction;
-          magnitude = std::hypot(vector.x, vector.y);
         }
       }
 
       cv::Point2f movement(0.0f, 0.0f);
-      bool publish_goto = true;
       if (magnitude > 0.5f) {
         movement = cv::Point2f(
           (vector.x / magnitude) *
             static_cast<float>(config_.max_goto_movement),
           (vector.y / magnitude) *
             static_cast<float>(config_.max_goto_movement));
-        {
-          std::lock_guard<std::mutex> lock(mutex_);
-          last_nonzero_move_direction_ = cv::Point2f(
-            vector.x / magnitude,
-            vector.y / magnitude);
-          has_last_nonzero_move_direction_ = true;
-        }
       } else if (!is_push_objective) {
-        // Preserve the previously active nonzero waypoint instead of
-        // publishing an accidental hold command.
-        publish_goto = false;
+        // Explicitly replace stale waypoints when local recovery fails.
+        movement = cv::Point2f(0,0);
       }
 
-      if (publish_goto) {
+      {
         geometry_msgs::msg::Pose goto_msg;
         goto_msg.position.x = std::clamp(
           drone_x + movement.x,
@@ -1900,45 +2151,50 @@ private:
       }
     }
 
-    // 2. Focus on the nearest cow outside the active goal radius.
-    if (has_cows && cows && !cows->poses.empty()) {
-      std::vector<grid_visualizer_pkg::CowPoint> cow_points;
-      cow_points.reserve(cows->poses.size());
-      for (const auto & cow_pose : cows->poses) {
-        cow_points.push_back({cow_pose.position.x, cow_pose.position.y});
-      }
-      const std::size_t closest_index =
-        grid_visualizer_pkg::closest_cow_outside_goal(
-        cow_points,
-        {drone_x, drone_y},
-        {config_.goal_position.x, config_.goal_position.y},
-        effective_goal_radius);
-
-      if (closest_index < cows->poses.size()) {
-        focusin_pub_->publish(cows->poses[closest_index]);
-      } else {
-        geometry_msgs::msg::Pose focus_pose;
-        if (all_cows_at_goal) {
-          // Continue watching the goal area while holding position.
-          focus_pose.position.x = config_.goal_position.x;
-          focus_pose.position.y = config_.goal_position.y;
-        } else {
-          // A previous movement command may still be active. Aim away from
-          // the goal rather than at a cow inside the quiet zone.
-          double direction_x = drone_x - config_.goal_position.x;
-          double direction_y = drone_y - config_.goal_position.y;
-          double magnitude = std::hypot(direction_x, direction_y);
-          if (magnitude < 1.0e-6) {
-            direction_x = 1.0;
-            direction_y = 0.0;
-            magnitude = 1.0;
-          }
-          focus_pose.position.x = drone_x + 10.0 * direction_x / magnitude;
-          focus_pose.position.y = drone_y + 10.0 * direction_y / magnitude;
-        }
-        focusin_pub_->publish(focus_pose);
-      }
+    // Score headings for simultaneous observation benefits, rather than averaging bearings.
+    double yaw = std::atan2(2*(drone_pose->orientation.w*drone_pose->orientation.z+
+      drone_pose->orientation.x*drone_pose->orientation.y),
+      1-2*(drone_pose->orientation.y*drone_pose->orientation.y+drone_pose->orientation.z*drone_pose->orientation.z));
+    std::vector<double> headings{yaw};
+    for (int k=0; k<24; ++k) {headings.push_back(yaw+k*std::acos(-1.0)/12);}
+    for (const auto& view : latest_search_views_) {
+      headings.push_back(std::atan2(view.look_at.y-drone_y,view.look_at.x-drone_x));
     }
+    std::vector<grid_visualizer_pkg::SearchPoint> active_cows;
+    if (cows) {for (const auto& cow : cows->poses) {
+      if (std::hypot(cow.position.x-config_.goal_position.x,cow.position.y-config_.goal_position.y)>effective_goal_radius) {
+        active_cows.push_back({cow.position.x,cow.position.y});
+        headings.push_back(std::atan2(cow.position.y-drone_y,cow.position.x-drone_x));
+      }
+    }}
+    double max_gain=1;
+    std::vector<double> heading_gains;
+    heading_gains.reserve(headings.size());
+    for (double h : headings) {
+      double gain = search_weight_ > 0 ? coverage_->gain(
+        {drone_x,drone_y},h,search_near_,search_far_,search_fov_,active_search_max_depth_) : 0;
+      heading_gains.push_back(gain);
+      max_gain=std::max(max_gain,gain);
+    }
+    double best_heading=yaw, best_score=-1e9;
+    for (std::size_t heading_index=0; heading_index<headings.size(); ++heading_index) {
+      double h=headings[heading_index];
+      double visible=0;
+      for (auto cow : active_cows) {
+        if (grid_visualizer_pkg::distance({drone_x,drone_y},cow)<=search_far_ &&
+          std::abs(grid_visualizer_pkg::angle_difference(std::atan2(cow.y-drone_y,cow.x-drone_x),h))<=search_fov_/2) {++visible;}
+      }
+      double score=search_weight_*heading_gains[heading_index]/max_gain+
+        herd_weight_*visible/std::max(std::size_t(1),active_cows.size())-
+        0.05*std::abs(grid_visualizer_pkg::angle_difference(h,yaw))/std::acos(-1.0);
+      if (score>best_score+1e-8) {best_score=score; best_heading=h;}
+    }
+    geometry_msgs::msg::Pose focus;
+    focus.position.x=drone_x+10*std::cos(best_heading);
+    focus.position.y=drone_y+10*std::sin(best_heading);
+    focus.position.z=drone_pose->position.z;
+    if (has_no_objectives) {focus.position.x=config_.goal_position.x; focus.position.y=config_.goal_position.y;}
+    focusin_pub_->publish(focus);
   }
 
   // Subscriptions, Publishers, Timers & Mutex
@@ -1954,7 +2210,24 @@ private:
   rclcpp::TimerBase::SharedPtr timer_2hz_;
 
   GridConfig config_;
-  grid_visualizer_pkg::GoalQuietZone goal_quiet_zone_;
+  std::unique_ptr<grid_visualizer_pkg::GoalQuietZone> goal_quiet_zone_;
+  std::unique_ptr<grid_visualizer_pkg::SearchCoverage> coverage_;
+  grid_visualizer_pkg::SearchBalance balance_;
+  std::vector<grid_visualizer_pkg::SearchView> latest_search_views_;
+  std::vector<std::pair<grid_visualizer_pkg::SearchPoint,double>> failed_views_;
+  std::map<int,int> failed_observations_;
+  std::size_t last_observation_gain_{0};
+  bool has_own_observation_{false};
+  double search_near_{2},search_far_{10},search_fov_{2.09};
+  double search_planning_period_{1},last_search_plan_{0};
+  bool search_plan_initialized_{false};
+  double search_weight_{0},herd_weight_{0};
+  double active_search_max_depth_{std::numeric_limits<double>::infinity()};
+  bool stopped_{false};
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PolygonStamped>::SharedPtr observation_sub_;
+  std::vector<rclcpp::Subscription<geometry_msgs::msg::PolygonStamped>::SharedPtr> coverage_subs_;
+  rclcpp::Publisher<geometry_msgs::msg::PolygonStamped>::SharedPtr searched_pub_;
   double latest_effective_goal_radius_{0.0};
   int drone_index_{-1};
   int total_drones_{0};
@@ -1973,13 +2246,17 @@ private:
   cv::Point2f global_map_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_offset_{0.0f, 0.0f};
-  std::vector<PushObjective> latest_valid_push_objectives_;
   cv::Point2f latest_primary_push_objective_{0.0f, 0.0f};
   bool has_primary_push_objective_{false};
   std::string drone_namespace_;
   std::string grid_name_;
   std::string occupancy_window_name_;
   std::string vector_window_name_;
+  std::string coverage_window_name_;
+  bool coverage_window_open_{false};
+  cv::Mat coverage_cells_;
+  std::size_t rendered_coverage_count_{0};
+  std::chrono::steady_clock::time_point last_coverage_display_{};
 
   std::mutex mutex_;
   geometry_msgs::msg::Pose::SharedPtr latest_drone_pose_;
@@ -1990,12 +2267,10 @@ private:
   std::vector<std::vector<CellState>> latest_cell_grid_;
   cv::Mat latest_is_fixed_grid_;
   cv::Mat latest_saddle_escape_grid_;
-  cv::Point2f last_nonzero_move_direction_{0.0f, 0.0f};
   bool received_drone_{false};
   bool received_cows_{false};
   bool has_vector_grid_{false};
-  bool has_last_nonzero_move_direction_{false};
-  bool all_cows_at_goal_{false};
+  bool has_no_objectives_{false};
 };
 
 int main(int argc, char ** argv)

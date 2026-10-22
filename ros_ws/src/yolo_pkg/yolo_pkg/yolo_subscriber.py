@@ -5,13 +5,14 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose, PoseArray, PolygonStamped, Point32
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
 from yolo_pkg.config import load_yolo_config
+from yolo_pkg.search_observation import ObservationSampler
 from yolo_pkg.tracker_factory import create_cow_tracker
 
 
@@ -276,6 +277,14 @@ class YoloCowSubscriber(Node):
         if not self.cow_positions_topic:
             raise ValueError('cow_positions_topic cannot be empty')
 
+        near = float(self.declare_parameter('search_near_m', 2.0).value)
+        far = float(self.declare_parameter('search_far_m', 10.0).value)
+        fov = float(self.declare_parameter('search_fov_rad', self.config.horizontal_fov_rad).value)
+        if far > self.config.max_detection_distance_m or fov > self.config.horizontal_fov_rad:
+            raise ValueError('Search footprint exceeds configured detector visibility')
+        observation_period = float(self.declare_parameter('search_observation_period_s', 1.0).value)
+        self.observation_sampler = ObservationSampler(near, far, fov, observation_period)
+        self.observation_publishers = {}
         self.drone_image_sub_list = {}
         self.drone_pos_sub_list = {}
         self.drone_pose_history = {}
@@ -295,6 +304,8 @@ class YoloCowSubscriber(Node):
 
         for i in range(number_of_drones):
             name = self.namespace + str(i)
+            self.observation_publishers[name] = self.create_publisher(
+                PolygonStamped, name + '/processed_view', 50)
             self.drone_index_by_name[name] = i
             self.expected_camera_names.add(name)
             self.drone_pose_history[name] = deque(maxlen=self.config.pose_history_length)
@@ -423,6 +434,16 @@ class YoloCowSubscriber(Node):
                     2,
                     cv2.LINE_AA,
                 )
+
+        footprint = self.observation_sampler.sample(
+            name, timestamp, drone_x, drone_y, drone_yaw)
+        if footprint is not None:
+            observation = PolygonStamped()
+            observation.header.stamp = msg.header.stamp
+            observation.header.frame_id = 'map'
+            observation.polygon.points = [Point32(x=float(x), y=float(y), z=0.0)
+                                          for x, y in footprint]
+            self.observation_publishers[name].publish(observation)
 
         if annotated_frame is not None:
             cv2.imshow(f'{name} - YOLO cow detection', annotated_frame)

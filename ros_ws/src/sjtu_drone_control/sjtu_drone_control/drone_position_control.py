@@ -7,6 +7,7 @@ from rclpy.node import Node
 from std_msgs.msg import Empty
 
 from sjtu_drone_control.config import load_drone_control_config
+from sjtu_drone_control.simulation_stop import SimulationStop
 
 
 class DronePositionControl(Node):
@@ -74,15 +75,34 @@ class DronePositionControl(Node):
             f'slowdown={self.linear_slowdown_distance:.2f} m'
         )
 
-        print(f'Takeoff in drone_position_controll -- {namespace}')
-        self.wait_for_subscribers(
-            self.takeoff_publisher, namespace + '/takeoff')
-        time.sleep(self.config.takeoff_delay_seconds)
-        self.takeoff_publisher.publish(Empty())
+        self.stop_latch = SimulationStop(self, self.stop_motion)
+        self.takeoff_ready_at = None
+        self.takeoff_sent = False
+        self.startup_timer = self.create_timer(0.1, self.startup)
 
         self.last_control_time = time.monotonic()
         self.control_timer = self.create_timer(
             self.config.control_period_seconds, self.move_to_position)
+
+    def stop_motion(self):
+        self.final_position_x = self.final_position_y = None
+        self.command_world_velocity_x = self.command_world_velocity_y = 0.0
+        self.command_angular_velocity = 0.0
+        self.cmd_vel_publisher.publish(Twist())
+
+    def startup(self):
+        if self.stop_latch.stopped:
+            self.startup_timer.cancel()
+            return
+        if not self.takeoff_publisher.get_subscription_count():
+            return
+        now = time.monotonic()
+        if self.takeoff_ready_at is None:
+            self.takeoff_ready_at = now + self.config.takeoff_delay_seconds
+        if now >= self.takeoff_ready_at:
+            self.takeoff_publisher.publish(Empty())
+            self.takeoff_sent = True
+            self.startup_timer.cancel()
 
     def _validate_parameters(self):
         positive_parameters = {
@@ -104,20 +124,6 @@ class DronePositionControl(Node):
                 'drone_position_tolerance must be finite and nonnegative'
             )
 
-    def wait_for_subscribers(self, publisher, topic_name):
-        start_time = time.time()
-        while publisher.get_subscription_count() == 0:
-            self.get_logger().info(
-                f'Waiting for subscribers on {topic_name}...')
-            time.sleep(self.config.subscriber_poll_period_seconds)
-            if (
-                time.time() - start_time
-                > self.config.subscriber_wait_timeout_seconds
-            ):
-                self.get_logger().warn(
-                    f'Timeout waiting for subscribers on {topic_name}')
-                break
-
     @staticmethod
     def quaternion_to_yaw(orientation):
         sin_yaw = 2.0 * (
@@ -136,10 +142,14 @@ class DronePositionControl(Node):
         self.drone_angle = self.quaternion_to_yaw(msg.orientation)
 
     def goto_callback(self, msg):
+        if self.stop_latch.stopped:
+            return
         self.final_position_x = float(msg.position.x)
         self.final_position_y = float(msg.position.y)
 
     def focusin_callback(self, msg):
+        if self.stop_latch.stopped:
+            return
         self.camera_focus_position_x = float(msg.position.x)
         self.camera_focus_position_y = float(msg.position.y)
 
@@ -215,6 +225,11 @@ class DronePositionControl(Node):
         return self.max_angular_velocity * angle_error / math.pi
 
     def move_to_position(self):
+        if self.stop_latch.stopped:
+            self.stop_motion()
+            return
+        if not self.takeoff_sent:
+            return
         if (
             self.drone_x is None
             or self.drone_y is None
@@ -264,6 +279,9 @@ class DronePositionControl(Node):
         self.publish_cmd_vel(linear_vector, angular_vector)
 
     def publish_cmd_vel(self, linear_vector=None, angular_vector=None):
+        if self.stop_latch.stopped:
+            self.cmd_vel_publisher.publish(Twist())
+            return
         if linear_vector is None:
             linear_vector = Vector3()
         if angular_vector is None:

@@ -20,6 +20,8 @@ from std_msgs.msg import Empty
 import sys
 import termios
 import tty
+import select
+from sjtu_drone_control.simulation_stop import SimulationStop
 
 
 MSG = """
@@ -59,6 +61,9 @@ class TeleopNode(Node):
         self.max_linear_velocity = 1.0
         self.max_angular_velocity = 1.0
 
+        self.stop_latch = SimulationStop(self, self.stop_motion)
+        self.stop_timer = self.create_timer(0.1, self.stopped_tick)
+        print(MSG)
         # Start a timer to listen to keyboard inputs
         self.create_timer((1/30), self.read_keyboard_input)
 
@@ -70,83 +75,94 @@ class TeleopNode(Node):
         """
         Read keyboard inputs and publish corresponding commands
         """
-        while rclpy.ok():
-            # Print the instructions
-            print(MSG+self.get_velocity_msg())
-            # Implement a non-blocking keyboard read
-            key = self.get_key()
-            # Handle velocity changes
-            if key.lower() == 'q':
-                self.linear_velocity = min(self.linear_velocity + self.linear_increment,
-                                           self.max_linear_velocity)
-                self.angular_velocity = min(self.angular_velocity + self.angular_increment,
-                                            self.max_angular_velocity)
-            elif key.lower() == 'e':
-                self.linear_velocity = max(self.linear_velocity - self.linear_increment,
-                                           -self.max_linear_velocity)
-                self.angular_velocity = max(self.angular_velocity - self.angular_increment,
-                                            -self.max_angular_velocity)
-            elif key.lower() == 'w':
-                # Move forward
-                linear_vec = Vector3()
-                linear_vec.x = self.linear_velocity
-                self.publish_cmd_vel(linear_vec)
-            elif key.lower() == 's':
-                # Hover
-                self.publish_cmd_vel()
-            elif key.lower() == 'x':
-                # Move backward
-                linear_vec = Vector3()
-                linear_vec.x = -self.linear_velocity
-                self.publish_cmd_vel(linear_vec)
-            elif key == 'a':
-                # Move Left
-                linear_vec = Vector3()
-                linear_vec.y = self.linear_velocity
-                self.publish_cmd_vel(linear_vec)
-            elif key == 'd':
-                # Move right
-                linear_vec = Vector3()
-                linear_vec.y = -self.linear_velocity
-                self.publish_cmd_vel(linear_vec)
-            elif key == 'A':
-                # Move Left
-                angular_vec = Vector3()
-                angular_vec.z = self.angular_velocity
-                self.publish_cmd_vel(angular_vec=angular_vec)
-            elif key == 'D':
-                # Move right
-                angular_vec = Vector3()
-                angular_vec.z = -self.angular_velocity
-                self.publish_cmd_vel(angular_vec=angular_vec)
-            elif key.lower() == 'r':
-                # Rise
-                linear_vec = Vector3()
-                linear_vec.z = self.linear_velocity
-                self.publish_cmd_vel(linear_vec)
-            elif key.lower() == 'f':
-                # Fall
-                linear_vec = Vector3()
-                linear_vec.z = -self.angular_velocity
-                self.publish_cmd_vel(linear_vec)
-            # Handle other keys for different movements
-            elif key.lower() == 't':
-                # Takeoff
-                self.takeoff_publisher.publish(Empty())
-            elif key.lower() == 'l':
-                # Land
-                self.publish_cmd_vel()
-                self.land_publisher.publish(Empty())
+        if self.stop_latch.stopped:
+            return
+        # Implement a non-blocking keyboard read
+        key = self.get_key()
+        if not key:
+            return
+        # Handle velocity changes
+        if key.lower() == 'q':
+            self.linear_velocity = min(self.linear_velocity + self.linear_increment,
+                                       self.max_linear_velocity)
+            self.angular_velocity = min(self.angular_velocity + self.angular_increment,
+                                        self.max_angular_velocity)
+        elif key.lower() == 'e':
+            self.linear_velocity = max(self.linear_velocity - self.linear_increment,
+                                       -self.max_linear_velocity)
+            self.angular_velocity = max(self.angular_velocity - self.angular_increment,
+                                        -self.max_angular_velocity)
+        elif key.lower() == 'w':
+            # Move forward
+            linear_vec = Vector3()
+            linear_vec.x = self.linear_velocity
+            self.publish_cmd_vel(linear_vec)
+        elif key.lower() == 's':
+            # Hover
+            self.publish_cmd_vel()
+        elif key.lower() == 'x':
+            # Move backward
+            linear_vec = Vector3()
+            linear_vec.x = -self.linear_velocity
+            self.publish_cmd_vel(linear_vec)
+        elif key == 'a':
+            # Move Left
+            linear_vec = Vector3()
+            linear_vec.y = self.linear_velocity
+            self.publish_cmd_vel(linear_vec)
+        elif key == 'd':
+            # Move right
+            linear_vec = Vector3()
+            linear_vec.y = -self.linear_velocity
+            self.publish_cmd_vel(linear_vec)
+        elif key == 'A':
+            # Move Left
+            angular_vec = Vector3()
+            angular_vec.z = self.angular_velocity
+            self.publish_cmd_vel(angular_vec=angular_vec)
+        elif key == 'D':
+            # Move right
+            angular_vec = Vector3()
+            angular_vec.z = -self.angular_velocity
+            self.publish_cmd_vel(angular_vec=angular_vec)
+        elif key.lower() == 'r':
+            # Rise
+            linear_vec = Vector3()
+            linear_vec.z = self.linear_velocity
+            self.publish_cmd_vel(linear_vec)
+        elif key.lower() == 'f':
+            # Fall
+            linear_vec = Vector3()
+            linear_vec.z = -self.angular_velocity
+            self.publish_cmd_vel(linear_vec)
+        # Handle other keys for different movements
+        elif key.lower() == 't':
+            # Takeoff
+            self.takeoff_publisher.publish(Empty())
+        elif key.lower() == 'l':
+            # Land
+            self.publish_cmd_vel()
+            self.land_publisher.publish(Empty())
+
+    def stop_motion(self):
+        self.linear_velocity = self.angular_velocity = 0.0
+        self.cmd_vel_publisher.publish(Twist())
+
+    def stopped_tick(self):
+        if self.stop_latch.stopped:
+            self.stop_motion()
 
     def get_key(self) -> str:
         """
         Function to capture keyboard input
         """
+        if not sys.stdin.isatty():
+            return ""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setraw(sys.stdin.fileno())
-            ch = sys.stdin.read(1)
+            ch = sys.stdin.read(1) if select.select([sys.stdin], [], [], 0)[0] else ''
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         return ch
@@ -156,7 +172,7 @@ class TeleopNode(Node):
         """
         Publish a Twist message to cmd_vel topic
         """
-        twist = Twist(linear=linear_vec, angular=angular_vec)
+        twist = Twist() if self.stop_latch.stopped else Twist(linear=linear_vec, angular=angular_vec)
         self.cmd_vel_publisher.publish(twist)
 
 

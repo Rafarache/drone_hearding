@@ -16,6 +16,7 @@ from rclpy.node import Node
 from std_msgs.msg import Empty, Bool, Int8, String
 from geometry_msgs.msg import Twist, Pose, Vector3
 from sensor_msgs.msg import Range, Image, Imu
+from sjtu_drone_control.simulation_stop import SimulationStop
 
 STATES = {
     0: "Landed",
@@ -64,8 +65,17 @@ class DroneObject(Node):
         self._bottom_img = Image()
         self._gt_pose = Pose()
 
-        while self.pubTakeOff.get_subscription_count() == 0:
-            self.logger.info("Waiting for drone to spawn", throttle_duration_sec=1)
+        self.stop_latch = SimulationStop(self, self.stop_motion)
+        self.stop_timer = self.create_timer(0.1, self.stopped_tick)
+
+    def stop_motion(self):
+        self.pubCmd.publish(Twist())
+        if hasattr(self, 'timer'):
+            self.timer.cancel()
+
+    def stopped_tick(self):
+        if self.stop_latch.stopped:
+            self.stop_motion()
 
     @property
     def state(self):
@@ -136,7 +146,7 @@ class DroneObject(Node):
         Take off the drone
         :return: True if the command was sent successfully, False if drone is already flying
         """
-        if self.isFlying:
+        if self.stop_latch.stopped or self.isFlying or not self.pubTakeOff.get_subscription_count():
             return False
         self.logger.info("Taking off")
         self.pubTakeOff.publish(Empty())
@@ -148,7 +158,7 @@ class DroneObject(Node):
         Land the drone
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         self.logger.info("Landing")
         self.pubLand.publish(Empty())
@@ -160,7 +170,7 @@ class DroneObject(Node):
         Hover the drone
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         twist_msg = Twist()
         twist_msg.linear.x = 0.0
@@ -177,6 +187,8 @@ class DroneObject(Node):
         Turn on/off position control
         :param on: True to turn on position control, False to turn off
         """
+        if self.stop_latch.stopped:
+            return False
         self.isPosctrl = on
         bool_msg = Bool()
         bool_msg.data = on
@@ -189,7 +201,7 @@ class DroneObject(Node):
         :param on: True to turn on velocity control mode, False to turn off
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         self.isVelMode = on
         bool_msg = Bool()
@@ -206,7 +218,7 @@ class DroneObject(Node):
         :param v_angular: Angular velocity in rad/s
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         twist_msg = Twist(linear=v_linear, angular=v_angular)
         self.pubCmd.publish(twist_msg)
@@ -220,7 +232,7 @@ class DroneObject(Node):
         :param z: Z position in m
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         twist_msg = Twist()
         twist_msg.linear.x = x
@@ -238,7 +250,7 @@ class DroneObject(Node):
         :param speed: Pitch speed in rad/s
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         twist_msg = Twist()
         twist_msg.linear.x = 1.0
@@ -256,7 +268,7 @@ class DroneObject(Node):
         :param speed: Roll speed in rad/s
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         twist_msg = Twist()
         twist_msg.linear.x = 1.0
@@ -274,7 +286,7 @@ class DroneObject(Node):
         :param speed: Rise speed in m/s
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         twist_msg = Twist()
         twist_msg.linear.x = 0.0
@@ -292,7 +304,7 @@ class DroneObject(Node):
         :param speed: Rotation speed in rad/s
         :return: True if the command was sent successfully, False if drone is not flying
         """
-        if not self.isFlying:
+        if self.stop_latch.stopped or not self.isFlying:
             return False
         twist_msg = Twist()
         twist_msg.linear.x = 0.0
@@ -339,4 +351,6 @@ class DroneObject(Node):
             self.logger.error("Invalid command mode: {}".format(msg.data))
 
     def reset(self):
+        if self.stop_latch.stopped:
+            return
         self.pubReset.publish(Empty())

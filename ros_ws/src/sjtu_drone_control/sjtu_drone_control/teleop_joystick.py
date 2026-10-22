@@ -18,6 +18,7 @@ from geometry_msgs.msg import Twist, Vector3
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Empty
+from sjtu_drone_control.simulation_stop import SimulationStop
 
 
 class TeleopNode(Node):
@@ -25,14 +26,23 @@ class TeleopNode(Node):
         super().__init__('teleop_node')
 
         # Subscribers
-        self.create_subscription(Joy, 'joy', self.joy_callback, 0)
+        self.create_subscription(Joy, 'joy', self.joy_callback, 10)
 
         # Publishers
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
         self.takeoff_publisher = self.create_publisher(Empty, 'takeoff', 10)
         self.land_publisher = self.create_publisher(Empty, 'land', 10)
 
+        self.stop_latch = SimulationStop(self, lambda: self.cmd_vel_publisher.publish(Twist()))
+        self.stop_timer = self.create_timer(0.1, self.stopped_tick)
+
+    def stopped_tick(self):
+        if self.stop_latch.stopped:
+            self.cmd_vel_publisher.publish(Twist())
+
     def joy_callback(self, msg: Joy) -> None:
+        if self.stop_latch.stopped:
+            return
         """
         Callback for joystick input
 

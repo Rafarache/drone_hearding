@@ -13,7 +13,7 @@ from launch.actions import (
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetParameter
 
 
 def _required_element(root, name, source_path):
@@ -90,6 +90,7 @@ def _load_simulation_config(source_path):
     map_element = _required_element(root, 'map', source_path)
     interfaces = _required_element(root, 'interfaces', source_path)
     herding = _required_element(root, 'herding', source_path)
+    search = _required_element(root, 'search', source_path)
     drones_element = _required_element(root, 'drones', source_path)
     cows_element = _required_element(root, 'cows', source_path)
 
@@ -129,6 +130,13 @@ def _load_simulation_config(source_path):
         'push_point_margin': _required_float(
             herding, 'push_point_margin_m', source_path
         ),
+        'goal_x': _required_float(herding, 'goal_x', source_path),
+        'goal_y': _required_float(herding, 'goal_y', source_path),
+        'final_goal_reached_radius': _required_float(herding, 'final_goal_reached_radius_m', source_path),
+        'search_near_m': _required_float(search, 'near_m', source_path),
+        'search_far_m': _required_float(search, 'far_m', source_path),
+        'search_fov_rad': _required_float(search, 'horizontal_fov_rad', source_path),
+        'search_observation_period_s': float(search.get('observation_period_s', '1.0')),
         'drones': _parse_positions(
             drones_element, 'drone', source_path, include_z=False
         ),
@@ -137,6 +145,12 @@ def _load_simulation_config(source_path):
         ),
     }
 
+    if not (math.isfinite(config['search_observation_period_s']) and
+            config['search_observation_period_s'] > 0 and
+            config['final_goal_reached_radius'] > 0 and
+            0 <= config['search_near_m'] < 5 < config['search_far_m'] and
+            0 < config['search_fov_rad'] <= 2 * math.pi):
+        raise ValueError(f'Invalid goal radius or search footprint in {source_path}')
     if config['controller'] not in {'keyboard', 'joystick'}:
         raise ValueError(
             f"controller must be keyboard or joystick in {source_path}"
@@ -165,6 +179,8 @@ def _load_simulation_config(source_path):
     max_x = config['map_center_x'] + config['map_width_m'] / 2.0
     min_y = config['map_center_y'] - config['map_height_m'] / 2.0
     max_y = config['map_center_y'] + config['map_height_m'] / 2.0
+    if not (min_x <= config['goal_x'] <= max_x and min_y <= config['goal_y'] <= max_y):
+        raise ValueError(f'Goal is outside the map in {source_path}')
     for entity_type in ('drones', 'cows'):
         for index, position in enumerate(config[entity_type]):
             if not (
@@ -221,6 +237,7 @@ def _launch_setup(context):
     )
 
     actions = [
+        SetParameter(name="use_sim_time", value=True),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(gazebo_share, 'launch', 'gzserver.launch.py')
@@ -333,11 +350,19 @@ def _launch_setup(context):
                     'drone_namespace_prefix': namespace_prefix,
                     'number_of_drones': number_of_drones,
                     'cow_positions_topic': config['cow_positions_topic'],
+                    **{key: config[key] for key in ('search_near_m', 'search_far_m', 'search_fov_rad',
+                                                   'search_observation_period_s')},
                 }
             ],
             output='screen',
         )
     )
+
+    actions.append(Node(
+        package="cow_pkg", executable="simulation_completion_monitor",
+        parameters=[{key: config[key] for key in ("goal_x", "goal_y", "final_goal_reached_radius")} |
+                    {"cow_name_prefix": cow_name_prefix, "number_of_cows": number_of_cows}],
+        output="screen"))
 
     drone_launch = os.path.join(
         bringup_share,
@@ -371,6 +396,8 @@ def _launch_setup(context):
                     name=f'grid{index}',
                     parameters=[
                         {
+                            **{key: config[key] for key in ('goal_x', 'goal_y', 'final_goal_reached_radius',
+                                                           'search_near_m', 'search_far_m', 'search_fov_rad')},
                             'drone_index': index,
                             'total_drones': number_of_drones,
                             'global_map_center_x': config['map_center_x'],

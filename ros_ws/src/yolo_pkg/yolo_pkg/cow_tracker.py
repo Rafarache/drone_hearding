@@ -181,12 +181,13 @@ class CowTrackerManager:
                 visible_misses += 1
 
         tracks_before_removal = len(self.tracks)
-        # Expire only on counted visible misses. Updates outside the camera
-        # view leave the miss counter and remembered position unchanged.
+        # Confirmed cows are mission memory, not temporary camera tracks.
+        # Keep their last global position until a detection updates it. Only
+        # unconfirmed candidates can expire after counted visible misses.
         self.tracks = [
             track
             for track in self.tracks
-            if track.lost_frames < self.max_lost_frames
+            if track.confirmed or track.lost_frames < self.max_lost_frames
         ]
         removed_tracks = tracks_before_removal - len(self.tracks)
 

@@ -8,6 +8,15 @@
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
+  <exec_depend>cow_pkg</exec_depend>
+  <exec_depend>yolo_pkg</exec_depend>
+  <exec_depend>grid_visualizer_pkg</exec_depend>
+  <exec_depend>sjtu_drone_control</exec_depend>
+  <exec_depend>sjtu_drone_description</exec_depend>
+  <test_depend>gazebo_msgs</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>std_msgs</test_depend>
   <depend>xacro</depend>
   <depend>rviz2</depend>
   <depend>xterm</depend>

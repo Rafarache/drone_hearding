@@ -87,9 +87,7 @@ class DroneController(DroneObject):
         self.start_time = None
 
         self.logger.info("Drone controller initialized. Taking off")
-        self.takeOff()
-        self.change_state(TaskState.TAKEOFF)
-        time.sleep(1)
+        # Takeoff is retried by the timer once the plugin is ready.
 
     # Task logging method
     def task_logging(self):
@@ -108,12 +106,14 @@ class DroneController(DroneObject):
     # ------- #
     #  Tasks  #
     def task_execution(self):
+        if self.stop_latch.stopped:
+            return
         current_time = self.clock.now().nanoseconds
 
         # Common actions for all tasks
         if self.task_state == TaskState.INIT:
-            self.takeOff()
-            self.change_state(TaskState.TAKEOFF)
+            if self.takeOff():
+                self.change_state(TaskState.TAKEOFF)
 
         elif self.task_state == TaskState.TAKEOFF:
             if self.isFlying:

@@ -14,17 +14,18 @@
   <enable_saddle_neighbor_descent>0</enable_saddle_neighbor_descent>
   <enable_geodesic_field_fallback>1</enable_geodesic_field_fallback>
   <control_recovery_search_radius_cells>8</control_recovery_search_radius_cells>
+  <!-- Search the outermost reachable unvisited band before moving inward. -->
+  <search_border_first>1</search_border_first>
 
   <show_occupancy_grid>0</show_occupancy_grid>
   <show_vector_grid>1</show_vector_grid>
+  <!-- Whole-field visited areas: 1 enables, 0 disables. -->
+  <show_coverage_map>1</show_coverage_map>
   <visualization_period_ms>200</visualization_period_ms>
   <control_period_ms>500</control_period_ms>
 
-  <goal_x>-10.0</goal_x>
-  <goal_y>-10.0</goal_y>
-  <final_goal_reached_radius_m>2.0</final_goal_reached_radius_m>
-  <goal_quiet_radius_m>4.0</goal_quiet_radius_m>
-  <goal_quiet_duration_seconds>5.0</goal_quiet_duration_seconds>
+  <goal_quiet_radius_m>8.0</goal_quiet_radius_m>
+  <goal_quiet_duration_seconds>20.0</goal_quiet_duration_seconds>
   <max_goto_movement_m>0.5</max_goto_movement_m>
 
   <max_near_goal_objective_potential>0.9</max_near_goal_objective_potential>

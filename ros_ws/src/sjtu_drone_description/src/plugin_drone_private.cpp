@@ -35,6 +35,8 @@ DroneSimpleControllerPrivate::~DroneSimpleControllerPrivate() {}
 
 void DroneSimpleControllerPrivate::Reset()
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {return;}
   // Reset the values of the controllers
   controllers_.roll.reset();
   controllers_.pitch.reset();
@@ -65,6 +67,9 @@ void DroneSimpleControllerPrivate::InitSubscribers(
   std::string reset_topic_,
   std::string switch_mode_topic_)
 {
+  stop_subscriber_ = ros_node_->create_subscription<std_msgs::msg::Empty>(
+    "/simulation/stop", rclcpp::QoS(1).reliable().transient_local(),
+    [this](std_msgs::msg::Empty::SharedPtr) {simulation_stopped_.store(true);});
   auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
 
   if (!cmd_normal_topic_.empty()) {
@@ -226,6 +231,8 @@ void DroneSimpleControllerPrivate::LoadControllerSettings(
 */
 void DroneSimpleControllerPrivate::CmdCallback(const geometry_msgs::msg::Twist::SharedPtr cmd)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {return;}
   cmd_vel = *cmd;
 
   static gazebo::common::Time last_sim_time = world->SimTime();
@@ -261,6 +268,8 @@ void DroneSimpleControllerPrivate::CmdCallback(const geometry_msgs::msg::Twist::
 */
 void DroneSimpleControllerPrivate::PosCtrlCallback(const std_msgs::msg::Bool::SharedPtr cmd)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {return;}
   m_posCtrl = cmd->data;
 }
 
@@ -271,6 +280,7 @@ void DroneSimpleControllerPrivate::PosCtrlCallback(const std_msgs::msg::Bool::Sh
 */
 void DroneSimpleControllerPrivate::ImuCallback(const sensor_msgs::msg::Imu::SharedPtr imu)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
   //directly read the quternion from the IMU data
   pose.Rot().Set(imu->orientation.w, imu->orientation.x, imu->orientation.y, imu->orientation.z);
   euler = pose.Rot().Euler();
@@ -287,6 +297,8 @@ void DroneSimpleControllerPrivate::ImuCallback(const sensor_msgs::msg::Imu::Shar
 */
 void DroneSimpleControllerPrivate::TakeoffCallback(const std_msgs::msg::Empty::SharedPtr msg)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {return;}
   if (navi_state == LANDED_MODEL) {
     navi_state = TAKINGOFF_MODEL;
     m_timeAfterCmd = 0;
@@ -300,6 +312,8 @@ void DroneSimpleControllerPrivate::TakeoffCallback(const std_msgs::msg::Empty::S
 */
 void DroneSimpleControllerPrivate::LandCallback(const std_msgs::msg::Empty::SharedPtr msg)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {return;}
   if (navi_state == FLYING_MODEL || navi_state == TAKINGOFF_MODEL) {
     navi_state = LANDING_MODEL;
     m_timeAfterCmd = 0;
@@ -314,6 +328,8 @@ void DroneSimpleControllerPrivate::LandCallback(const std_msgs::msg::Empty::Shar
 */
 void DroneSimpleControllerPrivate::ResetCallback(const std_msgs::msg::Empty::SharedPtr msg)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {return;}
   RCLCPP_INFO(ros_node_->get_logger(), "Reset quadrotor!!");
   Reset();
 }
@@ -327,6 +343,8 @@ void DroneSimpleControllerPrivate::ResetCallback(const std_msgs::msg::Empty::Sha
 */
 void DroneSimpleControllerPrivate::SwitchModeCallback(const std_msgs::msg::Bool::SharedPtr msg)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {return;}
   m_velMode = msg->data;
 
   std_msgs::msg::String mode;
@@ -394,6 +412,14 @@ void DroneSimpleControllerPrivate::PublishOdom(
 */
 void DroneSimpleControllerPrivate::UpdateState(double dt)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {
+    cmd_vel = geometry_msgs::msg::Twist();
+    m_timeAfterCmd = 0;
+    m_posCtrl = false;
+    m_velMode = true;
+    if (navi_state != LANDED_MODEL) {navi_state = FLYING_MODEL;}
+  }
   if (navi_state == TAKINGOFF_MODEL) {
     m_timeAfterCmd += dt;
     if (m_timeAfterCmd > 0.5) {
@@ -428,6 +454,13 @@ void DroneSimpleControllerPrivate::UpdateState(double dt)
 */
 void DroneSimpleControllerPrivate::UpdateDynamics(double dt)
 {
+  std::lock_guard<std::recursive_mutex> lock(command_mutex_);
+  if (simulation_stopped_) {
+    cmd_vel = geometry_msgs::msg::Twist();
+    m_posCtrl = false;
+    m_velMode = true;
+    if (navi_state != LANDED_MODEL) {navi_state = FLYING_MODEL;}
+  }
   ignition::math::v6::Vector3<double> force, torque;
 
   // Get Pose/Orientation from Gazebo

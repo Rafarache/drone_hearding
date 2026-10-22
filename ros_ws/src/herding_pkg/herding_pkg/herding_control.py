@@ -2,6 +2,8 @@ from time import sleep
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose, PoseArray
+from std_msgs.msg import Empty
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 import numpy as np
 import cv2
 import sys
@@ -15,6 +17,11 @@ class HerdingControl(Node):
             self.get_logger().error("Uso: ros2 run <pacote> <script> <namespace> <num_drones>")
             sys.exit(1)
 
+        self.stopped = False
+        self.stop_subscription = self.create_subscription(
+            Empty, '/simulation/stop', self.stop,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.namespace = sys.argv[1]
         number_of_drones = int(sys.argv[2])
 
@@ -69,7 +76,12 @@ class HerdingControl(Node):
         return cows_pos
 
 
+    def stop(self, _msg):
+        self.stopped = True
+
     def move_drones(self):
+        if self.stopped:
+            return
         cows_pos = self.get_cows_pos()
         #print(cows_pos)
 

@@ -30,6 +30,7 @@ class RepellerForceTests(unittest.TestCase):
         publisher = Mock()
         state = SimpleNamespace(
             config=config,
+            stopped=False,
             cows_dict={'cow0': pose(0, 0), **cows},
             last_cows_dict=None,
             publishers_dict={'cow0': publisher},

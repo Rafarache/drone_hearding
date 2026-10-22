@@ -10,10 +10,13 @@ The simulation selects its cow tracker through `config/yolo_config.xml`:
 - `true`: `cow_tracker_with_kalman_filter.py` retains the Kalman filter and
   prediction used to associate and smooth observed cow positions.
 
-Both versions confirm new cows using `min_confirmation_hits`, preserve the
-last mapped position when no detection matches, and remove tracks after
-`max_lost_frames` visible misses (15 by default). Out-of-view updates do not
-advance that counter. Camera synchronization and merging of overlapping
+Both versions confirm new cows using `min_confirmation_hits` and then retain
+them for the entire running mission. Missing detections, looking away, and
+leaving a drone's local map do not delete a confirmed cow or move its last
+mapped global position. Reacquisition updates that same entry when association
+succeeds. `max_lost_frames` (15 by default) expires only **unconfirmed candidates**
+after visible misses; out-of-view updates do not advance that counter.
+Camera synchronization and merging of overlapping
 camera detections remain common to both versions; unfiltered positions are
 the measurements produced by that existing detection pipeline.
 

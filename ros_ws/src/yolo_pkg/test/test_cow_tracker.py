@@ -106,7 +106,7 @@ class CowTrackerMemoryTests:
         self.assertEqual(remembered['x'], -9.2)
         self.assertFalse(remembered['coasting'])
 
-    def test_visible_misses_freeze_position_then_retire_after_15_updates(self):
+    def test_confirmed_cow_survives_visible_misses_past_expiry_limit(self):
         tracker = self.make_tracker(max_lost_frames=15)
         tracker.update([(2.0, 0.0)], timestamp=0.0, camera_views=[camera()])
         tracks = tracker.update(
@@ -115,7 +115,7 @@ class CowTrackerMemoryTests:
         cow_id = tracks[0]['id']
         remembered_x = tracks[0]['x']
 
-        for missed_frame in range(1, 15):
+        for missed_frame in range(1, 151):
             tracks = tracker.update(
                 [], timestamp=0.1 + missed_frame * 0.1,
                 camera_views=[camera()],
@@ -126,9 +126,32 @@ class CowTrackerMemoryTests:
             self.assertEqual(tracks[0]['lost_frames'], missed_frame)
             self.assertEqual(tracker.last_diagnostics['removed_tracks'], 0)
 
-        tracks = tracker.update([], timestamp=1.6, camera_views=[camera()])
-        self.assertEqual(tracks, [])
-        self.assertEqual(tracker.last_diagnostics['removed_tracks'], 1)
+        # Returning to the cow updates the same global map entry, not a new ID.
+        tracks = tracker.update([(2.8, 0.0)], timestamp=15.2, camera_views=[camera()])
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]['id'], cow_id)
+        self.assertFalse(tracks[0]['coasting'])
+        self.assertEqual(tracks[0]['lost_frames'], 0)
+
+    def test_cow_outside_local_window_keeps_real_global_position(self):
+        tracker = self.make_tracker(max_lost_frames=3, min_hits=3)
+        for step in range(3):
+            tracks = tracker.update([(15.0, 2.0)], timestamp=step * 0.1,
+                                    camera_views=[camera()])
+        cow_id = tracks[0]['id']
+        # The 20 m local window extends only +/-10 m, while the detector can
+        # see 20 m. Misses here used to delete a known off-local-map cow.
+        for step in range(3, 33):
+            tracks = tracker.update([], timestamp=step * 0.1, camera_views=[camera()])
+            self.assertEqual(len(tracks), 1)
+            self.assertEqual((tracks[0]['id'], tracks[0]['x'], tracks[0]['y']),
+                             (cow_id, 15.0, 2.0))
+        # Searching elsewhere must neither shift the cow nor age it out.
+        distant_camera = dict(camera(), x=-30.0, y=25.0)
+        for step in range(33, 133):
+            tracks = tracker.update([], timestamp=step * 0.1, camera_views=[distant_camera])
+            self.assertEqual((tracks[0]['id'], tracks[0]['x'], tracks[0]['y']),
+                             (cow_id, 15.0, 2.0))
 
     def test_redetection_resets_visible_misses(self):
         tracker = self.make_tracker(max_lost_frames=15)

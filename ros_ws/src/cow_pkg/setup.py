@@ -39,6 +39,7 @@ setup(
     entry_points={
         'console_scripts': [
             'repeller = cow_pkg.repeller_node:main',
+            'simulation_completion_monitor = cow_pkg.simulation_completion_monitor:main',
         ],
     },
 )

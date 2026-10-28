@@ -188,51 +188,6 @@ class HerdingControlMy(Node):
         if len(self.drone_pos_dir) < self.number_of_drones:
             return
 
-        if not hasattr(self, '_scan_finished'):
-            self._scan_finished = False
-
-        if not self._scan_finished:
-            if not hasattr(self, '_scan_initialized'):
-                self._scan_initialized = True
-                self._scan_progress = {}
-                for name, pose in self.drone_pos_dir.items():
-                    yaw = math.radians(self.get_yaw_degrees(pose.orientation))
-                    self._scan_progress[name] = {
-                        'start_yaw': yaw,
-                        'current_yaw': yaw,
-                        'initial_pos': np.array([pose.position.x, pose.position.y])
-                    }
-                self.get_logger().info("Starting initial 360-degree scan...")
-
-            all_done = True
-            for name, progress in self._scan_progress.items():
-                pose = self.drone_pos_dir[name]
-                rel_angle = progress['current_yaw'] - progress['start_yaw']
-                if rel_angle < 2 * math.pi:
-                    progress['current_yaw'] += 0.2
-                    all_done = False
-                
-                # Keep drone in place by command to initial_pos
-                target_pose = Pose()
-                target_pose.position.x = float(progress['initial_pos'][0])
-                target_pose.position.y = float(progress['initial_pos'][1])
-                target_pose.position.z = pose.position.z
-                self.drone_goto_pub_list[name].publish(target_pose)
-
-                # Focus point rotates around initial_pos to complete 360 degrees
-                focus_x = progress['initial_pos'][0] + 2.0 * math.cos(progress['current_yaw'])
-                focus_y = progress['initial_pos'][1] + 2.0 * math.sin(progress['current_yaw'])
-                focus_pose = Pose()
-                focus_pose.position.x = float(focus_x)
-                focus_pose.position.y = float(focus_y)
-                focus_pose.position.z = pose.position.z
-                self.drone_focusin_pub_list[name].publish(focus_pose)
-
-            if all_done:
-                self._scan_finished = True
-                self.get_logger().info("360-degree scan complete. Starting herding algorithm.")
-            return
-
         cows_pos = self.get_cows_pos()
         targets = self.compute_drone_targets(cows_pos)
 

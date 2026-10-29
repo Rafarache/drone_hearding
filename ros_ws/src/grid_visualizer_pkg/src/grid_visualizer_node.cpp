@@ -56,8 +56,8 @@ struct GridConfig
   int control_period_ms{0};
   double free_cell_potential{0.0};
   double boundary_potential{0.0};
-  int peer_drone_obstacle_radius_cells{2};
-  double peer_drone_repulsion_potential{2.0};
+  int peer_drone_obstacle_radius_cells{1};
+  double peer_drone_repulsion_potential{1.0};
   cv::Point2f goal_position{0.0f, 0.0f};
   double final_goal_reached_radius{0.0};
   double goal_quiet_radius{0.0};
@@ -218,10 +218,12 @@ GridConfig load_grid_config(const std::string& source_path = "")
   if (config.peer_drone_obstacle_radius_cells < 1 ||
     config.peer_drone_obstacle_radius_cells >= config.grid_size / 2 ||
     !std::isfinite(config.peer_drone_repulsion_potential) ||
-    config.peer_drone_repulsion_potential <= config.boundary_potential)
+    config.peer_drone_repulsion_potential < 0.0 ||
+    config.peer_drone_repulsion_potential > 1.0 ||
+    config.peer_drone_repulsion_potential != config.boundary_potential)
   {
     throw std::invalid_argument(
-      "Peer drone radius must fit the local grid and repulsion must exceed boundary_potential");
+      "Peer radius must fit the grid; peer potential must equal boundary_potential in [0,1]");
   }
 
   config.map_half_width = local_grid_extent / 2.0;
@@ -252,6 +254,8 @@ GridConfig load_grid_config(const std::string& source_path = "")
     config.control_period_ms <= 0 ||
     !std::isfinite(config.free_cell_potential) ||
     !std::isfinite(config.boundary_potential) ||
+    config.free_cell_potential < 0.0 ||
+    config.boundary_potential > 1.0 ||
     config.boundary_potential <= config.free_cell_potential)
   {
     throw std::invalid_argument(
@@ -1109,7 +1113,7 @@ private:
 
     // Reproject a circular exclusion around each peer on every local update.
     // Rasterize by global cell centers so peers just outside the moving window
-    // still block overlapping cells. The higher potential strengthens avoidance.
+    // still block overlapping cells. All obstacle classes share the same potential.
     const double peer_radius =
       config_.peer_drone_obstacle_radius_cells * config_.cell_size;
     for (int peer_index = 0;
@@ -1448,8 +1452,8 @@ private:
               potential_grid.at<double>(r, c + 1) +
               potential_grid.at<double>(r - 1, c) +
               potential_grid.at<double>(r + 1, c), absorption.at<double>(r,c));
-            const double new_value = old_value +
-              config_.sor_relaxation_factor * (neighbor_average - old_value);
+            const double new_value = grid_visualizer_pkg::relaxed_absorbing_value(
+              old_value, neighbor_average, config_.sor_relaxation_factor);
 
             potential_grid.at<double>(r, c) = new_value;
             max_change = std::max(max_change, std::abs(new_value - old_value));

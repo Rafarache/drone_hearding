@@ -206,7 +206,11 @@ Settings changes are saved as timeline events. Recorded configuration retains
 the original defaults.
 
 Windows appear on the simulator's desktop (`DISPLAY`), not as embedded video
-inside the browser. If the runner has no desktop, it uses a virtual display and
+inside the browser. The Gazebo viewer uses installed/cached local models and a
+local empty Insert catalog, so startup does not wait for Gazebo's online model
+database. Online catalog browsing is disabled for this experiment viewer.
+Verbose startup diagnostics are saved in `gazebo.log`.
+If the runner has no desktop, it uses a virtual display and
 the panel says so; use the browser's live trajectory/search view in that case.
 Enabling extra windows can increase real elapsed time, while the test's
 simulation-time limit stays the same.

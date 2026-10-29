@@ -319,6 +319,12 @@ private:
 inline double absorbing_value(double neighbor_sum,double absorption)
 {return neighbor_sum/(4.0+absorption);}
 
+// Over-relaxation may overshoot even when its inputs are normalized. Keep every
+// intermediate iterate in the potential range; convergence still checks the
+// original absorption equation's residual.
+inline double relaxed_absorbing_value(double old_value,double equilibrium_value,double factor)
+{return std::clamp(old_value+factor*(equilibrium_value-old_value),0.0,1.0);}
+
 // Geometric track association preserves the existing PoseArray interface.
 class SearchBalance
 {

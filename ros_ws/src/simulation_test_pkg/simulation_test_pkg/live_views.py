@@ -9,6 +9,26 @@ from .processes import process_identity
 from .storage import atomic_json, utcnow
 
 
+def gazebo_viewer_environment(directory, environment):
+    """Resolve installed models locally and keep the Insert catalog offline.
+
+    Gazebo 11's GUI waits synchronously for the online model database when it
+    builds the Insert panel. A local, empty catalog avoids an unbounded network
+    wait; scene meshes still resolve through the normal local model paths.
+    """
+    from ament_index_python.packages import get_package_share_directory
+    catalog = Path(directory).resolve() / 'gazebo_model_database'
+    catalog.mkdir(exist_ok=True)
+    (catalog / 'database.config').write_text(
+        '<?xml version="1.0"?><database><name>Local experiment models</name><models/></database>')
+    result = dict(environment, GAZEBO_MODEL_DATABASE_URI=catalog.as_uri() + '/')
+    models = [str(Path(get_package_share_directory(package)) / 'models')
+              for package in ('sjtu_drone_description', 'turtlebot3_gazebo', 'cow_pkg')]
+    existing = result.get('GAZEBO_MODEL_PATH', '').split(os.pathsep)
+    result['GAZEBO_MODEL_PATH'] = os.pathsep.join(dict.fromkeys(p for p in [*models, *existing] if p))
+    return result
+
+
 class LiveViews:
     def __init__(self, directory, manifest, node, environment, recording, virtual_display=False):
         self.directory = Path(directory)
@@ -76,7 +96,7 @@ class LiveViews:
 
     def _viewers(self):
         from ament_index_python.packages import get_package_share_directory
-        commands = {'gazebo': ['gzclient'], 'rviz': ['rviz2', '-d',
+        commands = {'gazebo': ['gzclient', '--verbose'], 'rviz': ['rviz2', '-d',
                     str(Path(get_package_share_directory('sjtu_drone_bringup')) / 'rviz/rviz.rviz'),
                     '--ros-args', '-p', 'use_sim_time:=true', '-r', '__node:=test_lab_rviz']}
         for key, command in commands.items():
@@ -95,7 +115,9 @@ class LiveViews:
                     log = (self.directory / f'{key}.log').open('a')
                     self.logs[key] = log
                     try:
-                        self.processes[key] = subprocess.Popen(command, env=self.environment, stdout=log,
+                        environment = (gazebo_viewer_environment(self.directory, self.environment)
+                                       if key == 'gazebo' else self.environment)
+                        self.processes[key] = subprocess.Popen(command, env=environment, stdout=log,
                                                               stderr=subprocess.STDOUT)
                     except OSError as error:
                         self.errors[key] = str(error)

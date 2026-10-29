@@ -191,13 +191,20 @@ int main()
   // monotonic response to stronger targets, rather than just its update formula.
   auto solve=[](double strength) {
     const int n=15;
-    std::vector<double> u(n*n,1);
+    std::vector<double> u(n*n,0.5);
+    for (int i=0;i<n;++i) {u[i]=u[(n-1)*n+i]=u[i*n]=u[i*n+n-1]=1;}
     for (int k=0;k<1500;++k) {
       for (int r=1;r<n-1;++r) {for (int c=1;c<n-1;++c) {
         double sum=u[(r-1)*n+c]+u[(r+1)*n+c]+u[r*n+c-1]+u[r*n+c+1];
-        u[r*n+c]=absorbing_value(sum, r==7 && c==7 ? strength:0);
+        u[r*n+c]=relaxed_absorbing_value(u[r*n+c],
+          absorbing_value(sum, r==7 && c==7 ? strength:0),1.7);
+        assert(u[r*n+c]>=0 && u[r*n+c]<=1);
       }}
     }
+    for (int r=1;r<n-1;++r) {for (int c=1;c<n-1;++c) {
+      double sum=u[(r-1)*n+c]+u[(r+1)*n+c]+u[r*n+c-1]+u[r*n+c+1];
+      assert(std::abs(u[r*n+c]-absorbing_value(sum,r==7 && c==7 ? strength:0))<1e-9);
+    }}
     return u;
   };
   auto weak=solve(1),strong=solve(8);

@@ -100,16 +100,18 @@ motion for every herd layout.
 
 ## Drone spacing
 
-Each fellow drone creates a circular obstacle with a **two-cell radius** (1 m
+Each fellow drone creates a circular obstacle with a **one-cell radius** (0.5 m
 at the default 0.5 m resolution), rebuilt from its latest global pose on every
-local update. These fixed cells use potential **2.0**, twice the ordinary
-boundary value, to strengthen drone-to-drone repulsion. Global search planning
+local update. These fixed cells use potential **1.0**, matching cow and map
+boundaries. All potential cells remain in **[0, 1]**, including intermediate
+relaxation updates. Global search planning
 uses the same exclusion radius, and local navigation and recovery avoid the
 inflated cells. A drone already inside an exclusion holds until the area clears.
 
-Tune `peer_drone_obstacle_radius_cells` and `peer_drone_repulsion_potential` in
+Tune `peer_drone_obstacle_radius_cells` in
 `grid_visualizer_pkg/config/grid_config.xml`; rebuild the package and restart
-the nodes to apply changes.
+the nodes to apply changes. `peer_drone_repulsion_potential` must equal
+`boundary_potential`, and configured potentials must stay in [0, 1].
 
 ## Independent coverage maps
 

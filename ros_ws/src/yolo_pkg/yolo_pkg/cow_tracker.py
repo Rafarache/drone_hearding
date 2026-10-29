@@ -7,6 +7,8 @@ import numpy as np
 
 from scipy.optimize import linear_sum_assignment
 
+from yolo_pkg.camera_observation import observed_camera_views
+
 
 class Track:
     _id_counter = itertools.count(1)
@@ -175,19 +177,20 @@ class CowTrackerManager:
             track.innovation_norm = float('nan')
             track.unobserved = True
             if self._is_position_visible(
-                track.last_observed_position, camera_views
+                track.last_observed_position,
+                observed_camera_views(track.last_observed_position, camera_views),
             ):
                 track.lost_frames += 1
                 visible_misses += 1
 
         tracks_before_removal = len(self.tracks)
-        # Confirmed cows are mission memory, not temporary camera tracks.
-        # Keep their last global position until a detection updates it. Only
-        # unconfirmed candidates can expire after counted visible misses.
+        # Keep out-of-view mission memory, but repeated processed images of
+        # an empty location invalidate it, including previously confirmed cows.
+        # A matched detection resets this counter before removal.
         self.tracks = [
             track
             for track in self.tracks
-            if track.confirmed or track.lost_frames < self.max_lost_frames
+            if track.lost_frames < self.max_lost_frames
         ]
         removed_tracks = tracks_before_removal - len(self.tracks)
 

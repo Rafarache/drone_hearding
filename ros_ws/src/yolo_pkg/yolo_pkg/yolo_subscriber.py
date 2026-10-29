@@ -497,6 +497,8 @@ class YoloCowSubscriber(Node):
                     'yaw': drone_yaw,
                     'horizontal_fov': self.camera_horizontal_fov_rad,
                     'max_range': self.config.max_detection_distance_m,
+                    'observed_polygon': self.observation_sampler.footprint(
+                        drone_x, drone_y, drone_yaw),
                 }
             )
 
@@ -517,6 +519,11 @@ class YoloCowSubscriber(Node):
         self._publish_tracks(tracks, header, source_drone_index)
 
     def _log_tracker_diagnostics(self, timestamp):
+        removed = self.tracker.last_diagnostics['removed_tracks']
+        if removed:
+            self.get_logger().info(
+                f'Cleared {removed} cow track(s) after repeated empty observations'
+            )
         last_log_time = self.last_tracker_diagnostic_log_time
         if (
             last_log_time is not None

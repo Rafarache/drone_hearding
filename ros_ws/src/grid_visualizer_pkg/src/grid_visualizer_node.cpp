@@ -53,6 +53,8 @@ struct GridConfig
   int control_period_ms{0};
   double free_cell_potential{0.0};
   double boundary_potential{0.0};
+  int peer_drone_obstacle_radius_cells{2};
+  double peer_drone_repulsion_potential{2.0};
   cv::Point2f goal_position{0.0f, 0.0f};
   double final_goal_reached_radius{0.0};
   double goal_quiet_radius{0.0};
@@ -99,6 +101,10 @@ GridConfig load_grid_config()
     read_required<double>(storage, "free_cell_potential");
   config.boundary_potential =
     read_required<double>(storage, "boundary_potential");
+  config.peer_drone_obstacle_radius_cells =
+    read_required<int>(storage, "peer_drone_obstacle_radius_cells");
+  config.peer_drone_repulsion_potential =
+    read_required<double>(storage, "peer_drone_repulsion_potential");
   config.relaxation_max_iterations =
     read_required<int>(storage, "relaxation_max_iterations");
   config.relaxation_tolerance =
@@ -204,6 +210,15 @@ GridConfig load_grid_config()
   {
     throw std::invalid_argument(
       "local_grid_extent_m must divide into an even number of cells");
+  }
+
+  if (config.peer_drone_obstacle_radius_cells < 1 ||
+    config.peer_drone_obstacle_radius_cells >= config.grid_size / 2 ||
+    !std::isfinite(config.peer_drone_repulsion_potential) ||
+    config.peer_drone_repulsion_potential <= config.boundary_potential)
+  {
+    throw std::invalid_argument(
+      "Peer drone radius must fit the local grid and repulsion must exceed boundary_potential");
   }
 
   config.map_half_width = local_grid_extent / 2.0;
@@ -601,9 +616,10 @@ private:
   void cow_callback(
     const geometry_msgs::msg::PoseArray::SharedPtr msg)
   {
-    // The tracker publishes the full persistent map of confirmed cows, even
-    // when none are currently visible. Keep global positions here: clipping
-    // for this drone's moving local grid must never modify this snapshot.
+    // The tracker publishes its current remembered map, including off-camera
+    // cows, but removes entries whose locations were repeatedly observed empty.
+    // Replace the whole snapshot, including an empty map, so recovery can drop
+    // invalidated cows. Local-grid clipping must never modify global positions.
     auto valid_cows =
       std::make_shared<geometry_msgs::msg::PoseArray>();
     valid_cows->header = msg->header;
@@ -1081,9 +1097,11 @@ private:
       }
     }
 
-    // Peer drone poses stay in global coordinates and are reprojected into
-    // this drone's moving grid. For now, each peer occupies one fixed cell
-    // with no surrounding radius.
+    // Reproject a circular exclusion around each peer on every local update.
+    // Rasterize by global cell centers so peers just outside the moving window
+    // still block overlapping cells. The higher potential strengthens avoidance.
+    const double peer_radius =
+      config_.peer_drone_obstacle_radius_cells * config_.cell_size;
     for (int peer_index = 0;
       peer_index < static_cast<int>(peer_drone_poses.size());
       ++peer_index)
@@ -1093,28 +1111,23 @@ private:
       }
 
       const auto& peer_pose = peer_drone_poses[peer_index];
-      if (!is_inside_global_map(
-          peer_pose->position.x,
-          peer_pose->position.y))
-      {
-        continue;
+      const double peer_x = peer_pose->position.x;
+      const double peer_y = peer_pose->position.y;
+      for (int row = 0; row < config_.grid_size; ++row) {
+        for (int col = 0; col < config_.grid_size; ++col) {
+          const auto cell = grid_to_global(row, col, grid_center);
+          if (std::hypot(cell.x - peer_x, cell.y - peer_y) <= peer_radius) {
+            if (grid[row][col] != COW) {grid[row][col] = EXCLUSION;}
+            potential_grid.at<double>(row, col) = config_.peer_drone_repulsion_potential;
+            is_fixed.at<uchar>(row, col) = 1;
+          }
+        }
       }
 
-      int peer_row = 0;
-      int peer_col = 0;
-      if (!global_to_grid(
-          peer_pose->position.x,
-          peer_pose->position.y,
-          grid_center,
-          peer_row,
-          peer_col))
-      {
-        continue;
+      int peer_row = 0, peer_col = 0;
+      if (global_to_grid(peer_x, peer_y, grid_center, peer_row, peer_col)) {
+        grid[peer_row][peer_col] = DRONE;
       }
-
-      grid[peer_row][peer_col] = DRONE;
-      potential_grid.at<double>(peer_row, peer_col) = config_.boundary_potential;
-      is_fixed.at<uchar>(peer_row, peer_col) = 1;
     }
 
     cv::Point2f current_primary_push_objective;
@@ -1257,7 +1270,7 @@ private:
         if (grid_visualizer_pkg::distance(p, cow) <= cow_exclusion_radius_) {return true;}
       }
       for (auto peer : peers) {
-        if (grid_visualizer_pkg::distance(p, peer) <= config_.cell_size) {return true;}
+        if (grid_visualizer_pkg::distance(p, peer) <= peer_radius) {return true;}
       }
       return false;
     };
@@ -1691,19 +1704,33 @@ private:
     const int height = std::max(1, cvRound(global_map_height_ * scale));
     constexpr int margin = 16;
     constexpr int top = 58;
-    cv::Mat image(height + top + 64, std::max(500, width + 2 * margin),
+    cv::Mat image(height + top + 88, std::max(500, width + 2 * margin),
       CV_8UC3, cv::Scalar(245, 245, 245));
     const cv::Rect plot(margin, top, width, height);
     cv::Mat scaled_cells;
     cv::resize(coverage_cells_, scaled_cells, plot.size(), 0, 0, cv::INTER_NEAREST);
     scaled_cells.copyTo(image(plot));
     cv::rectangle(image, plot, cv::Scalar(80, 80, 80), 1);
+    auto pixel = [&](double x, double y) {
+      return cv::Point(plot.x + cvRound((x - global_map_min_x_) / global_map_width_ * (width - 1)),
+        plot.y + cvRound((global_map_max_y_ - y) / global_map_height_ * (height - 1)));
+    };
+    auto label = [&](const std::string& text, cv::Point marker, const cv::Scalar& color) {
+      int baseline = 0;
+      const auto size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseline);
+      const cv::Point origin(
+        std::clamp(marker.x + 9, plot.x + 2, std::max(plot.x + 2, plot.x + width - size.width - 2)),
+        std::clamp(marker.y - 9, plot.y + size.height + 2,
+          std::max(plot.y + size.height + 2, plot.y + height - baseline - 2)));
+      cv::putText(image, text, origin, cv::FONT_HERSHEY_SIMPLEX, 0.4,
+        cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
+      cv::putText(image, text, origin, cv::FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv::LINE_AA);
+    };
+    const cv::Scalar own_drone_color(210, 80, 20);
+    const cv::Scalar peer_drone_color(180, 50, 160);
+    const cv::Scalar goal_color(0, 150, 190);
     if (!latest_search_views_.empty()) {
       const auto& view=latest_search_views_.front();
-      auto pixel=[&](double x,double y) {
-        return cv::Point(plot.x+cvRound((x-global_map_min_x_)/global_map_width_*(width-1)),
-          plot.y+cvRound((global_map_max_y_-y)/global_map_height_*(height-1)));
-      };
       const int step=coverage_->patch_step(search_near_,search_far_,search_fov_);
       const int id=coverage_->index(view.look_at);
       if(id>=0) {
@@ -1717,20 +1744,42 @@ private:
     }
     // These are detector/tracker positions, not Gazebo ground-truth cows.
     geometry_msgs::msg::PoseArray::SharedPtr detected_cows;
+    geometry_msgs::msg::Pose::SharedPtr own_drone;
+    std::vector<geometry_msgs::msg::Pose::SharedPtr> peer_drones;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       detected_cows = latest_cows_;
+      own_drone = latest_drone_pose_;
+      peer_drones = latest_peer_drone_poses_;
+    }
+    if (is_inside_global_map(config_.goal_position.x, config_.goal_position.y)) {
+      const auto marker = pixel(config_.goal_position.x, config_.goal_position.y);
+      cv::circle(image, marker, 11, cv::Scalar(255, 255, 255), 4, cv::LINE_AA);
+      cv::circle(image, marker, 11, goal_color, 2, cv::LINE_AA);
+      cv::drawMarker(image, marker, goal_color, cv::MARKER_CROSS, 14, 2, cv::LINE_AA);
+      label("FINAL GOAL", marker, goal_color);
     }
     if (detected_cows) {
       for (const auto& cow : detected_cows->poses) {
         if (!is_inside_global_map(cow.position.x, cow.position.y)) {continue;}
-        const int x = plot.x + cvRound(
-          (cow.position.x - global_map_min_x_) / global_map_width_ * (width - 1));
-        const int y = plot.y + cvRound(
-          (global_map_max_y_ - cow.position.y) / global_map_height_ * (height - 1));
-        cv::circle(image, cv::Point(x, y), 4, cv::Scalar(0, 0, 255), cv::FILLED, cv::LINE_AA);
+        cv::circle(image, pixel(cow.position.x, cow.position.y), 4,
+          cv::Scalar(0, 0, 255), cv::FILLED, cv::LINE_AA);
       }
     }
+    // Draw current positions over the cached coverage background, even if no
+    // new cells have been visited. Peer slots retain their configured indices.
+    auto draw_drone = [&](const geometry_msgs::msg::Pose::SharedPtr& pose, int index, bool own) {
+      if (!pose || !is_inside_global_map(pose->position.x, pose->position.y)) {return;}
+      const auto marker = pixel(pose->position.x, pose->position.y);
+      const auto color = own ? own_drone_color : peer_drone_color;
+      cv::circle(image, marker, 8, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
+      cv::circle(image, marker, 6, color, cv::FILLED, cv::LINE_AA);
+      label(cv::format(own ? "D%d (self)" : "D%d", index), marker, color);
+    };
+    for (int index = 0; index < static_cast<int>(peer_drones.size()); ++index) {
+      if (index != drone_index_) {draw_drone(peer_drones[index], index, false);}
+    }
+    draw_drone(own_drone, drone_index_, true);
     cv::putText(image,
       cv::format("%s | visited %.1f%%", drone_namespace_.c_str(), 100 * coverage_->fraction()),
       cv::Point(margin, 23), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
@@ -1751,6 +1800,21 @@ private:
     cv::circle(image, cv::Point(margin + 357, legend_y + 7), 4,
       cv::Scalar(0, 0, 255), cv::FILLED, cv::LINE_AA);
     cv::putText(image, "Detected cows", cv::Point(margin + 370, legend_y + 12),
+      cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+
+    const int marker_legend_y = legend_y + 29;
+    cv::circle(image, cv::Point(margin + 7, marker_legend_y), 6,
+      own_drone_color, cv::FILLED, cv::LINE_AA);
+    cv::putText(image, "Own drone", cv::Point(margin + 20, marker_legend_y + 5),
+      cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+    cv::circle(image, cv::Point(margin + 147, marker_legend_y), 6,
+      peer_drone_color, cv::FILLED, cv::LINE_AA);
+    cv::putText(image, "Peer drone", cv::Point(margin + 160, marker_legend_y + 5),
+      cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+    cv::circle(image, cv::Point(margin + 297, marker_legend_y), 8, goal_color, 2, cv::LINE_AA);
+    cv::drawMarker(image, cv::Point(margin + 297, marker_legend_y), goal_color,
+      cv::MARKER_CROSS, 10, 1, cv::LINE_AA);
+    cv::putText(image, "Final goal", cv::Point(margin + 310, marker_legend_y + 5),
       cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
 
     cv::imshow(coverage_window_name_, image);

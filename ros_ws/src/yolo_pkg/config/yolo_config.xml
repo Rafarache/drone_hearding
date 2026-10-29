@@ -33,10 +33,11 @@
     bearing_center_offset_px="167.69"
     bearing_log_denominator="171.46" />
 
-  <!-- Confirmed cows keep their last global position for the entire mission.
-       max_lost_frames expires only unconfirmed candidates on visible misses;
-       out-of-view updates do not count. min_confirmation_hits counts
-       associated detections while the candidate remains available. -->
+  <!-- Keep last global positions while out of view. max_lost_frames expires
+       tentative AND confirmed tracks after processed empty observations of
+       their location inside the conservative ground footprint. Out-of-view
+       updates do not count; a matched detection resets the miss counter.
+       min_confirmation_hits counts associated detections. -->
   <tracker
     use_kalman_filter="false"
     default_dt_seconds="0.1"

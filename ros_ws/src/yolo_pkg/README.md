@@ -10,19 +10,26 @@ The simulation selects its cow tracker through `config/yolo_config.xml`:
 - `true`: `cow_tracker_with_kalman_filter.py` retains the Kalman filter and
   prediction used to associate and smooth observed cow positions.
 
-Both versions confirm new cows using `min_confirmation_hits` and then retain
-them for the entire running mission. Missing detections, looking away, and
-leaving a drone's local map do not delete a confirmed cow or move its last
-mapped global position. Reacquisition updates that same entry when association
-succeeds. `max_lost_frames` (15 by default) expires only **unconfirmed candidates**
-after visible misses; out-of-view updates do not advance that counter.
+Both versions confirm new cows using `min_confirmation_hits` and retain their
+last mapped global positions while out of view. A short detection gap does not
+move or erase a cow, and reacquisition resets its miss counter. After
+`max_lost_frames` (15 by default) processed empty observations of its remembered
+location, any track, including a confirmed cow, is removed. Looking away,
+leaving a drone's local map, missing pose matches, and failed image processing
+supply no negative evidence and cannot expire a track.
+
+In the detector, negative evidence uses the conservative ground rectangle of
+each successfully processed image, independent of the 1 Hz coverage-publication
+throttle. The wider FOV/range remains available for matching detections but does
+not by itself establish that an absent cow's ground location was inspected.
+An empty tracked `PoseArray` is published when the last track is removed, so
+navigation and retained recovery targets can clear immediately.
 Camera synchronization and merging of overlapping
 camera detections remain common to both versions; unfiltered positions are
 the measurements produced by that existing detection pipeline.
 
-Visibility still uses the horizontal FOV and range approximation. Switching
-trackers does not correct its known vertical-view, camera-attitude, or
-occlusion limitations.
+The ground footprint is still a camera model; camera-attitude errors and static
+occlusion are not modeled. Switching trackers does not correct those limitations.
 
 Build inside the simulation container, then launch the simulation normally.
 An already running YOLO node must be restarted to load a changed selection.

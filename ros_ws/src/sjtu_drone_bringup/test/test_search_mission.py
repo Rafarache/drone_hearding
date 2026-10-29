@@ -243,9 +243,10 @@ def test_remembered_cow_drives_intermediate_targets_after_drone_moves_away(tmp_p
         spin(executor, 0.7)
         assert targets and process.poll() is None
 
-        # Visible misses beyond the old expiry limit cannot empty the cow map.
+        # Looking elsewhere must preserve the remembered off-map cow.
         for step in range(1, 31):
-            tracks = tracker.update([], timestamp=step * 0.1, camera_views=[camera])
+            tracks = tracker.update([], timestamp=step * 0.1,
+                                    camera_views=[dict(camera, yaw=math.pi)])
         assert [(t['id'], t['x'], t['y']) for t in tracks] == [(cow_id, 25.0, 10.0)]
         timestamp = 3.0
         for x, y in [(-20.0, -10.0), (-30.0, 20.0)]:
@@ -270,6 +271,18 @@ def test_remembered_cow_drives_intermediate_targets_after_drone_moves_away(tmp_p
         position.publish(pose(20, 10))  # revisiting keeps the same real cow entry
         tracks = tracker.update([(25.2, 10.0)], timestamp=timestamp + 0.1, camera_views=[camera])
         assert len(tracks) == 1 and tracks[0]['id'] == cow_id and not tracks[0]['coasting']
+        # Repeated inspection of an empty location invalidates the cow. The
+        # empty snapshot must clear its intermediate navigation/recovery goal.
+        for step in range(1, 4):
+            tracks = tracker.update([], timestamp=timestamp + .1 + step * .1,
+                                    camera_views=[camera])
+        assert tracks == []
+        cows.publish(PoseArray())
+        spin(executor, .5)
+        targets.clear()
+        spin(executor, .8)
+        assert targets and all(math.hypot(p.position.x - 20, p.position.y - 10) < 1e-6
+                               for p in targets)
     finally:
         process.terminate()
         process.wait(timeout=5)

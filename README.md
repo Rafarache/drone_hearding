@@ -44,12 +44,20 @@ footprint. The local navigation solver and visualizations remain configurable in
 
 Each drone also opens a **Visited Areas** window showing its independent coverage
 over the whole field, with green visited cells, white unvisited cells, and a
-coverage percentage, plus red dots for current detected/tracked cows. It includes
+coverage percentage, plus red dots for current detected/tracked cows. Labeled
+markers show the current drone in blue, peers in purple, and the final goal as
+an amber crosshair. Drone labels use their configured indices (D0, D1, etc.),
+with the current drone marked as self. It includes
 both its own observations and received peer observations, without movement
 arrows. Cow dots use the detector topic rather than Gazebo ground truth.
-Confirmed cows stay at their last detected global positions until reacquired;
-looking away, missed detections, and leaving the local map cannot delete them.
-The tracker retains this memory until the mission processes restart. The view keeps the field
+Confirmed cows stay at their last detected global positions while out of view;
+looking away and leaving the local map do not erase them. Repeated successful
+images that inspect a remembered location without detecting its cow invalidate
+that entry after `max_lost_frames` (15 by default). Short detection gaps preserve
+memory, and a matching detection resets the miss counter. Absence is checked
+inside the conservative processed ground footprint, not the wider association
+range. Removed entries disappear from maps and navigation/recovery objectives
+on the next updates. The view keeps the field
 bounds fixed and remains responsive after the mission stops.
 
 For off-map cows, local arrow/occupancy views show a hollow red edge marker
@@ -89,6 +97,19 @@ settles near the requested heading, noisy weak forces, measured angular-rate
 feedback, and the completion stop latch. The approach test is a controller
 simulation; it does not model Gazebo contact forces or guarantee collision-free
 motion for every herd layout.
+
+## Drone spacing
+
+Each fellow drone creates a circular obstacle with a **two-cell radius** (1 m
+at the default 0.5 m resolution), rebuilt from its latest global pose on every
+local update. These fixed cells use potential **2.0**, twice the ordinary
+boundary value, to strengthen drone-to-drone repulsion. Global search planning
+uses the same exclusion radius, and local navigation and recovery avoid the
+inflated cells. A drone already inside an exclusion holds until the area clears.
+
+Tune `peer_drone_obstacle_radius_cells` and `peer_drone_repulsion_potential` in
+`grid_visualizer_pkg/config/grid_config.xml`; rebuild the package and restart
+the nodes to apply changes.
 
 ## Independent coverage maps
 
@@ -351,6 +372,7 @@ isolated ROS domain:
 
 ```bash
 ROS_DOMAIN_ID=157 python3 -m pytest -q \
+  src/grid_visualizer_pkg/test/test_peer_avoidance_ros.py \
   src/grid_visualizer_pkg/test/test_distance_recovery_ros.py
 ```
 

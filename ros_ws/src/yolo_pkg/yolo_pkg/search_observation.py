@@ -26,6 +26,10 @@ class ObservationSampler:
         if previous is not None and 0 <= timestamp - previous < self.period - 1e-9:
             return None
         self.last[source] = timestamp
+        return self.footprint(x, y, yaw)
+
+    def footprint(self, x, y, yaw):
+        """Ground inspected by one successful image, without publication throttling."""
         cosine, sine = math.cos(yaw), math.sin(yaw)
         return [(x + forward * cosine - lateral * sine,
                  y + forward * sine + lateral * cosine)

@@ -52,3 +52,13 @@ def test_invalid_settings():
         ObservationSampler(fov=float('nan'))
     with pytest.raises(ValueError):
         ObservationSampler(period=0)
+
+
+def test_every_processed_image_has_footprint_even_between_coverage_publications():
+    sampler = ObservationSampler()
+    assert sampler.sample('a', 0, 0, 0, 0)
+    assert sampler.sample('a', .1, 3, 4, .5) is None
+    footprint = sampler.footprint(3, 4, .5)
+    assert len(footprint) == 4
+    assert footprint == ObservationSampler().sample('a', .1, 3, 4, .5)
+    assert sampler.sample('a', .2, 3, 4, .5) is None

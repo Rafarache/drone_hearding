@@ -9,6 +9,7 @@ from yolo_pkg.cow_tracker_with_kalman_filter import (
     CowTrackerManager as KalmanCowTrackerManager,
 )
 from yolo_pkg.tracker_factory import create_cow_tracker
+from yolo_pkg.search_observation import ObservationSampler
 
 
 def make_tracker(max_lost_frames=3, min_hits=1, use_kalman_filter=False):
@@ -106,32 +107,48 @@ class CowTrackerMemoryTests:
         self.assertEqual(remembered['x'], -9.2)
         self.assertFalse(remembered['coasting'])
 
-    def test_confirmed_cow_survives_visible_misses_past_expiry_limit(self):
+    def test_confirmed_cow_expires_after_repeated_observed_empty_frames(self):
         tracker = self.make_tracker(max_lost_frames=15)
-        tracker.update([(2.0, 0.0)], timestamp=0.0, camera_views=[camera()])
-        tracks = tracker.update(
-            [(2.4, 0.0)], timestamp=0.1, camera_views=[camera()]
-        )
+        tracks = tracker.update([(5.0, 0.0)], timestamp=0.0, camera_views=[camera()])
         cow_id = tracks[0]['id']
-        remembered_x = tracks[0]['x']
-
-        for missed_frame in range(1, 151):
-            tracks = tracker.update(
-                [], timestamp=0.1 + missed_frame * 0.1,
-                camera_views=[camera()],
-            )
+        view = dict(camera(), observed_polygon=ObservationSampler().footprint(0, 0, 0))
+        for missed_frame in range(1, 15):
+            tracks = tracker.update([], timestamp=missed_frame * .1, camera_views=[view])
             self.assertEqual(len(tracks), 1)
             self.assertEqual(tracks[0]['id'], cow_id)
-            self.assertEqual(tracks[0]['x'], remembered_x)
+            self.assertEqual((tracks[0]['x'], tracks[0]['y']), (5.0, 0.0))
             self.assertEqual(tracks[0]['lost_frames'], missed_frame)
-            self.assertEqual(tracker.last_diagnostics['removed_tracks'], 0)
-
-        # Returning to the cow updates the same global map entry, not a new ID.
-        tracks = tracker.update([(2.8, 0.0)], timestamp=15.2, camera_views=[camera()])
+        self.assertEqual(tracker.update([], timestamp=1.5, camera_views=[view]), [])
+        self.assertEqual(tracker.last_diagnostics['removed_tracks'], 1)
+        # It can be rediscovered after invalidation rather than blacklisted.
+        tracks = tracker.update([(5.1, 0.0)], timestamp=1.6, camera_views=[view])
         self.assertEqual(len(tracks), 1)
-        self.assertEqual(tracks[0]['id'], cow_id)
-        self.assertFalse(tracks[0]['coasting'])
-        self.assertEqual(tracks[0]['lost_frames'], 0)
+        self.assertNotEqual(tracks[0]['id'], cow_id)
+
+    def test_only_processed_ground_footprint_can_invalidate_a_cow(self):
+        for yaw in (0.0, math.pi / 2, -2.3):
+            for local in ((2.0, 0.0), (15.0, 0.0), (5.0, 7.0)):
+                x = 3 + local[0] * math.cos(yaw) - local[1] * math.sin(yaw)
+                y = 4 + local[0] * math.sin(yaw) + local[1] * math.cos(yaw)
+                tracker = self.make_tracker(max_lost_frames=3)
+                view = dict(camera(yaw=yaw, horizontal_fov=2.09), x=3, y=4,
+                            observed_polygon=ObservationSampler().footprint(3, 4, yaw))
+                tracks = tracker.update([(x, y)], camera_views=[view])
+                cow_id = tracks[0]['id']
+                for step in range(20):
+                    tracks = tracker.update([], timestamp=step * .1, camera_views=[view])
+                    self.assertEqual(tracks[0]['id'], cow_id)
+                    self.assertEqual(tracks[0]['lost_frames'], 0)
+
+    def test_missing_camera_evidence_never_clears_mission_memory(self):
+        tracker = self.make_tracker(max_lost_frames=3)
+        tracks = tracker.update([(5, 0)], camera_views=[camera()])
+        cow_id = tracks[0]['id']
+        for views in (None, [], [dict(camera(), observed_polygon=[])]):
+            for _ in range(10):
+                tracks = tracker.update([], camera_views=views)
+                self.assertEqual(tracks[0]['id'], cow_id)
+                self.assertEqual(tracks[0]['lost_frames'], 0)
 
     def test_cow_outside_local_window_keeps_real_global_position(self):
         tracker = self.make_tracker(max_lost_frames=3, min_hits=3)
@@ -139,10 +156,11 @@ class CowTrackerMemoryTests:
             tracks = tracker.update([(15.0, 2.0)], timestamp=step * 0.1,
                                     camera_views=[camera()])
         cow_id = tracks[0]['id']
-        # The 20 m local window extends only +/-10 m, while the detector can
-        # see 20 m. Misses here used to delete a known off-local-map cow.
+        # Outside the local map and conservative inspected ground footprint:
+        # the broad 20 m association gate alone cannot establish absence.
+        view = dict(camera(), observed_polygon=ObservationSampler().footprint(0, 0, 0))
         for step in range(3, 33):
-            tracks = tracker.update([], timestamp=step * 0.1, camera_views=[camera()])
+            tracks = tracker.update([], timestamp=step * 0.1, camera_views=[view])
             self.assertEqual(len(tracks), 1)
             self.assertEqual((tracks[0]['id'], tracks[0]['x'], tracks[0]['y']),
                              (cow_id, 15.0, 2.0))

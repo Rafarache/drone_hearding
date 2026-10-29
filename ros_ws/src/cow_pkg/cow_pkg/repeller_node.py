@@ -61,7 +61,7 @@ class PeopleRepeller(Node):
         )
 
         self.cows_dict = None
-        self.last_cows_dict = None
+        self.cow_yaw_rates = {}
 
         minimum_sensing_radius = (
             self.drone_approach_radius + self.push_point_margin
@@ -94,6 +94,12 @@ class PeopleRepeller(Node):
             f'cow cutoff={self.config.cow_cutoff_distance_m:.2f} m, '
             f'approach={minimum_sensing_radius:.2f} m, '
             f'force updates={1.0 / self.config.control_period_seconds:.1f} Hz'
+        )
+        self.get_logger().info(
+            f'Cow steering: stop force={self.config.force_stop_threshold:g}, '
+            f'heading tolerance={self.config.heading_tolerance_rad:.3f} rad, '
+            f'P={self.config.heading_proportional_gain:g}, '
+            f'angular-rate damping={self.config.heading_derivative_gain:g}'
         )
 
     def _validate_shared_parameters(self):
@@ -144,8 +150,10 @@ class PeopleRepeller(Node):
         if self.cows_dict is None or not self.publishers_dict:
             return
 
-        for key, value in self.cows_dict.items():
-            if value is None or key not in self.publishers_dict:
+        for key, publisher in self.publishers_dict.items():
+            value = self.cows_dict.get(key)
+            if value is None:
+                publisher.publish(Twist())
                 continue
 
             px = value.position.x
@@ -182,36 +190,31 @@ class PeopleRepeller(Node):
                 force_y += cow_force_y
 
             yaw = self.quaternion_to_yaw(value.orientation)
-            if (
-                self.last_cows_dict is not None
-                and key in self.last_cows_dict
-                and self.last_cows_dict[key] is not None
-            ):
-                last_yaw = self.quaternion_to_yaw(
-                    self.last_cows_dict[key].orientation
-                )
-            else:
-                last_yaw = yaw
-
             twist = Twist()
             twist.linear.x, twist.angular.z = force_to_velocity(
-                force_x, force_y, yaw, last_yaw, self.config
+                force_x, force_y, yaw, self.config,
+                yaw_rate=self.cow_yaw_rates.get(key, 0.0),
             )
-            self.publishers_dict[key].publish(twist)
+            publisher.publish(twist)
 
     def drone_callback(self, msg, namespace):
         self.drone_pos_dir[namespace] = msg
 
     def models_callback(self, msg):
         dictionary = {}
-        self.last_cows_dict = self.cows_dict
+        yaw_rates = {}
 
         for index, name in enumerate(msg.name):
-            if not name.startswith(self.cow_name_prefix):
+            if name not in self.publishers_dict or index >= len(msg.pose):
+                continue
+            if not all(math.isfinite(value) for value in
+                       (msg.pose[index].position.x, msg.pose[index].position.y)):
                 continue
             dictionary[name] = msg.pose[index]
+            yaw_rates[name] = msg.twist[index].angular.z if index < len(msg.twist) else 0.0
 
         self.cows_dict = dictionary
+        self.cow_yaw_rates = yaw_rates
 
 
 def main(args=None):

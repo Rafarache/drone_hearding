@@ -23,6 +23,7 @@ class CowConfig:
     max_angular_velocity_radps: float
     heading_proportional_gain: float
     heading_derivative_gain: float
+    heading_tolerance_rad: float
     control_period_seconds: float
 
 
@@ -110,6 +111,9 @@ def load_cow_config():
         heading_derivative_gain=_required_float(
             motion, 'heading_derivative_gain', source_path
         ),
+        heading_tolerance_rad=_required_float(
+            motion, 'heading_tolerance_rad', source_path
+        ),
         control_period_seconds=_required_float(
             timing, 'control_period_seconds', source_path
         ),
@@ -126,6 +130,7 @@ def load_cow_config():
         'full_speed_force': config.full_speed_force,
         'force_stop_threshold': config.force_stop_threshold,
         'max_angular_velocity_radps': config.max_angular_velocity_radps,
+        'heading_proportional_gain': config.heading_proportional_gain,
         'control_period_seconds': config.control_period_seconds,
     }
     for name, value in positive.items():
@@ -135,6 +140,10 @@ def load_cow_config():
     for name in ('cow_max_repulsion', 'cow_max_attraction'):
         if getattr(config, name) < 0.0:
             raise ValueError(f'{name} must be nonnegative in {source_path}')
+    if config.heading_derivative_gain < 0.0:
+        raise ValueError(f'heading_derivative_gain must be nonnegative in {source_path}')
+    if not 0.0 <= config.heading_tolerance_rad < math.pi / 2:
+        raise ValueError(f'heading_tolerance_rad must be in [0, pi/2) in {source_path}')
     if config.cow_cutoff_distance_m <= config.cow_equilibrium_distance_m:
         raise ValueError(
             'cow_cutoff_distance_m must exceed cow_equilibrium_distance_m '

@@ -7,7 +7,7 @@
     controller="keyboard"
     fixed_frame="" />
 
-  <map center_x="0.0" center_y="0.0" width_m="100.0" height_m="100.0" />
+  <map center_x="0.0" center_y="0.0" width_m="40.0" height_m="40.0" />
 
   <interfaces
     drone_namespace_prefix="/simple_drone"

@@ -21,7 +21,9 @@ terminals, plus the Gazebo models and YOLO weights used by this repository.
 `ros_ws/src/sjtu_drone_bringup/config/simulation.xml` defines the field bounds,
 drone and cow starting positions, goal, completion radius, and search footprint.
 The goal and radius are passed to both navigation and completion monitoring;
-they no longer come from the local grid configuration. Defaults are a goal at
+they no longer come from the local grid configuration. The default field is
+**40 m × 40 m**, centered at the origin (X and Y from -20 to 20 m). At 0.5 m
+resolution this uses 6,400 global coverage cells, down from 40,000. Defaults are a goal at
 `(-10, -10)`, a **2 m planar completion radius**, and a conservative rectangular
 observation footprint inside a camera sector with a 2–10 m range and 2.09 rad
 horizontal field of view.
@@ -34,8 +36,8 @@ ros2 launch sjtu_drone_bringup bringup.launch.py \
 ```
 
 The observation footprint must fit inside the detector's configured range and
-field of view. The 5 m search viewpoint offset must lie between its near/far
-ranges. The local navigation solver and visualizations remain configurable in
+field of view. Viewpoints center each search patch in the modeled camera
+footprint. The local navigation solver and visualizations remain configurable in
 `grid_visualizer_pkg/config/grid_config.xml`. Individual grid nodes also accept
 `show_vector_grid:=false`, `show_occupancy_grid:=false`, and
 `show_coverage_map:=false` for display-free tests.
@@ -63,6 +65,30 @@ ROS parameter can also toggle an individual drone's window while it is running:
 ros2 param set /simple_drone0/grid0 show_coverage_map false
 ros2 param set /simple_drone0/grid0 show_coverage_map true
 ```
+
+## Cow spacing and steering
+
+`cow_pkg/config/cow_config.xml` sets the cow-to-cow repulsion range through
+`cow_equilibrium_distance_m`, now **5 m between centers** instead of 4 m.
+`cow_repulsion_shape` is reduced from 8 to 3 so repulsion is appreciable before
+the 2 m-long cow bodies touch. At 3 m separation, the repulsive magnitude is
+0.064 instead of approximately 0.000015. This produces a more spread-out herd;
+the 2 m mission completion radius is unchanged.
+
+Both forward speed and turning now taper with resultant force. Resultants at or
+below `force_stop_threshold` (0.001) stop both, and `heading_tolerance_rad`
+(0.05 rad, about 2.9 degrees) prevents steering corrections for tiny heading
+errors. The steering gains are P=1.0 and angular-rate damping=0.2. Damping uses
+the cow's measured angular velocity from `/gazebo/model_states`, in rad/s,
+instead of yaw changes between messages with an unspecified time interval.
+Missing cows and invalid steering inputs receive zero velocity commands.
+
+Rebuild `cow_pkg` and restart the mission to apply these settings. Tests cover
+head-on approach with drone pressure and braking lag, bounded steering that
+settles near the requested heading, noisy weak forces, measured angular-rate
+feedback, and the completion stop latch. The approach test is a controller
+simulation; it does not model Gazebo contact forces or guarantee collision-free
+motion for every herd layout.
 
 ## Independent coverage maps
 
@@ -106,27 +132,34 @@ this implementation; the existing cow, peer-drone, and field exclusions apply.
 ## Simultaneous objectives
 
 By default, MMPF-inspired selection searches **from the borders inward**. It groups
-unseen cells into bands by distance from the nearest field edge, with band width
-equal to half the camera range (5 m by default), and splits each band into
-camera-range tiles. It uses the outermost band with a reachable, non-retired,
-positive-gain viewpoint. Once that band has been covered, selection moves to the
-next band inward; temporarily unavailable outer bands are reconsidered every
-planning update. This lets a drone starting in the center select distant border targets
-instead of growing the local searched frontier.
+fixed, cell-aligned patches up to 2 m square into bands by distance from the
+nearest field edge, with band width equal to half the camera range (5 m by
+default). It uses the outermost band with a reachable, non-retired viewpoint.
+Once that band has been observed, selection moves inward; unavailable outer
+bands are reconsidered on later planning updates.
 
-For each tile, selection takes a representative unseen cell near its centroid,
-samples eight viewpoints 5 m around it, and scores predicted new coverage of the
-active band against wavefront travel distance and nearby peer crowding. The score
-is `new_band_cells / (1 + travel_distance / camera_range) / crowding_penalty`.
-The best viewpoint per tile is retained, and up to 12 scored viewpoints feed the
-field. Camera search attention also scores the active band so central unknown
-space cannot steal attention from a border observation. Search targets are
-observation positions inside the field; the drone need not fly on the fence.
+When selecting a new patch, its viewing position is placed on the line from the
+current drone position toward the patch center, offset from that center by the
+middle of the modeled camera footprint (about 6.1 m with the defaults). This
+puts the attraction between the drone and patch when there is enough viewing
+distance. A drone outside an inner patch can therefore look inward instead of
+flying past it to a permanently border-facing viewpoint. If already too close,
+the camera's minimum viewing distance can require stepping back. Blocked,
+retired, or geometrically invalid viewpoints use the nearest valid alternative
+angle. Every candidate must fit the entire patch with the 0.5 m margin.
+
+Selection scores obstacle-aware travel distance and peer crowding as
+`1 / (1 + travel_distance / camera_range) / crowding_penalty`, with the existing
+outward startup preference on the first selection. Each drone retains one
+selected attraction and direction until the patch is observed or invalidated;
+its viewpoint does not move as the drone approaches or as coverage is partial.
+Camera attention compares the distance to this selected attraction against the
+distance to the eligible local cow-group center, facing the patch when the
+attraction is closer and the cows otherwise.
 
 Set `<search_border_first>0</search_border_first>` in `grid_config.xml` (or the
-boolean `search_border_first` ROS parameter at startup) to use the original
-inside-out selector, which clusters unseen cells bordering already searched
-cells. Both policies feed the same simultaneous search/pushing controller.
+boolean `search_border_first` ROS parameter at startup) to select nearby
+unfinished patches across all bands. Both settings share the same controller.
 Wavefront travel rejects exclusions and diagonal corner cutting. A viewpoint
 that produces no new coverage in three aligned arrival observations is retired
 for 10 simulation seconds so an alternative can be selected.
@@ -149,7 +182,8 @@ g++ -std=c++17 -O2 -Iros_ws/src/grid_visualizer_pkg/include \
 /tmp/benchmark_search
 ```
 
-On the development machine's 100 m × 100 m scenario, the previous search update
+The benchmark now uses the default 40 m × 40 m field. For historical comparison,
+on the development machine's 100 m × 100 m scenario, the previous search update
 took about 65 ms without optimization (the existing build default), or 13 ms
 with `-O2`. The box-based version takes about 6.3 ms with `-O2` and runs at 1 Hz
 instead of 5 Hz. Forty camera gain evaluations fell from 2.6 ms to 0.22 ms when
@@ -201,7 +235,7 @@ After building and sourcing the workspace:
 
 ```bash
 ctest --test-dir build/grid_visualizer_pkg --output-on-failure \
-  -R 'test_(goal_quiet_zone|search_coverage)'
+  -R 'test_(goal_quiet_zone|search_coverage|stall_recovery|distance_recovery)'
 python3 -m pytest -q \
   src/cow_pkg/test/test_completion.py \
   src/cow_pkg/test/test_repeller_forces.py \
@@ -219,3 +253,108 @@ completion edge cases, controller latching, late subscribers, and the real
 Gazebo flight plugin during takeoff, landing, and position control. They do not
 replace an end-to-end camera/detection mission trial with cows distributed
 across the full field.
+
+## Fixed search patches, approach viewpoints, and initial separation
+
+Search uses fixed, cell-aligned patches up to 2 m by 2 m, reduced automatically
+for narrower camera footprints with a 0.5 m geometric margin. A new attraction
+is chosen from the drone's current approach side, then its viewing position and
+direction remain fixed until the patch is fully observed, blocked, or retired.
+Partial observations never shift a patch or its selected attraction. Local and peer camera reports remove
+completed patches; reaching a viewpoint alone does not count as coverage.
+Outer bands are searched before inner bands, with nearby reachable patches
+preferred within a band. Search and cow pushing still share the potential field.
+
+On startup, drones wait for peer poses and initially turn away from the other
+drones' centroid before translating. For two drones these headings are opposite.
+Coincident starting positions use deterministic headings spaced by drone index.
+The first search attraction is biased in that same outward direction; subsequent
+patches use normal border-first selection. This discourages duplicate searching
+without assigning SEARCH/HERD modes or exclusive territories. Cow forces can
+still influence the eventual path. A single drone skips the initial turn.
+
+Camera attention compares two planar distances from the drone: the distance to
+the selected global search **attraction/viewpoint**, and the distance to the
+arithmetic center of eligible remembered cows in the current local map (20 m
+square by default). If the search attraction is strictly closer, the camera faces
+the search **patch center**; otherwise it faces the cow-group center. Equal
+distances favor the cows. The comparison uses the real attraction rather than
+the local grid's clipped intermediate waypoint or the patch center itself.
+
+Cows inside the permanent 2 m goal completion radius are excluded. Local-map
+membership is independent of camera heading/range and the temporary 8 m herding
+quiet radius. With only one available target type the camera faces it; with
+neither it preserves heading. Camera choice is independent of navigation's
+60/40 attraction allocation and does not change the selected search attraction.
+
+Search and cow attraction shares are configured in
+`ros_ws/src/grid_visualizer_pkg/config/grid_config.xml` using
+`search_attraction_percent` (60) and `cow_attraction_percent` (40). Values must
+be nonnegative and total 100. This fixed split replaces progress-based balancing;
+when only one target type is available, it receives the full budget. Cow points
+share their group budget according to their existing priorities and distances.
+Rebuild `grid_visualizer_pkg` and restart the nodes after editing the XML.
+
+## Distance-field recovery
+
+Relaxation remains the normal controller, with the configured 60% search / 40%
+cow attraction allocation. `enable_geodesic_field_fallback=1` enables recovery
+when measured motion stalls or oscillates, or when relaxation fails to converge.
+The default stall window is 6 simulation seconds and the confinement threshold
+is 0.4 m. Larger back-and-forth motion also qualifies when it contains at least
+two reversals, at least 0.8 m of travel, and net displacement below 25% of travel.
+Motion segments below 0.05 m do not count as reversals. Intentional holds within
+0.5 m of a search viewpoint do not trigger recovery. Cow-pushing waypoints are
+not terminal holds: the normal field remains active there, and a stalled cow
+approach remains eligible for recovery.
+
+Recovery selects one reachable target using obstacle-aware distance plus its
+existing attraction-priority cost. It retains the global target while rebuilding
+a single-target distance field around moving obstacles and the moving local
+window. Search targets retain their patch identity; cow targets use spatial
+association within the existing 2 m association radius because the cow topic
+contains positions without tracker IDs. Invalid or unreachable targets are
+replaced. Zero-strength targets cannot seed recovery. With no safe route, the
+drone explicitly holds rather than following a stale waypoint.
+
+`recovery_release_m` now means **minimum approach toward the retained target**
+(default 1 m), rather than displacement from the stall position. Returning to
+relaxation additionally requires a converged field, normal and recovery headings
+within `recovery_alignment_deg` (45 degrees) for `recovery_agreement_s` (3 s),
+and at least `recovery_window_progress_m` (0.3 m) of approach in that window.
+Target motion beyond one grid cell resets the progress reference. Arrival within
+`recovery_arrival_m` (0.5 m) also ends recovery; reaching a clipped intermediate
+waypoint does not count as arrival.
+
+After handoff, `recovery_watch_s` (6 s) retains the target. Losing
+`recovery_backtrack_m` (1 m) from the best distance, or opposing the recovery
+route for `recovery_opposition_s` (1 s), immediately reactivates recovery.
+Simulation clock resets, mission stop, and loss of objectives clear recovery
+memory. This adds navigation recovery memory, not SEARCH/HERD task modes.
+
+Recovery respects fixed cells, prevents diagonal corner cutting, and caps each
+step at the smaller of one grid cell and `max_goto_movement_m`. The vector view
+keeps the relaxed field arrows and adds a magenta commanded arrow and retained
+target marker, labelled RECOVERY or HANDOFF WATCH. Transition logs identify the
+trigger and selected target. Camera attention keeps using the search-attraction
+versus cow-center distance comparison during navigation recovery.
+
+Thresholds are in `ros_ws/src/grid_visualizer_pkg/config/grid_config.xml`.
+Rebuild `grid_visualizer_pkg` and restart the nodes to apply them. Recovery still
+uses a local map and does not guarantee global completeness in every obstacle
+layout. The paper's adaptive potential distortion is not implemented.
+
+Standalone checks include a closed-loop saddle fixture using the configured
+controller's velocity, acceleration, slowdown, and position tolerance. Run the
+live headless recovery check after building and sourcing the workspace, in an
+isolated ROS domain:
+
+```bash
+ROS_DOMAIN_ID=157 python3 -m pytest -q \
+  src/grid_visualizer_pkg/test/test_distance_recovery_ros.py
+```
+
+The ROS check covers measured stalls, retained targets, stable-progress handoff,
+command bounds, camera priority, simulation-clock resets, and mission stop.
+A full Gazebo reproduction of the reported camera/detection scene remains a
+separate validation step.

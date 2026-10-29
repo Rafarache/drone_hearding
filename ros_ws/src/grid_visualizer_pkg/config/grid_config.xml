@@ -14,8 +14,22 @@
   <enable_saddle_neighbor_descent>0</enable_saddle_neighbor_descent>
   <enable_geodesic_field_fallback>1</enable_geodesic_field_fallback>
   <control_recovery_search_radius_cells>8</control_recovery_search_radius_cells>
+  <stall_window_s>6.0</stall_window_s>
+  <stall_motion_m>0.4</stall_motion_m>
+  <!-- Minimum approach to the retained target, not displacement from the stall. -->
+  <recovery_release_m>1.0</recovery_release_m>
+  <recovery_agreement_s>3.0</recovery_agreement_s>
+  <recovery_alignment_deg>45.0</recovery_alignment_deg>
+  <recovery_window_progress_m>0.3</recovery_window_progress_m>
+  <recovery_watch_s>6.0</recovery_watch_s>
+  <recovery_backtrack_m>1.0</recovery_backtrack_m>
+  <recovery_opposition_s>1.0</recovery_opposition_s>
+  <recovery_arrival_m>0.5</recovery_arrival_m>
   <!-- Search the outermost reachable unvisited band before moving inward. -->
   <search_border_first>1</search_border_first>
+  <!-- Fixed attraction budget split when both search and cow targets exist. -->
+  <search_attraction_percent>60.0</search_attraction_percent>
+  <cow_attraction_percent>40.0</cow_attraction_percent>
 
   <show_occupancy_grid>0</show_occupancy_grid>
   <show_vector_grid>1</show_vector_grid>

@@ -1,5 +1,6 @@
 """ROS integration checks; run after building and sourcing the workspace."""
 
+import math
 import os
 from pathlib import Path
 import re
@@ -143,6 +144,14 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
             poses[i].publish(pose(0, i * 4))
         spin(executor, 0.6)
         assert targets[0] and all(p.position.x == 0 and p.position.y == 0 for p in targets[0])
+        # Complete the initial outward turn. This fixture supplies poses itself
+        # and has no flight controller to execute focus commands.
+        for i, yaw in enumerate((-math.pi / 2, math.pi / 2)):
+            aligned = pose(0, i * 4)
+            aligned.orientation.z = math.sin(yaw / 2)
+            aligned.orientation.w = math.cos(yaw / 2)
+            poses[i].publish(aligned)
+        spin(executor, 0.6)
         footprint = PolygonStamped()
         footprint.header.frame_id = 'map'
         footprint.header.stamp = driver.get_clock().now().to_msg()
@@ -163,6 +172,7 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
             output.flush()
         logs = [(tmp_path / f'grid{i}.log').read_text() for i in (0, 1)]
         assert all(re.search(r'objectives=[1-9][0-9]*/1', log) for log in logs), logs
+        assert all(values for values in focuses)
         coverage = [re.findall(r'coverage=([0-9.]+)%', log)[-1] for log in logs]
         assert coverage[0] == coverage[1]
         # Tracker-empty updates retire cow objectives but must not stop search.
@@ -264,6 +274,159 @@ def test_remembered_cow_drives_intermediate_targets_after_drone_moves_away(tmp_p
         process.terminate()
         process.wait(timeout=5)
         output.close()
+        driver.destroy_node()
+        executor.shutdown()
+        rclpy.shutdown()
+
+
+def test_search_viewpoints_follow_approach_and_remain_until_observed(tmp_path):
+    rclpy.init()
+    driver = Node('approach_view_test_driver')
+    executor = SingleThreadedExecutor()
+    executor.add_node(driver)
+    executable = str(Path(get_package_prefix('grid_visualizer_pkg')) /
+                     'lib/grid_visualizer_pkg/grid_visualizer_node')
+    log_path = tmp_path / 'approach_grid.log'
+    output = log_path.open('w')
+    parameters = dict(drone_index=0, total_drones=1, global_map_center_x=0.0,
+                      global_map_center_y=0.0, global_map_width=60.0, global_map_height=60.0,
+                      drone_namespace_prefix='/approach_drone', cow_positions_topic='/approach_cows',
+                      cow_exclusion_radius=2.0, push_point_margin=2.0, goal_x=-10.0, goal_y=-10.0,
+                      show_vector_grid=False, show_occupancy_grid=False, show_coverage_map=False)
+    args = [executable, '--ros-args', '-r', '__node:=approach_grid0']
+    for key, value in parameters.items():
+        args.extend(['-p', f'{key}:={str(value).lower() if isinstance(value, bool) else value}'])
+    process = subprocess.Popen(args, stdout=output, stderr=subprocess.STDOUT)
+    try:
+        position = driver.create_publisher(Pose, '/approach_drone0/gt_pose', 10)
+        observations = driver.create_publisher(PolygonStamped, '/approach_drone0/processed_view', 50)
+        cows = driver.create_publisher(PoseArray, '/approach_cows', 10)
+        targets = []
+        subscription = driver.create_subscription(Pose, '/approach_drone0/goto', targets.append, 10)
+        focuses = []
+        focus_subscription = driver.create_subscription(
+            Pose, '/approach_drone0/focusin', focuses.append, 10)
+        spin(executor, 0.8)
+        position.publish(pose(24, 11))
+
+        def observe_rectangle(left, bottom, right, top):
+            footprint = PolygonStamped()
+            footprint.header.frame_id = 'map'
+            footprint.polygon.points = [Point32(x=float(x), y=float(y), z=0.0) for x, y in
+                                        [(left, bottom), (right, bottom), (right, top), (left, top)]]
+            observations.publish(footprint)
+
+        # Leave two whole 2 m patches unseen, centered at (+/-11, 11).
+        for rectangle in [(-30, -30, 30, 10), (-30, 12, 30, 30),
+                          (-30, 10, -12, 12), (-10, 10, 10, 12), (12, 10, 30, 12)]:
+            observe_rectangle(*rectangle)
+        spin(executor, 1.8)
+        first = re.findall(r'search viewpoint: patch=\(11.00,11.00\) '
+                           r'attraction=\(([-\d.]+),([-\d.]+)\)', log_path.read_text())
+        assert first, log_path.read_text()
+        assert 11 < float(first[-1][0]) < 24 and abs(float(first[-1][1])-11) < .01
+        # The attraction is about 6.9 m away, the cow centroid is 9 m away,
+        # and the patch is 13 m away. Compare the attraction, then FACE the patch.
+        cows.publish(PoseArray(poses=[pose(15, 9), pose(15, 13)]))
+        spin(executor, 1.0)
+        assert focuses and abs(focuses[-1].position.x-11) < 1e-6
+        assert abs(focuses[-1].position.y-11) < 1e-6
+        # The cow centroid moves closer (4 m), without blocking the attraction.
+        cows.publish(PoseArray(poses=[pose(20, 9), pose(20, 13)]))
+        spin(executor, 1.0)
+        assert abs(focuses[-1].position.x-20) < 1e-6
+        assert abs(focuses[-1].position.y-11) < 1e-6
+        # With no eligible cows, resume search attention.
+        cows.publish(PoseArray())
+        spin(executor, 1.0)
+        assert abs(focuses[-1].position.x-11) < 1e-6
+        # Movement alone cannot relocate the selected attraction or complete coverage.
+        position.publish(pose(-24, 11))
+        spin(executor, 1.3)
+        assert not re.search(r'search viewpoint: patch=\(-11.00,11.00\)', log_path.read_text())
+        again = re.findall(r'search viewpoint: patch=\(11.00,11.00\)', log_path.read_text())
+        assert len(again) == len(first)
+        # Completion selects the remaining patch using the new drone position.
+        observe_rectangle(10, 10, 12, 12)
+        spin(executor, 1.8)
+        second = re.findall(r'search viewpoint: patch=\(-11.00,11.00\) '
+                            r'attraction=\(([-\d.]+),([-\d.]+)\)', log_path.read_text())
+        assert second, log_path.read_text()
+        assert -24 < float(second[-1][0]) < -11 and abs(float(second[-1][1])-11) < .01
+        observe_rectangle(-12, 10, -10, 12)
+        spin(executor, 1.8)
+        assert targets and targets[-1].position.x == -24 and targets[-1].position.y == 11
+        # No search remains: eligible local cows still receive attention.
+        cows.publish(PoseArray(poses=[pose(-20, 9), pose(-20, 13)]))
+        spin(executor, 1.0)
+        assert abs(focuses[-1].position.x+20) < 1e-6
+        assert abs(focuses[-1].position.y-11) < 1e-6
+        # Neither target exists: preserve the drone's current heading (+X).
+        cows.publish(PoseArray())
+        spin(executor, 1.0)
+        assert abs(focuses[-1].position.x+14) < 1e-6
+        assert abs(focuses[-1].position.y-11) < 1e-6
+        assert process.poll() is None and subscription and focus_subscription
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+        output.close()
+        executor.remove_node(driver)
+        driver.destroy_node()
+        executor.shutdown()
+        rclpy.shutdown()
+
+
+def test_cow_push_waypoint_is_not_a_terminal_hold(tmp_path):
+    rclpy.init()
+    driver = Node('cow_waypoint_test_driver')
+    executor = SingleThreadedExecutor()
+    executor.add_node(driver)
+    executable = str(Path(get_package_prefix('grid_visualizer_pkg')) /
+                     'lib/grid_visualizer_pkg/grid_visualizer_node')
+    log_path = tmp_path / 'cow_waypoint.log'
+    output = log_path.open('w')
+    parameters = dict(drone_index=0, total_drones=1, global_map_center_x=0.0,
+                      global_map_center_y=0.0, global_map_width=40.0, global_map_height=40.0,
+                      drone_namespace_prefix='/cow_waypoint_drone',
+                      cow_positions_topic='/cow_waypoint_cows', cow_exclusion_radius=2.0,
+                      push_point_margin=2.0, goal_x=-10.0, goal_y=0.0,
+                      show_vector_grid=False, show_occupancy_grid=False, show_coverage_map=False)
+    args = [executable, '--ros-args', '-r', '__node:=cow_waypoint_grid']
+    for key, value in parameters.items():
+        args.extend(['-p', f'{key}:={str(value).lower() if isinstance(value, bool) else value}'])
+    process = subprocess.Popen(args, stdout=output, stderr=subprocess.STDOUT)
+    try:
+        positions = driver.create_publisher(Pose, '/cow_waypoint_drone0/gt_pose', 10)
+        observations = driver.create_publisher(
+            PolygonStamped, '/cow_waypoint_drone0/processed_view', 10)
+        cows = driver.create_publisher(PoseArray, '/cow_waypoint_cows', 10)
+        targets = []
+        subscription = driver.create_subscription(
+            Pose, '/cow_waypoint_drone0/goto', targets.append, 10)
+        spin(executor, 0.8)
+        # Full coverage isolates herding. Estimated cow x=6 gives a pushing
+        # waypoint x=10. The drone is already within the former 0.5 m hold zone.
+        footprint = PolygonStamped()
+        footprint.header.frame_id = 'map'
+        footprint.polygon.points = [Point32(x=x, y=y, z=0.0) for x, y in
+                                    [(-20.0, -20.0), (20.0, -20.0),
+                                     (20.0, 20.0), (-20.0, 20.0)]]
+        observations.publish(footprint)
+        cows.publish(PoseArray(poses=[pose(6, 0)]))
+        positions.publish(pose(10.2, 0))
+        spin(executor, 1.5)
+        targets.clear()
+        spin(executor, 1.0)
+        assert process.poll() is None and targets, log_path.read_text()
+        assert any(p.position.x < 10.1 for p in targets), log_path.read_text()
+        assert all(math.hypot(p.position.x-10.2, p.position.y) <= .50001 for p in targets)
+        assert subscription
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+        output.close()
+        executor.remove_node(driver)
         driver.destroy_node()
         executor.shutdown()
         rclpy.shutdown()

@@ -1,24 +1,25 @@
 <?xml version="1.0"?>
 <cow_config>
-  <!-- Cow curve: R, A, D, d, p, alpha, beta. -->
+  <!-- Repulsion below D=5 m; p=3 gives stronger early separation than p=8. -->
   <interaction
     drone_sensing_radius_m="6.0"
     cow_max_repulsion="1.0"
     cow_max_attraction="1.0"
-    cow_equilibrium_distance_m="4.0"
+    cow_equilibrium_distance_m="5.0"
     cow_cutoff_distance_m="18.5"
-    cow_repulsion_shape="8"
+    cow_repulsion_shape="3"
     cow_attraction_rise="6"
     cow_attraction_fall="6" />
-  <!-- Speed follows resultant magnitude; linear_velocity_mps is the cap.
-       A resultant of full_speed_force or larger requests the speed cap. -->
+  <!-- Both translation and turning taper with resultant force.
+       The derivative gain damps measured angular velocity in rad/s. -->
   <motion
     linear_velocity_mps="0.5"
     full_speed_force="0.1"
-    force_stop_threshold="0.000001"
+    force_stop_threshold="0.001"
     max_angular_velocity_radps="1.0"
-    heading_proportional_gain="0.2"
-    heading_derivative_gain="5.0" />
+    heading_proportional_gain="1.0"
+    heading_derivative_gain="0.2"
+    heading_tolerance_rad="0.05" />
   <!-- Recompute all pairwise forces and publish movement at 5 Hz. -->
   <timing control_period_seconds="0.2" />
 </cow_config>

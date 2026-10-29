@@ -7,7 +7,7 @@ using namespace grid_visualizer_pkg;
 
 int main()
 {
-  SearchCoverage coverage(-50,-50,100,100,.5);
+  SearchCoverage coverage(-20,-20,40,40,.5);
   coverage.observe({{-8,-8},{8,-8},{8,8},{-8,8}});
   auto blocked=[](SearchPoint p) {return distance(p,{3,0})<2 || distance(p,{3,2})<2;};
   double checksum=0;

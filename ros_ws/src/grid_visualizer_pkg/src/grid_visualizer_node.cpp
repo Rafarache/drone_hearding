@@ -20,6 +20,8 @@
 #include "std_msgs/msg/empty.hpp"
 #include "grid_visualizer_pkg/search_coverage.hpp"
 #include "grid_visualizer_pkg/goal_quiet_zone.hpp"
+#include "grid_visualizer_pkg/stall_recovery.hpp"
+#include "grid_visualizer_pkg/distance_recovery.hpp"
 #include <opencv2/opencv.hpp>
 
 struct GridConfig
@@ -43,6 +45,10 @@ struct GridConfig
   bool show_vector_grid{false};
   bool show_coverage_map{false};
   bool search_border_first{true};
+  double stall_window_s{6},stall_motion_m{0.4},recovery_release_m{1};
+  grid_visualizer_pkg::RecoverySettings recovery;
+  double search_attraction_percent{60.0};
+  double cow_attraction_percent{40.0};
   int visualization_period_ms{0};
   int control_period_ms{0};
   double free_cell_potential{0.0};
@@ -117,6 +123,38 @@ GridConfig load_grid_config()
     read_required<int>(storage, "show_coverage_map") != 0;
   config.search_border_first =
     read_required<int>(storage, "search_border_first") != 0;
+  config.search_attraction_percent = read_required<double>(storage, "search_attraction_percent");
+  config.cow_attraction_percent = read_required<double>(storage, "cow_attraction_percent");
+  if (!std::isfinite(config.search_attraction_percent) ||
+    !std::isfinite(config.cow_attraction_percent) ||
+    config.search_attraction_percent < 0 || config.cow_attraction_percent < 0 ||
+    std::abs(config.search_attraction_percent + config.cow_attraction_percent - 100.0) > 1e-6)
+  {
+    throw std::invalid_argument("Search and cow attraction percentages must be nonnegative and sum to 100");
+  }
+  config.stall_window_s=read_required<double>(storage,"stall_window_s");
+  config.stall_motion_m=read_required<double>(storage,"stall_motion_m");
+  config.recovery_release_m=read_required<double>(storage,"recovery_release_m");
+  config.recovery.release_m=config.recovery_release_m;
+  config.recovery.agreement_s=read_required<double>(storage,"recovery_agreement_s");
+  config.recovery.alignment_deg=read_required<double>(storage,"recovery_alignment_deg");
+  config.recovery.window_progress_m=read_required<double>(storage,"recovery_window_progress_m");
+  config.recovery.watch_s=read_required<double>(storage,"recovery_watch_s");
+  config.recovery.backtrack_m=read_required<double>(storage,"recovery_backtrack_m");
+  config.recovery.opposition_s=read_required<double>(storage,"recovery_opposition_s");
+  config.recovery.arrival_m=read_required<double>(storage,"recovery_arrival_m");
+  for (double value : {config.recovery.agreement_s, config.recovery.window_progress_m,
+      config.recovery.watch_s, config.recovery.backtrack_m, config.recovery.opposition_s,
+      config.recovery.arrival_m}) {
+    if (!std::isfinite(value) || value<=0) {throw std::invalid_argument("Invalid recovery threshold");}
+  }
+  if (!std::isfinite(config.recovery.alignment_deg) || config.recovery.alignment_deg<=0 ||
+    config.recovery.alignment_deg>=90) {throw std::invalid_argument("Recovery alignment must be between 0 and 90 degrees");}
+  if(!std::isfinite(config.stall_window_s) || !std::isfinite(config.stall_motion_m) ||
+    !std::isfinite(config.recovery_release_m) || config.stall_window_s<=0 ||
+    config.stall_motion_m<=0 || config.recovery_release_m<=config.stall_motion_m) {
+    throw std::invalid_argument("Invalid stall recovery window or distances");
+  }
   config.visualization_period_ms =
     read_required<int>(storage, "visualization_period_ms");
   config.control_period_ms =
@@ -143,6 +181,9 @@ GridConfig load_grid_config()
     read_required<double>(storage, "objective_priority_min_spread_m");
   config.objective_priority_fallback_bias =
     read_required<double>(storage, "objective_priority_fallback_bias_m");
+  config.recovery.association_m=config.primary_objective_association_radius;
+  config.recovery.max_step_m=config.max_goto_movement;
+  config.recovery.epsilon=config.potential_descent_epsilon;
 
   if (
     !std::isfinite(local_grid_extent) ||
@@ -387,7 +428,10 @@ public:
 
     auto stop_qos = rclcpp::QoS(1).reliable().transient_local();
     stop_sub_ = create_subscription<std_msgs::msg::Empty>("/simulation/stop", stop_qos,
-      [this](std_msgs::msg::Empty::SharedPtr) {stopped_ = true; has_vector_grid_ = false;});
+      [this](std_msgs::msg::Empty::SharedPtr) {
+        stopped_ = true; has_vector_grid_ = false;
+        stall_recovery_.reset(); distance_recovery_.reset(); commanded_movement_={0,0};
+      });
     auto coverage_qos = rclcpp::QoS(50).reliable().durability_volatile();
     searched_pub_ = create_publisher<geometry_msgs::msg::PolygonStamped>(
       drone_namespace_ + "/searched_area", coverage_qos);
@@ -484,6 +528,7 @@ private:
     double strength{0.0};
     bool is_search{false};
     cv::Point2f look_at{0,0};
+    cv::Point2f cow_identity{0,0};
   };
 
   void drone_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
@@ -540,9 +585,12 @@ private:
       if (grid_visualizer_pkg::distance({p.position.x,p.position.y},view.position) > 0.75) {continue;}
       const double heading = std::atan2(view.look_at.y-p.position.y,view.look_at.x-p.position.x);
       if (std::abs(grid_visualizer_pkg::angle_difference(heading,yaw)) > 0.15) {continue;}
-      int key = coverage_->index(view.position);
+      int key = coverage_->index(view.look_at);
       int& misses = failed_observations_[key];
-      misses = last_observation_gain_ ? 0 : misses+1;
+      const auto remaining=coverage_->patch_remaining(view.look_at,search_near_,search_far_,search_fov_);
+      auto& previous=patch_previous_remaining_[key];
+      misses = remaining==0 || remaining<previous ? 0 : misses+1;
+      previous=remaining;
       if (misses >= 3) {
         failed_views_.push_back({view.position,now().seconds()+10.0});
         misses = 0;
@@ -756,98 +804,34 @@ private:
     return result_row >= 0;
   }
 
+  grid_visualizer_pkg::RecoveryGrid recovery_grid(
+    const cv::Mat& fixed, const cv::Point2f& center) const
+  {
+    grid_visualizer_pkg::RecoveryGrid result;
+    result.rows=fixed.rows; result.cols=fixed.cols; result.cell_size=config_.cell_size;
+    result.center={center.x,center.y};
+    result.blocked.reserve(fixed.total());
+    for(int r=0;r<fixed.rows;++r) {for(int c=0;c<fixed.cols;++c) {
+      result.blocked.push_back(fixed.at<uchar>(r,c));
+    }}
+    return result;
+  }
+
   cv::Mat compute_goal_distance_grid(
-    const cv::Mat& is_fixed,
-    const cv::Mat& objective_mask,
+    const cv::Mat& is_fixed, const cv::Mat& objective_mask,
     const cv::Mat& objective_source_cost) const
   {
-    using QueueEntry = std::tuple<double, int, int>;
-    std::priority_queue<
-      QueueEntry,
-      std::vector<QueueEntry>,
-      std::greater<QueueEntry>> open_cells;
-
-    cv::Mat distance_grid(
-      config_.grid_size,
-      config_.grid_size,
-      CV_64F,
-      cv::Scalar(std::numeric_limits<double>::infinity()));
-
-    for (int r = 1; r < config_.grid_size - 1; ++r) {
-      for (int c = 1; c < config_.grid_size - 1; ++c) {
-        if (objective_mask.at<uchar>(r, c) == 0) {
-          continue;
-        }
-        const double source_cost =
-          objective_source_cost.at<double>(r, c);
-        distance_grid.at<double>(r, c) = source_cost;
-        open_cells.emplace(source_cost, r, c);
+    const auto frame=recovery_grid(is_fixed,{0,0});
+    std::vector<std::pair<int,double>> sources;
+    for(int r=0;r<frame.rows;++r) {for(int c=0;c<frame.cols;++c) {
+      if(objective_mask.at<uchar>(r,c)) {
+        sources.emplace_back(r*frame.cols+c,objective_source_cost.at<double>(r,c));
       }
-    }
-
-    while (!open_cells.empty()) {
-      const auto [distance, row, col] = open_cells.top();
-      open_cells.pop();
-      if (distance > distance_grid.at<double>(row, col)) {
-        continue;
-      }
-
-      for (int row_offset = -1; row_offset <= 1; ++row_offset) {
-        for (int col_offset = -1; col_offset <= 1; ++col_offset) {
-          if (row_offset == 0 && col_offset == 0) {
-            continue;
-          }
-
-          const int neighbor_row = row + row_offset;
-          const int neighbor_col = col + col_offset;
-          if (
-            neighbor_row <= 0 ||
-            neighbor_row >= config_.grid_size - 1 ||
-            neighbor_col <= 0 ||
-            neighbor_col >= config_.grid_size - 1)
-          {
-            continue;
-          }
-
-          const bool is_goal =
-            objective_mask.at<uchar>(neighbor_row, neighbor_col) == 1;
-          if (
-            is_fixed.at<uchar>(neighbor_row, neighbor_col) == 1 &&
-            !is_goal)
-          {
-            continue;
-          }
-
-          // Do not pass diagonally through the corner of two fixed cells.
-          if (row_offset != 0 && col_offset != 0) {
-            const bool row_side_is_blocked =
-              is_fixed.at<uchar>(row + row_offset, col) == 1 &&
-              objective_mask.at<uchar>(row + row_offset, col) == 0;
-            const bool col_side_is_blocked =
-              is_fixed.at<uchar>(row, col + col_offset) == 1 &&
-              objective_mask.at<uchar>(row, col + col_offset) == 0;
-            if (row_side_is_blocked || col_side_is_blocked) {
-              continue;
-            }
-          }
-
-          const double step_distance = config_.cell_size *
-            std::hypot(
-              static_cast<double>(row_offset),
-              static_cast<double>(col_offset));
-          const double candidate_distance = distance + step_distance;
-          double& stored_distance =
-            distance_grid.at<double>(neighbor_row, neighbor_col);
-          if (candidate_distance + config_.potential_descent_epsilon < stored_distance) {
-            stored_distance = candidate_distance;
-            open_cells.emplace(
-              candidate_distance, neighbor_row, neighbor_col);
-          }
-        }
-      }
-    }
-
-    return distance_grid;
+    }}
+    const auto costs=grid_visualizer_pkg::recovery_distances(frame,sources,config_.potential_descent_epsilon);
+    cv::Mat result(frame.rows,frame.cols,CV_64F);
+    std::copy(costs.begin(),costs.end(),result.ptr<double>());
+    return result;
   }
 
   bool find_local_recovery_direction(
@@ -958,6 +942,21 @@ private:
 
     if (!has_drone || !drone_pose) {
       return;
+    }
+
+    if (!startup_heading_initialized_) {
+      if (total_drones_>1) {
+        std::vector<grid_visualizer_pkg::SearchPoint> initial_peers;
+        for (int i=0;i<total_drones_;++i) {
+          if(i==drone_index_) {continue;}
+          if(!peer_drone_poses[i]) {return;}
+          initial_peers.push_back({peer_drone_poses[i]->position.x,peer_drone_poses[i]->position.y});
+        }
+        startup_direction_=grid_visualizer_pkg::separation_direction(
+          {drone_pose->position.x,drone_pose->position.y},initial_peers,drone_index_,total_drones_);
+        startup_heading_pending_=true;
+      }
+      startup_heading_initialized_=true;
     }
 
     const cv::Point2f grid_center(
@@ -1072,11 +1071,11 @@ private:
             std::isfinite(global_push_point.x) &&
             std::isfinite(global_push_point.y))
           {
-            current_push_objectives.push_back(
-              PushObjective{
-                global_push_point,
-                static_cast<double>(goal_distance),
-                0.0});
+            PushObjective objective;
+            objective.global_point=global_push_point;
+            objective.cow_goal_distance=goal_distance;
+            objective.cow_identity={cow_x,cow_y};
+            current_push_objectives.push_back(objective);
           }
         }
       }
@@ -1269,11 +1268,23 @@ private:
       [&](const auto& failure) {return grid_visualizer_pkg::distance(p,failure.first)<config_.cell_size;});};
     // Keep local obstacle/field updates at 5 Hz; global destination selection is
     // much more expensive and only needs to run at the observation cadence.
-    if (has_own_observation_ && (!search_plan_initialized_ || sim_now < last_search_plan_ ||
+    if (has_own_observation_ && (latest_search_views_.empty() || !search_plan_initialized_ || sim_now < last_search_plan_ ||
       sim_now-last_search_plan_ >= search_planning_period_)) {
-      latest_search_views_ = coverage_->views(
+      if (latest_search_views_.empty() || blocked(latest_search_views_.front().position) ||
+        retired(latest_search_views_.front().position) || coverage_->patch_remaining(
+          latest_search_views_.front().look_at,search_near_,search_far_,search_fov_)==0) {
+        latest_search_views_ = coverage_->views(
         {grid_center.x, grid_center.y}, peers, blocked, search_near_, search_far_, search_fov_,
-        12, retired, config_.search_border_first);
+        1, retired, config_.search_border_first,
+        first_search_selected_ ? nullptr : &startup_direction_);
+        if(!latest_search_views_.empty()) {
+          first_search_selected_=true;
+          const auto& view=latest_search_views_.front();
+          RCLCPP_INFO(get_logger(),
+            "search viewpoint: patch=(%.2f,%.2f) attraction=(%.2f,%.2f) from=(%.2f,%.2f)",
+            view.look_at.x,view.look_at.y,view.position.x,view.position.y,grid_center.x,grid_center.y);
+        }
+      }
       last_search_plan_ = sim_now;
       search_plan_initialized_ = true;
     }
@@ -1282,15 +1293,15 @@ private:
     // destinations immediately, without waiting for the next global plan.
     search_views.erase(std::remove_if(search_views.begin(), search_views.end(),
       [&](const auto& view) {
-        return blocked(view.position) || retired(view.position) || coverage_->gain(
-          view.position, std::atan2(view.look_at.y-view.position.y,view.look_at.x-view.position.x),
-          search_near_,search_far_,search_fov_,view.max_border_depth)==0;
+        return blocked(view.position) || retired(view.position) || coverage_->patch_remaining(view.look_at,search_near_,search_far_,search_fov_)==0;
       }), search_views.end());
     active_search_max_depth_ = search_views.empty() ? std::numeric_limits<double>::infinity() :
       search_views.front().max_border_depth;
-    const auto weights = balance_.update(now().seconds(), coverage_->count(), cow_locations,
-      {config_.goal_position.x, config_.goal_position.y}, !search_views.empty(), !current_push_objectives.empty());
-    search_weight_ = weights.first; herd_weight_ = weights.second;
+    // Fixed configured split; unused attraction budget goes to the available task.
+    const bool searching = !search_views.empty();
+    const bool herding = !current_push_objectives.empty();
+    search_weight_ = searching ? (herding ? config_.search_attraction_percent/100.0 : 1.0) : 0.0;
+    herd_weight_ = herding ? (searching ? config_.cow_attraction_percent/100.0 : 1.0) : 0.0;
     double search_sum = 0, herd_sum = 0;
     for (const auto& view : search_views) {search_sum += view.score;}
     for (const auto& objective : current_push_objectives) {
@@ -1322,7 +1333,10 @@ private:
     // Project each global destination into the current local window without
     // modifying the cow map or the real global push destination. This temporary
     // edge objective is regenerated when the drone searches somewhere else.
+    std::vector<grid_visualizer_pkg::RecoveryTarget> recovery_targets;
     for (const auto& push_objective : active_push_objectives) {
+      // A disabled attraction group must not seed recovery or a phantom objective.
+      if(push_objective.strength<=0) {continue;}
       cv::Point2f clipped_push_point;
       if (!clip_target_to_valid_region(
           grid_center,
@@ -1378,6 +1392,16 @@ private:
         config_.objective_priority_fallback_bias*(1-std::min(1.0,
           absorption.at<double>(objective_row, objective_col)/budget));
       objective_mask.at<uchar>(objective_row, objective_col) = 1;
+      grid_visualizer_pkg::RecoveryTarget target;
+      target.position={push_objective.global_point.x,push_objective.global_point.y};
+      target.identity={push_objective.cow_identity.x,push_objective.cow_identity.y};
+      target.search=push_objective.is_search;
+      target.patch_id=target.search ? coverage_->index(
+        {push_objective.look_at.x,push_objective.look_at.y}) : -1;
+      target.cell=objective_row*config_.grid_size+objective_col;
+      target.strength=push_objective.strength;
+      target.source_cost=config_.objective_priority_fallback_bias*(1-std::min(1.0,target.strength));
+      recovery_targets.push_back(target);
     }
 
     const bool has_push_objective =
@@ -1609,6 +1633,7 @@ private:
       has_primary_push_objective_ = has_current_primary_push_objective;
       if (has_current_primary_push_objective) {latest_primary_push_objective_ = current_primary_push_objective;}
       latest_effective_goal_radius_ = effective_goal_radius;
+      latest_recovery_targets_ = std::move(recovery_targets);
       latest_vector_grid_ = vector_grid;
       latest_cell_grid_ = grid;
       latest_is_fixed_grid_ = is_fixed.clone();
@@ -1673,6 +1698,23 @@ private:
     cv::resize(coverage_cells_, scaled_cells, plot.size(), 0, 0, cv::INTER_NEAREST);
     scaled_cells.copyTo(image(plot));
     cv::rectangle(image, plot, cv::Scalar(80, 80, 80), 1);
+    if (!latest_search_views_.empty()) {
+      const auto& view=latest_search_views_.front();
+      auto pixel=[&](double x,double y) {
+        return cv::Point(plot.x+cvRound((x-global_map_min_x_)/global_map_width_*(width-1)),
+          plot.y+cvRound((global_map_max_y_-y)/global_map_height_*(height-1)));
+      };
+      const int step=coverage_->patch_step(search_near_,search_far_,search_fov_);
+      const int id=coverage_->index(view.look_at);
+      if(id>=0) {
+        const int row=(id/coverage_->cols()/step)*step,col=(id%coverage_->cols()/step)*step;
+        const double x=global_map_min_x_+col*config_.cell_size;
+        const double y=global_map_min_y_+row*config_.cell_size;
+        cv::rectangle(image,pixel(x,y),pixel(std::min(global_map_max_x_,x+step*config_.cell_size),
+          std::min(global_map_max_y_,y+step*config_.cell_size)),cv::Scalar(255,120,0),2);
+        cv::circle(image,pixel(view.position.x,view.position.y),3,cv::Scalar(255,120,0),cv::FILLED);
+      }
+    }
     // These are detector/tracker positions, not Gazebo ground-truth cows.
     geometry_msgs::msg::PoseArray::SharedPtr detected_cows;
     {
@@ -2026,6 +2068,30 @@ private:
       1,
       cv::LINE_AA);
 
+    auto pixel=[&](double x,double y) {
+        return cv::Point(cvRound((x-grid_center.x+config_.map_half_width)/(2*config_.map_half_width)*CANVAS_SIZE),
+          cvRound((config_.map_half_width-y+grid_center.y)/(2*config_.map_half_width)*CANVAS_SIZE));
+      };
+    const auto phase=distance_recovery_.phase();
+    const char* label=phase==grid_visualizer_pkg::RecoveryPhase::recovering ? "RECOVERY" :
+      (phase==grid_visualizer_pkg::RecoveryPhase::watching ? "HANDOFF WATCH" : "RELAXATION");
+    const auto& target=distance_recovery_.target();
+    const cv::Scalar command_color(180,0,180);
+    if(cv::norm(commanded_movement_)>1e-6) {
+      cv::arrowedLine(vector_img,pixel(command_origin_.x,command_origin_.y),
+        pixel(command_origin_.x+commanded_movement_.x,command_origin_.y+commanded_movement_.y),
+        command_color,3,cv::LINE_AA,0,0.4);
+    }
+    if(target) {
+      cv::Point2f displayed;
+      if(clip_target_to_valid_region(grid_center,
+          {static_cast<float>(target->position.x),static_cast<float>(target->position.y)},displayed)) {
+        cv::circle(vector_img,pixel(displayed.x,displayed.y),8,command_color,2,cv::LINE_AA);
+      }
+    }
+    cv::putText(vector_img,cv::format("%s%s | magenta: command / retained target",label,
+        target ? (target->search ? " SEARCH" : " COW") : ""),
+      cv::Point(8,CANVAS_SIZE-10),cv::FONT_HERSHEY_SIMPLEX,0.40,command_color,1,cv::LINE_AA);
     cv::imshow(vector_window_name_, vector_img);
     cv::waitKey(1);
   }
@@ -2040,26 +2106,24 @@ private:
     geometry_msgs::msg::Pose::SharedPtr drone_pose;
     geometry_msgs::msg::PoseArray::SharedPtr cows;
     std::vector<std::vector<cv::Point2f>> vector_grid;
-    std::vector<std::vector<CellState>> cell_grid;
     cv::Mat is_fixed_grid;
+    std::vector<grid_visualizer_pkg::RecoveryTarget> recovery_targets;
     cv::Point2f grid_center;
     bool has_drone = false;
     bool has_grid = false;
     bool has_no_objectives = false;
-    double effective_goal_radius = config_.final_goal_reached_radius;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
       drone_pose = latest_drone_pose_;
       cows = latest_cows_;
       vector_grid = latest_vector_grid_;
-      cell_grid = latest_cell_grid_;
       is_fixed_grid = latest_is_fixed_grid_.clone();
+      recovery_targets = latest_recovery_targets_;
       grid_center = latest_grid_center_;
       has_drone = received_drone_;
       has_grid = has_vector_grid_;
       has_no_objectives = has_no_objectives_;
-      effective_goal_radius = latest_effective_goal_radius_;
     }
 
     if (!has_drone || !drone_pose) {
@@ -2069,131 +2133,145 @@ private:
     double drone_x = drone_pose->position.x;
     double drone_y = drone_pose->position.y;
 
-    // Hold explicitly until there is a valid current search/pushing field.
-    if (has_no_objectives || !has_grid) {
-      geometry_msgs::msg::Pose hold_msg = *drone_pose;
-      goto_pub_->publish(hold_msg);
-    } else if (
-      has_grid &&
-      vector_grid.size() ==
-        static_cast<std::size_t>(config_.grid_size) &&
-      vector_grid[config_.grid_center_row].size() ==
-        static_cast<std::size_t>(config_.grid_size))
-    {
-      const int drone_row = config_.grid_center_row;
-      const int drone_col = config_.grid_center_col;
-      cv::Point2f vector = vector_grid[drone_row][drone_col];
-      float magnitude = std::hypot(vector.x, vector.y);
-
-      const double bounded_x =
-        std::clamp(drone_x, global_map_min_x_, global_map_max_x_);
-      const double bounded_y =
-        std::clamp(drone_y, global_map_min_y_, global_map_max_y_);
-      const cv::Point2f boundary_recovery(
-        static_cast<float>(bounded_x - drone_x),
-        static_cast<float>(bounded_y - drone_y));
-      const float boundary_recovery_magnitude =
-        std::hypot(boundary_recovery.x, boundary_recovery.y);
-      if (boundary_recovery_magnitude > 1.0e-6f) {
-        vector = boundary_recovery / boundary_recovery_magnitude;
-        magnitude = 1.0f;
+    if (!startup_heading_initialized_) {goto_pub_->publish(*drone_pose);return;}
+    if (startup_heading_pending_) {
+      double yaw=std::atan2(2*(drone_pose->orientation.w*drone_pose->orientation.z+
+        drone_pose->orientation.x*drone_pose->orientation.y),
+        1-2*(drone_pose->orientation.y*drone_pose->orientation.y+
+          drone_pose->orientation.z*drone_pose->orientation.z));
+      double desired=std::atan2(startup_direction_.y,startup_direction_.x);
+      if(std::abs(grid_visualizer_pkg::angle_difference(desired,yaw))>0.15) {
+        geometry_msgs::msg::Pose focus=*drone_pose;
+        focus.position.x+=10*startup_direction_.x;focus.position.y+=10*startup_direction_.y;
+        focusin_pub_->publish(focus);goto_pub_->publish(*drone_pose);return;
       }
+      startup_heading_pending_=false;
+    }
 
-      const bool is_push_objective =
-        !cell_grid.empty() &&
-        (cell_grid[drone_row][drone_col] == PUSH_OBJECTIVE ||
-          cell_grid[drone_row][drone_col] == SEARCH_OBJECTIVE);
+    // Pose and all field data above belong to one locked snapshot. The drone
+    // may have moved away from that snapshot's geometric center in the meantime.
+    const auto frame=recovery_grid(is_fixed_grid,grid_center);
+    const grid_visualizer_pkg::RecoveryPoint position{drone_x,drone_y};
+    const int index=frame.valid() ? frame.index(position) : -1;
+    const bool safe_cell=index>=0 && frame.free(index/frame.cols,index%frame.cols);
+    cv::Point2f normal(0,0);
+    if(safe_cell && vector_grid.size()==static_cast<std::size_t>(frame.rows) &&
+      vector_grid[index/frame.cols].size()==static_cast<std::size_t>(frame.cols)) {
+      normal=vector_grid[index/frame.cols][index%frame.cols];
+    }
+    const double normal_length=std::hypot(normal.x,normal.y);
+    if(!std::isfinite(normal_length) || (normal_length>0.5 &&
+      !grid_visualizer_pkg::recovery_segment_free(frame,position,
+        {drone_x+normal.x*config_.max_goto_movement/normal_length,
+          drone_y+normal.y*config_.max_goto_movement/normal_length}))) {normal={0,0};}
+    // Only search viewpoints intentionally hold for an observation. Reaching
+    // a cow-pushing waypoint does not complete herding: the field must keep
+    // controlling motion, and a non-moving cow approach must remain stall-eligible.
+    const bool intentional_search_hold=std::any_of(recovery_targets.begin(),recovery_targets.end(),
+      [&](const auto& target) {
+        return target.search && grid_visualizer_pkg::recovery_distance(position,target.position)<=config_.recovery.arrival_m;
+      });
+    const double sim_now=now().seconds();
+    const bool stalled=stall_recovery_.update(sim_now,drone_x,drone_y,
+      !has_no_objectives && !intentional_search_hold &&
+      distance_recovery_.phase()!=grid_visualizer_pkg::RecoveryPhase::recovering,
+      config_.stall_window_s,config_.stall_motion_m);
+    grid_visualizer_pkg::RecoveryResult recovery;
+    if(has_no_objectives || !config_.enable_geodesic_field_fallback) {
+      stall_recovery_.reset();distance_recovery_.reset();
+    } else {
+      const auto previous_target=distance_recovery_.target();
+      recovery=distance_recovery_.update(sim_now,position,frame,recovery_targets,
+        intentional_search_hold ? grid_visualizer_pkg::RecoveryPoint{0,0} :
+        grid_visualizer_pkg::RecoveryPoint{normal.x,normal.y},
+        has_grid,stalled || (!has_grid && !intentional_search_hold),config_.recovery);
+      for(auto event:recovery.events) {
+        const bool previous=event==grid_visualizer_pkg::RecoveryEvent::invalidated ||
+          event==grid_visualizer_pkg::RecoveryEvent::arrived ||
+          event==grid_visualizer_pkg::RecoveryEvent::watch_ended ||
+          event==grid_visualizer_pkg::RecoveryEvent::clock_reset;
+        const auto& target=previous ? previous_target : distance_recovery_.target();
+        const char* trigger=recovery.reason ? recovery.reason :
+          (stalled ? "stall" : (!has_grid ? "invalid_field" : "progress"));
+        RCLCPP_INFO(get_logger(),
+          "distance recovery: event=%s trigger=%s target=%s(%.2f,%.2f) direction_available=%d",
+          grid_visualizer_pkg::recovery_event_name(event),trigger,
+          target ? (target->search ? "search" : "cow") : "none",
+          target ? target->position.x : 0.0,target ? target->position.y : 0.0,recovery.has_step);
+        if(event==grid_visualizer_pkg::RecoveryEvent::arrived ||
+          event==grid_visualizer_pkg::RecoveryEvent::handed_off) {stall_recovery_.reset();}
+      }
+    }
 
-      if (magnitude <= 0.5f && !is_push_objective) {
-        cv::Point2f recovery_direction;
-        if (
-          !is_fixed_grid.empty() &&
-          find_local_recovery_direction(
-            drone_x,
-            drone_y,
-            drone_row,
-            drone_col,
-            vector_grid,
-            is_fixed_grid,
-            grid_center,
-            recovery_direction))
-        {
-          vector = recovery_direction;
-          magnitude = 1.0f;
+    cv::Point2f movement(0,0);
+    const double bounded_x=std::clamp(drone_x,global_map_min_x_,global_map_max_x_);
+    const double bounded_y=std::clamp(drone_y,global_map_min_y_,global_map_max_y_);
+    const cv::Point2f boundary_recovery(bounded_x-drone_x,bounded_y-drone_y);
+    const double boundary_distance=cv::norm(boundary_recovery);
+    if(boundary_distance>1e-6 && !has_no_objectives) {
+      movement=boundary_recovery*static_cast<float>(std::min(1.0,config_.max_goto_movement/boundary_distance));
+    } else if(!has_no_objectives && safe_cell) {
+      if(recovery.active) {
+        if(recovery.has_step) {movement={static_cast<float>(recovery.movement.x),static_cast<float>(recovery.movement.y)};}
+        RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
+          "distance recovery: active=1 direction_available=%d",recovery.has_step);
+      } else if(has_grid && !intentional_search_hold) {
+        float magnitude=std::hypot(normal.x,normal.y);
+        // Preserve the ordinary low-gradient behavior outside retained recovery.
+        if(magnitude<=0.5f && find_local_recovery_direction(drone_x,drone_y,
+            index/frame.cols,index%frame.cols,vector_grid,is_fixed_grid,grid_center,normal)) {
+          magnitude=1;
         }
-      }
-
-      cv::Point2f movement(0.0f, 0.0f);
-      if (magnitude > 0.5f) {
-        movement = cv::Point2f(
-          (vector.x / magnitude) *
-            static_cast<float>(config_.max_goto_movement),
-          (vector.y / magnitude) *
-            static_cast<float>(config_.max_goto_movement));
-      } else if (!is_push_objective) {
-        // Explicitly replace stale waypoints when local recovery fails.
-        movement = cv::Point2f(0,0);
-      }
-
-      {
-        geometry_msgs::msg::Pose goto_msg;
-        goto_msg.position.x = std::clamp(
-          drone_x + movement.x,
-          global_map_min_x_,
-          global_map_max_x_);
-        goto_msg.position.y = std::clamp(
-          drone_y + movement.y,
-          global_map_min_y_,
-          global_map_max_y_);
-        goto_msg.position.z = drone_pose->position.z;
-        goto_msg.orientation = drone_pose->orientation;
-        goto_pub_->publish(goto_msg);
+        if(magnitude>0.5f) {movement=normal*static_cast<float>(config_.max_goto_movement/magnitude);}
       }
     }
-
-    // Score headings for simultaneous observation benefits, rather than averaging bearings.
-    double yaw = std::atan2(2*(drone_pose->orientation.w*drone_pose->orientation.z+
-      drone_pose->orientation.x*drone_pose->orientation.y),
-      1-2*(drone_pose->orientation.y*drone_pose->orientation.y+drone_pose->orientation.z*drone_pose->orientation.z));
-    std::vector<double> headings{yaw};
-    for (int k=0; k<24; ++k) {headings.push_back(yaw+k*std::acos(-1.0)/12);}
-    for (const auto& view : latest_search_views_) {
-      headings.push_back(std::atan2(view.look_at.y-drone_y,view.look_at.x-drone_x));
+    if(boundary_distance<=1e-6 && !grid_visualizer_pkg::recovery_segment_free(frame,position,
+        {drone_x+movement.x,drone_y+movement.y})) {movement={0,0};}
+    geometry_msgs::msg::Pose goto_msg=*drone_pose;
+    goto_msg.position.x=std::clamp(drone_x+movement.x,global_map_min_x_,global_map_max_x_);
+    goto_msg.position.y=std::clamp(drone_y+movement.y,global_map_min_y_,global_map_max_y_);
+    // Never let the final boundary clamp turn a hold into an unbounded jump.
+    if(boundary_distance>1e-6) {
+      goto_msg.position.x=drone_x+movement.x;goto_msg.position.y=drone_y+movement.y;
     }
-    std::vector<grid_visualizer_pkg::SearchPoint> active_cows;
-    if (cows) {for (const auto& cow : cows->poses) {
-      if (std::hypot(cow.position.x-config_.goal_position.x,cow.position.y-config_.goal_position.y)>effective_goal_radius) {
-        active_cows.push_back({cow.position.x,cow.position.y});
-        headings.push_back(std::atan2(cow.position.y-drone_y,cow.position.x-drone_x));
-      }
+    command_origin_={static_cast<float>(drone_x),static_cast<float>(drone_y)};
+    commanded_movement_={static_cast<float>(goto_msg.position.x-drone_x),static_cast<float>(goto_msg.position.y-drone_y)};
+    goto_pub_->publish(goto_msg);
+
+    // Camera priority is independent of navigation's 60/40 attraction split.
+    // Compare the actual search attraction with the eligible local cow center.
+    // Search attention looks at the patch, not the navigation viewpoint.
+    double center_x=0,center_y=0;
+    std::size_t local_cows=0;
+    if(cows) {for(const auto& cow:cows->poses) {
+      const double x=cow.position.x,y=cow.position.y;
+      if(!std::isfinite(x) || !std::isfinite(y) || !is_inside_global_map(x,y)) {continue;}
+      if(std::abs(x-drone_x)>config_.map_half_width ||
+        std::abs(y-drone_y)>config_.map_half_width) {continue;}
+      if(std::hypot(x-config_.goal_position.x,y-config_.goal_position.y)<=
+        config_.final_goal_reached_radius) {continue;}
+      center_x+=x;center_y+=y;++local_cows;
     }}
-    double max_gain=1;
-    std::vector<double> heading_gains;
-    heading_gains.reserve(headings.size());
-    for (double h : headings) {
-      double gain = search_weight_ > 0 ? coverage_->gain(
-        {drone_x,drone_y},h,search_near_,search_far_,search_fov_,active_search_max_depth_) : 0;
-      heading_gains.push_back(gain);
-      max_gain=std::max(max_gain,gain);
+    geometry_msgs::msg::Pose focus=*drone_pose;
+    const bool search_closer=!latest_search_views_.empty() &&
+      (local_cows==0 || std::hypot(latest_search_views_.front().position.x-drone_x,
+          latest_search_views_.front().position.y-drone_y)<
+        std::hypot(center_x/local_cows-drone_x,center_y/local_cows-drone_y));
+    if(search_closer) {
+      focus.position.x=latest_search_views_.front().look_at.x;
+      focus.position.y=latest_search_views_.front().look_at.y;
+    } else if(local_cows>0) {
+      focus.position.x=center_x/local_cows;
+      focus.position.y=center_y/local_cows;
+    } else {
+      // Preserve heading when neither a local cow nor a search patch exists.
+      const double yaw=std::atan2(2*(drone_pose->orientation.w*drone_pose->orientation.z+
+        drone_pose->orientation.x*drone_pose->orientation.y),
+        1-2*(drone_pose->orientation.y*drone_pose->orientation.y+
+          drone_pose->orientation.z*drone_pose->orientation.z));
+      focus.position.x=drone_x+10*std::cos(yaw);
+      focus.position.y=drone_y+10*std::sin(yaw);
     }
-    double best_heading=yaw, best_score=-1e9;
-    for (std::size_t heading_index=0; heading_index<headings.size(); ++heading_index) {
-      double h=headings[heading_index];
-      double visible=0;
-      for (auto cow : active_cows) {
-        if (grid_visualizer_pkg::distance({drone_x,drone_y},cow)<=search_far_ &&
-          std::abs(grid_visualizer_pkg::angle_difference(std::atan2(cow.y-drone_y,cow.x-drone_x),h))<=search_fov_/2) {++visible;}
-      }
-      double score=search_weight_*heading_gains[heading_index]/max_gain+
-        herd_weight_*visible/std::max(std::size_t(1),active_cows.size())-
-        0.05*std::abs(grid_visualizer_pkg::angle_difference(h,yaw))/std::acos(-1.0);
-      if (score>best_score+1e-8) {best_score=score; best_heading=h;}
-    }
-    geometry_msgs::msg::Pose focus;
-    focus.position.x=drone_x+10*std::cos(best_heading);
-    focus.position.y=drone_y+10*std::sin(best_heading);
-    focus.position.z=drone_pose->position.z;
-    if (has_no_objectives) {focus.position.x=config_.goal_position.x; focus.position.y=config_.goal_position.y;}
     focusin_pub_->publish(focus);
   }
 
@@ -2212,7 +2290,6 @@ private:
   GridConfig config_;
   std::unique_ptr<grid_visualizer_pkg::GoalQuietZone> goal_quiet_zone_;
   std::unique_ptr<grid_visualizer_pkg::SearchCoverage> coverage_;
-  grid_visualizer_pkg::SearchBalance balance_;
   std::vector<grid_visualizer_pkg::SearchView> latest_search_views_;
   std::vector<std::pair<grid_visualizer_pkg::SearchPoint,double>> failed_views_;
   std::map<int,int> failed_observations_;
@@ -2221,7 +2298,15 @@ private:
   double search_near_{2},search_far_{10},search_fov_{2.09};
   double search_planning_period_{1},last_search_plan_{0};
   bool search_plan_initialized_{false};
+  std::vector<grid_visualizer_pkg::RecoveryTarget> latest_recovery_targets_;
+  grid_visualizer_pkg::StallRecovery stall_recovery_;
+  grid_visualizer_pkg::DistanceRecovery distance_recovery_;
+  cv::Point2f commanded_movement_{0,0};
+  cv::Point2f command_origin_{0,0};
   double search_weight_{0},herd_weight_{0};
+  bool startup_heading_initialized_{false},startup_heading_pending_{false},first_search_selected_{false};
+  grid_visualizer_pkg::SearchPoint startup_direction_{0,0};
+  std::map<int,std::size_t> patch_previous_remaining_;
   double active_search_max_depth_{std::numeric_limits<double>::infinity()};
   bool stopped_{false};
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;

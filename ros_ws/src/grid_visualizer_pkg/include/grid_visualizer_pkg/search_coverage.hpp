@@ -18,6 +18,23 @@ struct SearchPoint {double x; double y;};
 inline double distance(SearchPoint a, SearchPoint b) {return std::hypot(a.x-b.x, a.y-b.y);}
 inline double angle_difference(double a, double b) {return std::atan2(std::sin(a-b), std::cos(a-b));}
 
+// Startup heading is opposite the peers' centroid. Coincident drones use
+// deterministic equally spaced directions rather than an undefined vector.
+inline SearchPoint separation_direction(SearchPoint origin,const std::vector<SearchPoint>& peers,
+  int drone_index,int total_drones)
+{
+  if(peers.empty()) {return {0,0};}
+  SearchPoint center{0,0};
+  for(auto p:peers) {center.x+=p.x;center.y+=p.y;}
+  double dx=origin.x-center.x/peers.size(),dy=origin.y-center.y/peers.size();
+  double d=std::hypot(dx,dy);
+  if(d<1e-6) {
+    double angle=2*std::acos(-1.0)*drone_index/total_drones;
+    return {std::cos(angle),std::sin(angle)};
+  }
+  return {dx/d,dy/d};
+}
+
 struct SearchView
 {
   SearchPoint position;
@@ -126,13 +143,55 @@ public:
     return result;
   }
 
+  int patch_step(double near,double far,double fov) const
+  {
+    ObservationBox box(near,far,fov);
+    int step=static_cast<int>(std::floor(std::min({2.0,box.back-box.front-1,
+      2*box.half_width-1})/cell_));
+    if (step<1) {throw std::invalid_argument("Camera cannot contain a search cell with margin");}
+    return step;
+  }
+
+  std::size_t patch_remaining(SearchPoint center,double near,double far,double fov) const
+  {
+    int i=index(center), step=patch_step(near,far,fov);
+    if (i<0) {return 0;}
+    int r=(i/cols_/step)*step,c=(i%cols_/step)*step;
+    std::size_t count=0;
+    for(int y=r;y<std::min(rows_,r+step);++y) {
+      for(int x=c;x<std::min(cols_,c+step);++x) {count+=!seen_[y*cols_+x];}
+    }
+    return count;
+  }
+
+  std::size_t patch_gain(SearchPoint center,SearchPoint camera,double yaw,
+    double near,double far,double fov) const
+  {
+    int i=index(center),step=patch_step(near,far,fov);
+    if(i<0) {return 0;}
+    int r=(i/cols_/step)*step,c=(i%cols_/step)*step;
+    ObservationBox box(near,far,fov);
+    std::size_t count=0;
+    for(int y=r;y<std::min(rows_,r+step);++y) {
+      for(int x=c;x<std::min(cols_,c+step);++x) {
+        if(seen_[y*cols_+x]) {continue;}
+        auto q=point(y*cols_+x);
+        double dx=q.x-camera.x,dy=q.y-camera.y;
+        double f=dx*std::cos(yaw)+dy*std::sin(yaw);
+        double l=-dx*std::sin(yaw)+dy*std::cos(yaw);
+        if(f>=box.front-1e-9 && f<=box.back+1e-9 && std::abs(l)<=box.half_width+1e-9) {++count;}
+      }
+    }
+    return count;
+  }
+
   std::vector<SearchView> views(
     SearchPoint drone, const std::vector<SearchPoint>& peers,
     const std::function<bool(SearchPoint)>& blocked,
     double near, double far, double fov, int max_views=12,
-    const std::function<bool(SearchPoint)>& retired={}, bool border_first=false) const
+    const std::function<bool(SearchPoint)>& retired={}, bool border_first=false, const SearchPoint* preferred_direction=nullptr) const
   {
-    if (count_==seen_.size() || max_views<=0 || (!border_first && count_==0)) {return {};}
+    if (count_==seen_.size() || max_views<=0) {return {};}
     // One global wavefront per planning update; disallow diagonal corner cutting.
     std::vector<uint8_t> free(seen_.size());
     for (int i=0; i<static_cast<int>(free.size()); ++i) {free[i]=!blocked(point(i));}
@@ -153,78 +212,81 @@ public:
         if (next<costs[j]) {costs[j]=next; queue.emplace(next,j);}
       });
     }
-    struct Patch {int band; std::vector<int> cells;};
-    std::vector<Patch> patches;
-    // Camera-range tiles break a whole border ring into useful local targets.
-    // Bands are half a camera range deep and are reconsidered every cycle.
-    const double band_width=far/2;
-    if (border_first) {
-      std::map<std::tuple<int,int,int>,std::vector<int>> tiles;
-      for (int i=0; i<static_cast<int>(seen_.size()); ++i) {
-        auto p=point(i);
-        double depth=border_depth(p);
-        if (seen_[i] || depth<0) {continue;}
-        int band=static_cast<int>(std::floor(depth/band_width));
-        int tile_row=static_cast<int>(std::floor((p.y-min_y_)/far));
-        int tile_col=static_cast<int>(std::floor((p.x-min_x_)/far));
-        tiles[{band,tile_row,tile_col}].push_back(i);
-      }
-      for (auto& entry:tiles) {
-        patches.push_back({std::get<0>(entry.first),std::move(entry.second)});
-      }
-    } else {
-      std::vector<uint8_t> frontier(seen_.size(),0), visited(seen_.size(),0);
-      for (int i=0; i<static_cast<int>(seen_.size()); ++i) {
-        if (seen_[i]) {continue;}
-        neighbors(i,[&](int j,int,int) {if (seen_[j]) {frontier[i]=1;}});
-      }
-      for (int i=0; i<static_cast<int>(frontier.size()); ++i) {
-        if (!frontier[i] || visited[i]) {continue;}
-        std::vector<int> cluster{i}; visited[i]=1;
-        for (std::size_t k=0; k<cluster.size(); ++k) {
-          neighbors(cluster[k],[&](int j,int,int) {
-            if (frontier[j] && !visited[j]) {visited[j]=1; cluster.push_back(j);}
-          });
-        }
-        patches.push_back({-1,std::move(cluster)});
-      }
+    // Cache the fixed patch bounds, not a border-facing camera position.
+    // A viewpoint is chosen from this drone's approach side at selection time;
+    // the node then retains it until the patch is covered or invalidated.
+    if (patches_.empty() || camera_near_!=near || camera_far_!=far || camera_fov_!=fov) {
+      std::vector<Patch> patches;
+      const int step=patch_step(near,far,fov);
+      for(int r=0;r<rows_;r+=step) {for(int c=0;c<cols_;c+=step) {
+        const double left=min_x_+c*cell_,right=std::min(max_x_,min_x_+(c+step)*cell_);
+        const double bottom=min_y_+r*cell_,top=std::min(max_y_,min_y_+(r+step)*cell_);
+        patches.push_back({{(left+right)/2,(bottom+top)/2},(right-left)/2,(top-bottom)/2});
+      }}
+      patches_=std::move(patches);camera_near_=near;camera_far_=far;camera_fov_=fov;
     }
+    const ObservationBox box(near,far,fov);
+    const double offset=(box.front+box.back)/2;
     std::vector<SearchView> result;
-    int selected_band=-1;
-    for (const auto& patch:patches) {
-      // Try a deeper band only if no reachable positive-gain outer view exists.
-      if (border_first && selected_band>=0 && patch.band!=selected_band) {break;}
-      const auto& cluster=patch.cells;
-      const double max_depth=border_first ? (patch.band+1)*band_width:inf;
-      SearchPoint center{0,0};
-      for (int current:cluster) {
-        auto p=point(current); center.x+=p.x; center.y+=p.y;
+    int best_band=std::numeric_limits<int>::max();
+    for(const auto& patch:patches_) {
+      const auto target=patch.center;
+      if(!patch_remaining(target,near,far,fov)) {continue;}
+      const int band=border_first ? static_cast<int>(border_depth(target)/(far/2)):0;
+      if(band>best_band) {continue;}
+      const double bearing=std::atan2(target.y-drone.y,target.x-drone.x);
+      const double pi=std::acos(-1.0);
+      SearchPoint view{};
+      int j=-1;
+      auto choose_view=[&](double heading) {
+        const double cosine=std::cos(heading),sine=std::sin(heading);
+        SearchPoint candidate{target.x-offset*cosine,target.y-offset*sine};
+        const int candidate_index=index(candidate);
+        if(candidate_index<0 || blocked(candidate) || (retired && retired(candidate)) ||
+          !std::isfinite(costs[candidate_index])) {return false;}
+        // Verify all four physical patch corners with the same 0.5 m margin
+        // used to size the patches. Rotation must not leave an unseen sliver.
+        for(double dx:{-patch.half_width,patch.half_width}) {
+          for(double dy:{-patch.half_height,patch.half_height}) {
+            const double forward=offset+dx*cosine+dy*sine;
+            const double lateral=-dx*sine+dy*cosine;
+            if(forward<box.front+0.5-1e-9 || forward>box.back-0.5+1e-9 ||
+              std::abs(lateral)>box.half_width-0.5+1e-9) {return false;}
+          }
+        }
+        view=candidate;j=candidate_index;return true;
+      };
+      // The common case needs one candidate, without allocating/sorting angles.
+      // Only a blocked or invalid approach ray needs angular alternatives.
+      if(!choose_view(bearing)) {
+        std::vector<double> headings;
+        for(int k=1;k<8;++k) {
+          headings.push_back(bearing+k*pi/8);headings.push_back(bearing-k*pi/8);
+        }
+        headings.push_back(bearing+pi);
+        // Cardinal candidates preserve views for very narrow footprints.
+        for(int k=0;k<4;++k) {headings.push_back(k*pi/2);}
+        std::stable_sort(headings.begin(),headings.end(),[&](double a,double b) {
+          return std::abs(angle_difference(a,bearing))<std::abs(angle_difference(b,bearing));
+        });
+        for(double heading:headings) {if(choose_view(heading)) {break;}}
       }
-      center.x/=cluster.size(); center.y/=cluster.size();
-      int representative=*std::min_element(cluster.begin(),cluster.end(),[&](int a,int b) {
-        return distance(point(a),center)<distance(point(b),center);
-      });
-      const auto target=point(representative);
-      SearchView best{{0,0},target,0,max_depth};
-      for (int k=0; k<8; ++k) {
-        double angle=k*std::acos(-1.0)/4;
-        SearchPoint view{target.x+5*std::cos(angle),target.y+5*std::sin(angle)};
-        int j=index(view);
-        if (j<0 || !free[j] || blocked(view) || (retired && retired(view)) || !std::isfinite(costs[j])) {continue;}
-        double yaw=std::atan2(target.y-view.y,target.x-view.x);
-        double novelty=gain(view,yaw,near,far,fov,max_depth);
-        double crowd=1;
-        for (auto peer:peers) {crowd+=std::max(0.0,1-distance(view,peer)/far);}
-        double score=novelty/(1+costs[j]/far)/crowd;
-        if (score>best.score) {best={view,target,score,max_depth};}
+      if(j<0) {continue;}
+      if(band<best_band) {result.clear();best_band=band;}
+      double crowd=1;
+      for(auto peer:peers) {crowd+=std::max(0.0,1-distance(view,peer)/far);}
+      double preference=1;
+      if(preferred_direction) {
+        double dx=target.x-drone.x,dy=target.y-drone.y,d=std::hypot(dx,dy);
+        if(d>0) {preference=std::exp(4*(dx*preferred_direction->x+dy*preferred_direction->y)/d);}
       }
-      if (best.score>0) {result.push_back(best); selected_band=patch.band;}
+      result.push_back({view,target,preference/((1+costs[j]/far)*crowd),
+        border_first ? (band+1)*far/2:inf});
     }
-    std::sort(result.begin(),result.end(),[](const SearchView& a,const SearchView& b) {
-      if (a.score!=b.score) {return a.score>b.score;}
-      return std::tie(a.position.x,a.position.y)<std::tie(b.position.x,b.position.y);
+    std::stable_sort(result.begin(),result.end(),[](const SearchView& a,const SearchView& b) {
+      return a.score>b.score;
     });
-    if (static_cast<int>(result.size())>max_views) {result.resize(max_views);}
+    if(static_cast<int>(result.size())>max_views) {result.resize(max_views);}
     return result;
   }
 
@@ -249,6 +311,9 @@ private:
   int cols_,rows_;
   std::vector<uint8_t> seen_;
   std::size_t count_{0};
+  struct Patch {SearchPoint center;double half_width,half_height;};
+  mutable std::vector<Patch> patches_;
+  mutable double camera_near_{-1},camera_far_{-1},camera_fov_{-1};
 };
 
 inline double absorbing_value(double neighbor_sum,double absorption)

@@ -39,15 +39,78 @@ int main()
   auto views=a.views({0,0},{},free,2,10,2.09);
   assert(!views.empty());
   for (auto v:views) {
-    assert(std::abs(distance(v.position,v.look_at)-5)<1e-8);
+    ObservationBox box(2,10,2.09);
+    assert(std::abs(distance(v.position,v.look_at)-(box.front+box.back)/2)<1e-8);
     assert(a.gain(v.position,std::atan2(v.look_at.y-v.position.y,v.look_at.x-v.position.x),2,10,2.09)>0);
   }
   auto alternative=a.views({0,0},{},free,2,10,2.09,12,
     [&](SearchPoint p) {return distance(p,views[0].position)<0.1;});
   assert(!alternative.empty() && distance(alternative[0].position,views[0].position)>0.1);
   SearchCoverage blank(-10,-10,20,20,0.5);
-  assert(blank.views({0,0},{},free,2,10,2.09).empty());
+  assert(!blank.views({0,0},{},free,2,10,2.09).empty());
   assert(a.views({0,0},{},[](SearchPoint) {return true;},2,10,2.09).empty());
+
+  // Leave one fixed patch unfinished. Its viewing side must follow the
+  // approach, including looking inward from the outer side of the field.
+  SearchCoverage approach(-30,-30,60,60,.5);
+  approach.observe({{-30,-30},{30,-30},{30,10},{-30,10}});
+  approach.observe({{-30,12},{30,12},{30,30},{-30,30}});
+  approach.observe({{-30,10},{10,10},{10,12},{-30,12}});
+  approach.observe({{12,10},{30,10},{30,12},{12,12}});
+  assert(approach.patch_remaining({11,11},2,10,2.09)==16);
+  auto observe_view=[](SearchCoverage & coverage,const SearchView & view,double fov) {
+    ObservationBox box(2,10,fov);
+    const double yaw=std::atan2(view.look_at.y-view.position.y,view.look_at.x-view.position.x);
+    std::vector<SearchPoint> polygon;
+    for(auto q:std::vector<SearchPoint>{{box.front,-box.half_width},{box.back,-box.half_width},
+        {box.back,box.half_width},{box.front,box.half_width}}) {
+      polygon.push_back({view.position.x+q.x*std::cos(yaw)-q.y*std::sin(yaw),
+        view.position.y+q.x*std::sin(yaw)+q.y*std::cos(yaw)});
+    }
+    coverage.observe(polygon);
+  };
+  for(auto origin:std::vector<SearchPoint>{{-15,11},{24,11},{11,24},{24,24}}) {
+    auto planned=approach.views(origin,{},free,2,10,2.09,1);
+    assert(planned.size()==1);
+    const auto& view=planned.front();
+    assert(distance(view.look_at,{11,11})<1e-9);
+    const double ax=view.position.x-origin.x,ay=view.position.y-origin.y;
+    const double bx=view.look_at.x-origin.x,by=view.look_at.y-origin.y;
+    assert(std::abs(ax*by-ay*bx)<1e-8); // Exactly on drone -> patch segment.
+    assert(ax*bx+ay*by>0 && distance(origin,view.position)<distance(origin,view.look_at));
+    auto observed=approach;
+    observe_view(observed,view,2.09);
+    assert(observed.patch_remaining(view.look_at,2,10,2.09)==0);
+    assert(observed.views(origin,{},free,2,10,2.09,1).empty());
+  }
+  auto east=approach.views({24,11},{},free,2,10,2.09,1).front();
+  auto west=approach.views({-15,11},{},free,2,10,2.09,1).front();
+  assert(east.position.x>11 && west.position.x<11);
+  auto obstructed=[&](SearchPoint p) {return distance(p,east.position)<.75;};
+  for(bool obstacle:{false,true}) {
+    auto alternate=approach.views({24,11},{},obstacle ? std::function<bool(SearchPoint)>(obstructed):free,
+      2,10,2.09,1,obstacle ? std::function<bool(SearchPoint)>{}:obstructed);
+    assert(alternate.size()==1 && distance(alternate.front().position,east.position)>.75);
+    assert(alternate.front().position.x>11); // Keep the same approach side if feasible.
+    auto observed=approach;
+    observe_view(observed,alternate.front(),2.09);
+    assert(observed.patch_remaining({11,11},2,10,2.09)==0);
+  }
+  // Too close to fit the whole patch: a finite step-back viewpoint is needed.
+  auto close=approach.views({11.1,11.1},{},free,2,10,2.09,1);
+  assert(close.size()==1);
+  auto close_observed=approach;
+  observe_view(close_observed,close.front(),2.09);
+  assert(close_observed.patch_remaining({11,11},2,10,2.09)==0);
+  // Narrow footprints may need a different angle to preserve the full patch.
+  SearchCoverage narrow(-10,-10,20,20,.5);
+  auto narrow_views=narrow.views({0,0},{},free,2,10,.4,12);
+  assert(!narrow_views.empty());
+  for(const auto& view:narrow_views) {
+    auto observed=narrow;
+    observe_view(observed,view,.4);
+    assert(observed.patch_remaining(view.look_at,2,10,.4)==0);
+  }
   // Boundary/corner observations can be made from inward viewpoints.
   SearchCoverage edge(0,0,20,20,0.5);
   edge.observe({{0,0},{4,0},{4,4},{0,4}});
@@ -87,6 +150,42 @@ int main()
   }
   outside_in.observe({{-50,-30},{50,-30},{50,30},{-50,30}});
   assert(outside_in.views({0,0},{},free,2,10,2.09,12,{},true).empty());
+
+  // A single correctly oriented observation covers the selected fixed patch.
+  SearchCoverage fixed(-50,-50,100,100,.5);
+  auto first=fixed.views({0,0},{},free,2,10,2.09,1,{},true).front();
+  const auto before=fixed.patch_remaining(first.look_at,2,10,2.09);
+  const double yaw=std::atan2(first.look_at.y-first.position.y,first.look_at.x-first.position.x);
+  assert(fixed.patch_gain(first.look_at,first.position,yaw,2,10,2.09)==before);
+  fixed.observe({{first.look_at.x-1,first.look_at.y-1},
+    {first.look_at.x,first.look_at.y-1},{first.look_at.x,first.look_at.y+1},
+    {first.look_at.x-1,first.look_at.y+1}});
+  assert(fixed.patch_remaining(first.look_at,2,10,2.09)>0);
+  auto partial=fixed.views({0,0},{},free,2,10,2.09,10000,{},true);
+  assert(std::any_of(partial.begin(),partial.end(),[&](auto v) {
+    return distance(v.look_at,first.look_at)<1e-8 && distance(v.position,first.position)<1e-8;
+  }));
+  ObservationBox footprint(2,10,2.09);
+  std::vector<SearchPoint> polygon;
+  for(auto q:std::vector<SearchPoint>{{footprint.front,-footprint.half_width},
+    {footprint.back,-footprint.half_width},{footprint.back,footprint.half_width},
+    {footprint.front,footprint.half_width}}) {
+    polygon.push_back({first.position.x+q.x*std::cos(yaw)-q.y*std::sin(yaw),
+      first.position.y+q.x*std::sin(yaw)+q.y*std::cos(yaw)});
+  }
+  fixed.observe(polygon);
+  assert(fixed.patch_remaining(first.look_at,2,10,2.09)==0);
+  SearchCoverage spread(-50,-50,100,100,.5);
+  auto north=separation_direction({0,2},{{0,0}},1,2);
+  auto south=separation_direction({0,0},{{0,2}},0,2);
+  assert(north.x==0 && north.y==1 && south.x==0 && south.y== -1);
+  auto overlap0=separation_direction({0,0},{{0,0}},0,2);
+  auto overlap1=separation_direction({0,0},{{0,0}},1,2);
+  assert(distance(overlap0,overlap1)>1.99);
+  assert(distance(separation_direction({0,0},{},0,1),{0,0})==0);
+  auto n=spread.views({0,2},{{0,0}},free,2,10,2.09,1,{},true,&north).front();
+  auto south_view=spread.views({0,0},{{0,2}},free,2,10,2.09,1,{},true,&south).front();
+  assert(n.look_at.y>40 && south_view.look_at.y< -40);
 
   // Solve a small domain and verify the absorption maximum principle and
   // monotonic response to stronger targets, rather than just its update formula.

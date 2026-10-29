@@ -1,3 +1,11 @@
 ros_ws/build
 ros_ws/install
 ros_ws/log
+# Local experiment recordings and dashboard build dependencies
+ros_ws/test_results/
+ros_ws/.test_lab_venv/
+ros_ws/src/simulation_test_pkg/web/node_modules/
+ros_ws/src/simulation_test_pkg/web/dist/
+__pycache__/
+.pytest_cache/
+*.tsbuildinfo

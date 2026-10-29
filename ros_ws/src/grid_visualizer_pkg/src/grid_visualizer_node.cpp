@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <tuple>
 #include <map>
+#include <sstream>
+#include <iomanip>
 
 #include "rclcpp/rclcpp.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
@@ -18,6 +20,7 @@
 #include "geometry_msgs/msg/pose_array.hpp"
 #include "geometry_msgs/msg/polygon_stamped.hpp"
 #include "std_msgs/msg/empty.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "grid_visualizer_pkg/search_coverage.hpp"
 #include "grid_visualizer_pkg/goal_quiet_zone.hpp"
 #include "grid_visualizer_pkg/stall_recovery.hpp"
@@ -81,12 +84,12 @@ T read_required(const cv::FileStorage & storage, const char * key)
   return value;
 }
 
-GridConfig load_grid_config()
+GridConfig load_grid_config(const std::string& source_path = "")
 {
   GridConfig config;
-  config.source_path =
+  config.source_path = source_path.empty() ?
     ament_index_cpp::get_package_share_directory("grid_visualizer_pkg") +
-    "/config/grid_config.xml";
+    "/config/grid_config.xml" : source_path;
 
   cv::FileStorage storage(config.source_path, cv::FileStorage::READ);
   if (!storage.isOpened()) {
@@ -291,7 +294,8 @@ class OccupancyGridVisualizer : public rclcpp::Node
 {
 public:
   OccupancyGridVisualizer()
-  : Node("occupancy_grid_visualizer"), config_(load_grid_config())
+  : Node("occupancy_grid_visualizer"), config_(load_grid_config(
+      declare_parameter<std::string>("config_file", "")))
   {
     config_.goal_position = cv::Point2f(
       declare_parameter<double>("goal_x", -10.0), declare_parameter<double>("goal_y", -10.0));
@@ -441,10 +445,14 @@ public:
     RCLCPP_INFO(this->get_logger(), "Drone Goto Pub Topic: %s", goto_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Drone Focus Pub Topic: %s", focus_topic.c_str());
 
+    search_state_pub_ = create_publisher<std_msgs::msg::String>(
+      drone_namespace_ + "/search_state", rclcpp::QoS(1).reliable().transient_local());
     auto stop_qos = rclcpp::QoS(1).reliable().transient_local();
     stop_sub_ = create_subscription<std_msgs::msg::Empty>("/simulation/stop", stop_qos,
       [this](std_msgs::msg::Empty::SharedPtr) {
         stopped_ = true; has_vector_grid_ = false;
+        latest_search_views_.clear();
+        publish_search_state();
         stall_recovery_.reset(); distance_recovery_.reset(); commanded_movement_={0,0};
       });
     auto coverage_qos = rclcpp::QoS(50).reliable().durability_volatile();
@@ -932,6 +940,8 @@ private:
 
   void timer_5hz_callback()
   {
+    sync_visualization_parameters();
+    publish_search_state();
     // Keep the coverage view responsive before takeoff and after mission stop.
     update_coverage_map_window();
     if (stopped_) {return;}
@@ -1331,6 +1341,7 @@ private:
       active_push_objectives.push_back(objective);
     }
     latest_search_views_ = search_views;
+    publish_search_state();
     for (const auto& view : search_views) {
       PushObjective objective;
       objective.global_point = cv::Point2f(view.position.x, view.position.y);
@@ -1664,6 +1675,70 @@ private:
       compute_and_display_vector_grid(
         grid, vector_grid, is_fixed, saddle_escape_grid, grid_center);
     }
+  }
+
+  // Versioned telemetry of this node's real observation memory and selected
+  // global search viewpoint. Full states let late recorders recover exactly;
+  // publishing only changed states avoids sending the grid on every timer tick.
+  void publish_search_state()
+  {
+    if (!search_state_pub_ || !coverage_) {return;}
+    std::ostringstream goal;
+    goal << std::setprecision(17);
+    if (!stopped_ && !latest_search_views_.empty()) {
+      const auto& view = latest_search_views_.front();
+      const int id = coverage_->index(view.look_at);
+      const int step = coverage_->patch_step(search_near_, search_far_, search_fov_);
+      if (id >= 0) {
+        const int row = (id / coverage_->cols() / step) * step;
+        const int col = (id % coverage_->cols() / step) * step;
+        const double x0 = global_map_min_x_ + col * config_.cell_size;
+        const double y0 = global_map_min_y_ + row * config_.cell_size;
+        const double x1 = std::min(global_map_max_x_, x0 + step * config_.cell_size);
+        const double y1 = std::min(global_map_max_y_, y0 + step * config_.cell_size);
+        goal << "{\"viewpoint\":[" << view.position.x << "," << view.position.y
+             << "],\"patch_center\":[" << view.look_at.x << "," << view.look_at.y
+             << "],\"strength\":" << search_weight_
+             << ",\"patch\":[[" << x0 << "," << y0 << "],[" << x1 << "," << y0
+             << "],[" << x1 << "," << y1 << "],[" << x0 << "," << y1 << "]]}";
+      } else {goal << "null";}
+    } else {goal << "null";}
+    const auto goal_json = goal.str();
+    if (published_search_count_ == coverage_->count() && published_search_goal_ == goal_json) {return;}
+    std::ostringstream state;
+    state << std::setprecision(17) << "{\"version\":1,\"frame_id\":\"map\",\"stamp_s\":"
+          << now().seconds() << ",\"grid\":{\"width\":" << coverage_->cols()
+          << ",\"height\":" << coverage_->rows() << ",\"resolution\":" << config_.cell_size
+          << ",\"origin\":[" << global_map_min_x_ << "," << global_map_min_y_ << "],\"seen_cells\":[";
+    bool comma = false;
+    for (int row = 0; row < coverage_->rows(); ++row) {
+      for (int col = 0; col < coverage_->cols(); ++col) {
+        if (!coverage_->seen_cell(row, col)) {continue;}
+        if (comma) {state << ",";}
+        state << row * coverage_->cols() + col;
+        comma = true;
+      }
+    }
+    state << "]},\"goal\":" << goal_json << "}";
+    std_msgs::msg::String message;
+    message.data = state.str();
+    search_state_pub_->publish(message);
+    published_search_count_ = coverage_->count();
+    published_search_goal_ = goal_json;
+  }
+
+  void sync_visualization_parameters()
+  {
+    const bool occupancy = get_parameter("show_occupancy_grid").as_bool();
+    const bool vectors = get_parameter("show_vector_grid").as_bool();
+    if (!occupancy && occupancy_window_open_) {
+      cv::destroyWindow(occupancy_window_name_); occupancy_window_open_ = false;
+    }
+    if (!vectors && vector_window_open_) {
+      cv::destroyWindow(vector_window_name_); vector_window_open_ = false;
+    }
+    config_.show_occupancy_grid = occupancy;
+    config_.show_vector_grid = vectors;
   }
 
   void update_coverage_map_window()
@@ -2046,6 +2121,7 @@ private:
       cv::LINE_AA);
 
     cv::imshow(occupancy_window_name_, enlarged_img);
+    occupancy_window_open_ = true;
     cv::waitKey(1);
   }
 
@@ -2157,6 +2233,7 @@ private:
         target ? (target->search ? " SEARCH" : " COW") : ""),
       cv::Point(8,CANVAS_SIZE-10),cv::FONT_HERSHEY_SIMPLEX,0.40,command_color,1,cv::LINE_AA);
     cv::imshow(vector_window_name_, vector_img);
+    vector_window_open_ = true;
     cv::waitKey(1);
   }
 
@@ -2403,6 +2480,10 @@ private:
   std::string vector_window_name_;
   std::string coverage_window_name_;
   bool coverage_window_open_{false};
+  bool occupancy_window_open_{false}, vector_window_open_{false};
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr search_state_pub_;
+  std::size_t published_search_count_{std::numeric_limits<std::size_t>::max()};
+  std::string published_search_goal_;
   cv::Mat coverage_cells_;
   std::size_t rendered_coverage_count_{0};
   std::chrono::steady_clock::time_point last_coverage_display_{};

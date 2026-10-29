@@ -380,3 +380,17 @@ The ROS check covers measured stalls, retained targets, stable-progress handoff,
 command bounds, camera priority, simulation-clock resets, and mission stop.
 A full Gazebo reproduction of the reported camera/detection scene remains a
 separate validation step.
+
+## Experiment batteries and replay
+
+Run `./scripts/test_lab.sh` from the repository root and open
+**http://127.0.0.1:8765** to create starting layouts, queue repeated simulations,
+and replay actual cow/drone trajectories with fading paths. Runs end at success
+or at **20 simulated minutes** and save per-entity movement metrics, both clocks,
+configuration snapshots and logs locally under `ros_ws/test_results/`. The
+detector's remembered cows are available as a separate replay overlay. New tests
+also record per-drone searched/unsearched maps and search goals. Replay has layer
+toggles, scenario/live-run controls for desktop viewers, and single/bulk
+experiment deletion.
+
+See [Herding Lab setup, CLI batches and data format](ros_ws/src/simulation_test_pkg/README.md).

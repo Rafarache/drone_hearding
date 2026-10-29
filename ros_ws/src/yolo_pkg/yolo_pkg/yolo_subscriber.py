@@ -260,7 +260,8 @@ class YoloCowSubscriber(Node):
     def __init__(self):
         super().__init__('yolo_pkg')
 
-        self.config = load_yolo_config()
+        self.config = load_yolo_config(
+            self.declare_parameter('config_file', '').value or None)
         self.namespace = str(
             self.declare_parameter('drone_namespace_prefix', '').value
         )
@@ -292,7 +293,8 @@ class YoloCowSubscriber(Node):
         self.expected_camera_names = set()
         self.pending_detection_batches = {}
         self.pending_batch_start_timestamp = None
-        self.show_annotated_camera = self.config.show_annotated_camera
+        self.show_annotated_camera = bool(self.declare_parameter(
+            'show_annotated_camera', self.config.show_annotated_camera).value)
         self.camera_horizontal_fov_rad = self.config.horizontal_fov_rad
         camera_view_state = (
             'enabled' if self.show_annotated_camera else 'disabled'
@@ -330,12 +332,31 @@ class YoloCowSubscriber(Node):
         self.last_tracker_diagnostic_log_time = None
         self.plotter = (
             RealtimeCowPlotter(self.config)
-            if self.config.show_realtime_track_plot
+            if self.declare_parameter(
+                'show_realtime_track_plot', self.config.show_realtime_track_plot).value
             else None
         )
 
         self.bridge = CvBridge()
+        self.camera_windows = set()
         self.model = YOLO(self.config.model_path)
+        self.visualization_timer = self.create_timer(.2, self.update_visualizations)
+
+    def update_visualizations(self):
+        annotated = bool(self.get_parameter('show_annotated_camera').value)
+        if not annotated:
+            for window in self.camera_windows:
+                cv2.destroyWindow(window)
+            self.camera_windows.clear()
+        self.show_annotated_camera = annotated
+        plot = bool(self.get_parameter('show_realtime_track_plot').value)
+        if plot and self.plotter is None:
+            self.plotter = RealtimeCowPlotter(self.config)
+        elif not plot and self.plotter is not None:
+            cv2.destroyWindow(self.plotter.window_name)
+            self.plotter = None
+        if self.camera_windows or self.plotter is not None:
+            cv2.waitKey(1)
 
     def drone_callback(self, msg, namespace):
         timestamp = self._stamp_to_seconds(msg.header.stamp)
@@ -446,7 +467,9 @@ class YoloCowSubscriber(Node):
             self.observation_publishers[name].publish(observation)
 
         if annotated_frame is not None:
-            cv2.imshow(f'{name} - YOLO cow detection', annotated_frame)
+            window = f'{name} - YOLO cow detection'
+            cv2.imshow(window, annotated_frame)
+            self.camera_windows.add(window)
             cv2.waitKey(1)
 
         if self.pending_batch_start_timestamp is None:

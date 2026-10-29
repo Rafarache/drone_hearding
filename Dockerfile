@@ -16,7 +16,7 @@ RUN echo "deb http://packages.osrfoundation.org/gazebo/ubuntu `lsb_release -cs` 
     && apt-get install -y \
     gazebo \
     ros-${ROS_DISTRO}-gazebo-ros-pkgs \
-    python3-colcon-common-extensions python3-rosdep --no-install-recommends \
+    python3-colcon-common-extensions python3-rosdep python3-venv xvfb xauth --no-install-recommends \
     && apt-get clean
 RUN rosdep init && rosdep update --rosdistro=iron
 

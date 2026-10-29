@@ -92,8 +92,8 @@ def _required_bool(element, attribute, source_path):
     return raw == 'true'
 
 
-def load_yolo_config():
-    source_path = os.path.join(
+def load_yolo_config(source_path=None):
+    source_path = source_path or os.path.join(
         get_package_share_directory('yolo_pkg'),
         'config',
         'yolo_config.xml',

@@ -24,7 +24,7 @@ def _launch_setup(context):
         'urdf',
         'sjtu_drone.urdf.xacro',
     )
-    vehicle_config_path = os.path.join(
+    vehicle_config_path = LaunchConfiguration('vehicle_config_file').perform(context) or os.path.join(
         bringup_share,
         'config',
         'drone.yaml',
@@ -91,7 +91,8 @@ def _launch_setup(context):
             executable='drone_position_control',
             name='sjtu_drone_control',
             namespace=model_namespace,
-            parameters=[{'drone_namespace': model_namespace}],
+            parameters=[{'drone_namespace': model_namespace,
+                         'config_file': LaunchConfiguration('drone_control_config_file').perform(context)}],
             output='screen',
         ),
     ]
@@ -103,6 +104,8 @@ def generate_launch_description():
             DeclareLaunchArgument('x'),
             DeclareLaunchArgument('y'),
             DeclareLaunchArgument('model_ns'),
+            DeclareLaunchArgument('drone_control_config_file', default_value=''),
+            DeclareLaunchArgument('vehicle_config_file', default_value=''),
             OpaqueFunction(function=_launch_setup),
         ]
     )

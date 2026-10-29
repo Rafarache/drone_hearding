@@ -10,9 +10,12 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     OpaqueFunction,
+    RegisterEventHandler, EmitEvent, LogInfo,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch_ros.actions import Node, SetParameter
 
 
@@ -217,6 +220,11 @@ def _launch_setup(context):
         'simulation_config_file'
     ).perform(context)
     config = _load_simulation_config(source_path)
+    unattended = LaunchConfiguration('unattended').perform(context).lower() == 'true'
+    live_visualizations = LaunchConfiguration('live_visualizations').perform(context).lower() == 'true'
+    overrides = {name: LaunchConfiguration(name).perform(context) for name in (
+        'cow_config_file', 'drone_control_config_file', 'grid_config_file',
+        'yolo_config_file', 'vehicle_config_file')}
 
     bringup_share = get_package_share_directory('sjtu_drone_bringup')
     gazebo_share = get_package_share_directory('gazebo_ros')
@@ -264,7 +272,10 @@ def _launch_setup(context):
         ),
     ]
 
-    if config['use_gui']:
+    if unattended:
+        actions.pop()  # RViz is interactive; keep ordinary launches unchanged.
+
+    if config['use_gui'] and not unattended:
         actions.append(
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
@@ -330,6 +341,7 @@ def _launch_setup(context):
         'number_of_cows': number_of_cows,
         'drone_approach_radius': config['drone_approach_radius'],
         'push_point_margin': config['push_point_margin'],
+        'config_file': overrides['cow_config_file'],
     }
     actions.append(
         Node(
@@ -349,6 +361,9 @@ def _launch_setup(context):
                 {
                     'drone_namespace_prefix': namespace_prefix,
                     'number_of_drones': number_of_drones,
+                    'config_file': overrides['yolo_config_file'],
+                    **({'show_annotated_camera': False, 'show_realtime_track_plot': False}
+                       if unattended and not live_visualizations else {}),
                     'cow_positions_topic': config['cow_positions_topic'],
                     **{key: config[key] for key in ('search_near_m', 'search_far_m', 'search_fov_rad',
                                                    'search_observation_period_s')},
@@ -371,8 +386,8 @@ def _launch_setup(context):
     )
     for index, position in enumerate(config['drones']):
         namespace = namespace_prefix + str(index)
-        actions.extend(
-            [
+        if not unattended:
+            actions.extend([
                 Node(
                     package='joy',
                     executable='joy_node',
@@ -381,12 +396,17 @@ def _launch_setup(context):
                     output='screen',
                 ),
                 _teleop_node(namespace, config['controller']),
+            ])
+        actions.extend(
+            [
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(drone_launch),
                     launch_arguments={
                         'x': str(position['x']),
                         'y': str(position['y']),
                         'model_ns': namespace,
+                        'drone_control_config_file': overrides['drone_control_config_file'],
+                        'vehicle_config_file': overrides['vehicle_config_file'],
                     }.items(),
                 ),
                 Node(
@@ -398,6 +418,9 @@ def _launch_setup(context):
                         {
                             **{key: config[key] for key in ('goal_x', 'goal_y', 'final_goal_reached_radius',
                                                            'search_near_m', 'search_far_m', 'search_fov_rad')},
+                            'config_file': overrides['grid_config_file'],
+                            **({'show_vector_grid': False, 'show_occupancy_grid': False,
+                                'show_coverage_map': False} if unattended and not live_visualizations else {}),
                             'drone_index': index,
                             'total_drones': number_of_drones,
                             'global_map_center_x': config['map_center_x'],
@@ -418,6 +441,20 @@ def _launch_setup(context):
             ]
         )
 
+    if unattended:
+        def critical_exit(event, context):
+            if context.is_shutdown:
+                return []
+            command = event.action.process_details.get('cmd', [])
+            programs = {os.path.basename(str(part)) for part in command}
+            spawners = {'spawn_entity.py', 'spawn_drone_script'}
+            critical = {'gzserver', 'yolo_subscriber', 'repeller', 'grid_visualizer_node',
+                        'drone_position_control', 'simulation_completion_monitor'}
+            if programs & critical or (event.returncode != 0 and programs & spawners):
+                reason = f'Critical simulation process exited ({event.returncode}): {command}'
+                return [LogInfo(msg=reason), EmitEvent(event=Shutdown(reason=reason))]
+            return []
+        actions.insert(0, RegisterEventHandler(OnProcessExit(on_exit=critical_exit)))
     return actions
 
 
@@ -434,6 +471,13 @@ def generate_launch_description():
                 default_value=default_config,
                 description='Path to the authoritative simulation XML file',
             ),
+            DeclareLaunchArgument('unattended', default_value='false',
+                                  choices=['true', 'false']),
+            DeclareLaunchArgument('live_visualizations', default_value='false',
+                                  choices=['true', 'false']),
+            *[DeclareLaunchArgument(name, default_value='') for name in (
+                'cow_config_file', 'drone_control_config_file', 'grid_config_file',
+                'yolo_config_file', 'vehicle_config_file')],
             OpaqueFunction(function=_launch_setup),
         ]
     )

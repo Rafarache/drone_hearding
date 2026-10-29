@@ -43,8 +43,8 @@ def _required_float(element, attribute, source_path):
     return parsed
 
 
-def load_drone_control_config():
-    source_path = os.path.join(
+def load_drone_control_config(source_path=None):
+    source_path = source_path or os.path.join(
         get_package_share_directory('sjtu_drone_control'),
         'config',
         'drone_control_config.xml',

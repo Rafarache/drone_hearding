@@ -21,7 +21,8 @@ class PeopleRepeller(Node):
             Empty, '/simulation/stop', self.stop,
             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.config = load_cow_config()
+        self.config = load_cow_config(
+            self.declare_parameter('config_file', '').value or None)
         self.drone_namespace_prefix = str(
             self.declare_parameter('drone_namespace_prefix', '').value
         )

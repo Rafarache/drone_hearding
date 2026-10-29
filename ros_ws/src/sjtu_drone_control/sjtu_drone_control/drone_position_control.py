@@ -14,7 +14,8 @@ class DronePositionControl(Node):
     def __init__(self):
         super().__init__('drone_position_controller')
 
-        self.config = load_drone_control_config()
+        self.config = load_drone_control_config(
+            self.declare_parameter('config_file', '').value or None)
         namespace = str(
             self.declare_parameter('drone_namespace', '').value
         )

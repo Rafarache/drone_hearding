@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<package format="3"><name>simulation_test_pkg</name><version>1.0.0</version>
+<description>Local simulation experiment runner and telemetry archive</description>
+<maintainer email="rafael@example.com">Rafael</maintainer><license>MIT</license>
+<buildtool_depend>ament_python</buildtool_depend><exec_depend>rclpy</exec_depend>
+<exec_depend>gazebo_msgs</exec_depend><exec_depend>geometry_msgs</exec_depend>
+<exec_depend>rosgraph_msgs</exec_depend><exec_depend>std_msgs</exec_depend><exec_depend>rcl_interfaces</exec_depend>
+<exec_depend>cow_pkg</exec_depend><exec_depend>sjtu_drone_bringup</exec_depend>
+<test_depend>python3-pytest</test_depend><export><build_type>ament_python</build_type></export></package>

@@ -12,6 +12,7 @@
   <depend>rclcpp</depend>
   <depend>ament_index_cpp</depend>
   <depend>geometry_msgs</depend>
+  <depend>cow_mapping_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>opencv</depend>
 

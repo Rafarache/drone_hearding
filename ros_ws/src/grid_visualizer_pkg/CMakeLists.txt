@@ -17,6 +17,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(cow_mapping_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 
@@ -36,6 +37,7 @@ ament_target_dependencies(grid_visualizer_node
   "rclcpp"
   "ament_index_cpp"
   "geometry_msgs"
+  "cow_mapping_interfaces"
   "std_msgs"
 )
 
@@ -46,6 +48,10 @@ target_link_libraries(grid_visualizer_node
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(test_cow_evidence test/test_cow_evidence.cpp)
+  target_compile_features(test_cow_evidence PUBLIC cxx_std_17)
+  target_include_directories(test_cow_evidence PRIVATE include)
+  add_test(NAME test_cow_evidence COMMAND test_cow_evidence)
   add_executable(test_distance_recovery test/test_distance_recovery.cpp)
   target_compile_features(test_distance_recovery PUBLIC cxx_std_17)
   target_include_directories(test_distance_recovery PRIVATE include)
@@ -64,6 +70,7 @@ if(BUILD_TESTING)
   add_test(NAME test_search_coverage COMMAND test_search_coverage)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # These standalone regression tests use assert(), including Release builds.
+    target_compile_options(test_cow_evidence PRIVATE -UNDEBUG)
     target_compile_options(test_distance_recovery PRIVATE -UNDEBUG)
     target_compile_options(test_stall_recovery PRIVATE -UNDEBUG)
     target_compile_options(test_goal_quiet_zone PRIVATE -UNDEBUG)

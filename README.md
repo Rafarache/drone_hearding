@@ -16,6 +16,23 @@ The supplied Docker environment uses `/ros2_ws` as the workspace. As before, the
 normal launch needs a display for RViz, camera/grid windows, and keyboard
 terminals, plus the Gazebo models and YOLO weights used by this repository.
 
+After rebuilding, source `install/setup.bash` again before launching. A shell
+sourced before the build lacks paths for newly introduced message packages,
+which can make the detector and navigation processes exit at startup.
+
+Inside the Docker container, use `/ros2_ws/run_simulation.sh` (stored in the
+repository as `ros_ws/run_simulation.sh`). It clears the terminal, runs
+`colcon build`, reloads the workspace environment, and starts the canonical launch:
+
+```bash
+cd /ros2_ws
+./run_simulation.sh
+```
+
+The script forwards launch arguments. A failed build
+stops the launcher. It checks the cow observation Python messages and C++ library
+before starting the simulation.
+
 ## Configuration
 
 `ros_ws/src/sjtu_drone_bringup/config/simulation.xml` defines the field bounds,
@@ -44,18 +61,53 @@ footprint. The local navigation solver and visualizations remain configurable in
 
 Each drone also opens a **Visited Areas** window showing its independent coverage
 over the whole field, with green visited cells, white unvisited cells, and a
-coverage percentage, plus red dots for current detected/tracked cows. It includes
-both its own observations and received peer observations, without movement
-arrows. Cow dots use the detector topic rather than Gazebo ground truth.
-Confirmed cows stay at their last detected global positions until reacquired;
-looking away, missed detections, and leaving the local map cannot delete them.
-The tracker retains this memory until the mission processes restart. The view keeps the field
-bounds fixed and remains responsive after the mission stops.
+coverage percentage, plus red dots for cow-confidence cells above 180. It includes
+both its own search observations and received peer search observations, without
+movement arrows. Cow dots come from camera evidence rather than Gazebo ground
+truth. The view keeps the field bounds fixed and remains responsive after the
+mission stops.
+
+Cow tracking is disabled. Each successfully processed camera frame publishes an
+atomic `/cow_observations` message with its image timestamp, source drone,
+image-time camera pose, visibility cone, raw detections, and bounding-box bearing
+spans. `/cows_pos` remains a raw per-frame `PoseArray` for compatibility; an empty
+frame publishes an empty array. Neither topic republishes remembered cows.
+
+Each navigation node maintains an independent confidence grid at the global
+map's 0.5 m resolution. Scores start at 0, are clamped to **0–255**, and a cell
+represents a cow only at **strictly above 180**. On each 200 ms map update:
+
+1. Add **150** per new own-camera frame to each detected cell.
+2. Subtract **30** per new own-camera frame from visible empty cells, excluding
+   any cell detected by any drone in this same update and any own-camera cow shadow.
+3. Add **150** per new peer-camera frame to each detected cell.
+
+Multiple boxes in the same cell count once per frame. Peer empty frames never
+subtract points, and peer protection lasts only for the current update. Frames
+arriving in different updates do not protect each other. Duplicate or out-of-order
+source timestamps are ignored; timer ticks never replay evidence. A simulation
+clock reset clears confidence and pending observations. There is no time decay,
+cow identity, motion prediction, or association.
+
+Negative evidence uses cells fully inside the camera cone (2–20 m, 2.09 rad by
+default). A detected cow's entire bounding-box angular span protects cells behind
+it, starting 1 m before its estimated center; partially hidden cells are protected.
+A box with invalid depth protects its bearings without adding a position. Existing
+confident cells do not cast shadows. Missing pose, failed inference, and dropped
+images are not empty evidence. Visited/search coverage keeps its existing
+2–10 m rectangular footprint and is unaffected by cow occlusion.
+
+Two detections give `0 → 150 → 255`; three subsequent unprotected misses give
+`255 → 225 → 195 → 165`, removing the cow cell. Confident positions outside the
+current view persist until that drone sees empty space there. The empirical
+position projection is unchanged, so existing distance-calibration errors remain.
+The topic can be changed with `cow_observations_topic` in `simulation.xml`;
+custom layouts omitting it default to `/cow_observations`.
 
 For off-map cows, local arrow/occupancy views show a hollow red edge marker
 labeled with the cow's distance. The controller keeps the cow's global position
 separate from its clipped local push target (green), recalculating the target as
-the drone moves. Clipping never overwrites the remembered cow position.
+the drone moves. Clipping never overwrites the global confidence-cell position.
 
 Set `<show_coverage_map>1</show_coverage_map>` in `grid_config.xml` to enable these
 windows by default (use `0` to disable them), then rebuild the package. The boolean
@@ -218,7 +270,7 @@ move into previously inspected regions.
 `cow_pkg/simulation_completion_monitor` subscribes to `/gazebo/model_states`.
 It requires every configured cow, with a unique name and finite position, to be
 inside the goal radius in the **same snapshot**. There is no dwell time or
-coverage-completion requirement, and detector tracks are not used for this
+coverage-completion requirement, and camera estimates are not used for this
 decision.
 
 The monitor publishes a reliable, transient-local stop and stays alive so late
@@ -235,20 +287,23 @@ After building and sourcing the workspace:
 
 ```bash
 ctest --test-dir build/grid_visualizer_pkg --output-on-failure \
-  -R 'test_(goal_quiet_zone|search_coverage|stall_recovery|distance_recovery)'
+  -R 'test_(cow_evidence|goal_quiet_zone|search_coverage|stall_recovery|distance_recovery)'
 python3 -m pytest -q \
   src/cow_pkg/test/test_completion.py \
   src/cow_pkg/test/test_repeller_forces.py \
   src/cow_pkg/test/test_interaction.py \
   src/cow_pkg/test/test_motion.py \
   src/yolo_pkg/test/test_search_observation.py \
-  src/yolo_pkg/test/test_cow_tracker.py \
+  src/yolo_pkg/test/test_raw_observations.py \
+  src/grid_visualizer_pkg/test/test_cow_evidence_ros.py \
+  src/grid_visualizer_pkg/test/test_distance_recovery_ros.py \
   src/sjtu_drone_bringup/test/test_search_mission.py \
   src/sjtu_drone_bringup/test/test_gazebo_stop.py
 ```
 
 Run ROS integration tests in an isolated ROS domain with no active mission.
-They cover live coverage exchange, simultaneous objectives, empty cow tracks,
+They cover confidence scoring, raw detections, shadows, live coverage exchange,
+simultaneous objectives, visible-empty clearing,
 completion edge cases, controller latching, late subscribers, and the real
 Gazebo flight plugin during takeoff, landing, and position control. They do not
 replace an end-to-end camera/detection mission trial with cows distributed
@@ -312,8 +367,9 @@ Recovery selects one reachable target using obstacle-aware distance plus its
 existing attraction-priority cost. It retains the global target while rebuilding
 a single-target distance field around moving obstacles and the moving local
 window. Search targets retain their patch identity; cow targets use spatial
-association within the existing 2 m association radius because the cow topic
-contains positions without tracker IDs. Invalid or unreachable targets are
+association within the existing 2 m association radius because confidence cells
+have no cow IDs. This association retains a navigation target only; it does not
+track camera detections. Invalid or unreachable targets are
 replaced. Zero-strength targets cannot seed recovery. With no safe route, the
 drone explicitly holds rather than following a stale waypoint.
 

@@ -15,6 +15,7 @@
   <depend>python3-scipy</depend>
   <depend>python3-numpy</depend>
   <depend>geometry_msgs</depend>
+  <depend>cow_mapping_interfaces</depend>
   <depend>nav_msgs</depend>
 
   <test_depend>ament_copyright</test_depend>

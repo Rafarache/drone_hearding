@@ -11,7 +11,7 @@ import pytest
 import rclpy
 from ament_index_python.packages import get_package_prefix
 from gazebo_msgs.msg import ModelStates
-from geometry_msgs.msg import Point32, PolygonStamped, Pose, PoseArray, Twist, Vector3
+from geometry_msgs.msg import Point32, PolygonStamped, Pose, Twist, Vector3
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -19,6 +19,7 @@ from rclpy.serialization import serialize_message
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Empty
 
+from cow_mapping_interfaces.msg import CowObservation, CowDetection
 from cow_pkg.repeller_node import PeopleRepeller
 from cow_pkg.simulation_completion_monitor import SimulationCompletionMonitor
 from sjtu_drone_control.drone_position_control import DronePositionControl
@@ -39,6 +40,30 @@ def spin(executor, duration):
     deadline = time.monotonic() + duration
     while time.monotonic() < deadline:
         executor.spin_once(timeout_sec=0.02)
+
+
+def publish_cows(driver, publisher, executor, points, camera=(0.0, 0.0, 0.0), source=0):
+    """Two raw hits activate cells; three visible empty frames retire them."""
+    for _ in range(2 if points else 3):
+        observation = CowObservation()
+        observation.header.frame_id = 'map'
+        observation.header.stamp = driver.get_clock().now().to_msg()
+        observation.source_drone_index = source
+        observation.camera_pose = pose(camera[0], camera[1])
+        observation.camera_pose.orientation.z = math.sin(camera[2]/2)
+        observation.camera_pose.orientation.w = math.cos(camera[2]/2)
+        observation.near_range_m, observation.far_range_m = 2.0, 20.0
+        observation.horizontal_fov_rad = 2.09
+        for x, y in points:
+            detection = CowDetection()
+            detection.position.x, detection.position.y = float(x), float(y)
+            detection.position_valid = True
+            bearing = math.remainder(math.atan2(y-camera[1], x-camera[0])-camera[2], 2*math.pi)
+            detection.bearing_min_rad = max(-math.pi, bearing-.1)
+            detection.bearing_max_rad = min(math.pi, bearing+.1)
+            observation.detections.append(detection)
+        publisher.publish(observation)
+        spin(executor, .04)
 
 
 def stop_qos():
@@ -119,7 +144,7 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
             files.append(output)
             parameters = dict(drone_index=index, total_drones=2, global_map_center_x=0.0,
                               global_map_center_y=0.0, global_map_width=20.0, global_map_height=20.0,
-                              drone_namespace_prefix='/field_drone', cow_positions_topic='/field_cows',
+                              drone_namespace_prefix='/field_drone', cow_observations_topic='/field_cows',
                               cow_exclusion_radius=2.0, push_point_margin=2.0, goal_x=-8.0, goal_y=-8.0,
                               show_vector_grid=False, show_occupancy_grid=False, show_coverage_map=False)
             args = [executable, '--ros-args', '-r', f'__node:=test_grid{index}']
@@ -137,7 +162,7 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
             ])
             poses.append(driver.create_publisher(Pose, prefix + '/gt_pose', 10))
             observations.append(driver.create_publisher(PolygonStamped, prefix + '/processed_view', 50))
-        cows = driver.create_publisher(PoseArray, '/field_cows', 10)
+        cows = driver.create_publisher(CowObservation, '/field_cows', 10)
         stopper = driver.create_publisher(Empty, '/simulation/stop', stop_qos())
         spin(executor, 0.8)
         for i in (0, 1):
@@ -166,7 +191,7 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
         assert any(abs(p.position.x) + abs(p.position.y) > 0.1 for p in targets[0])
         assert focuses[0]  # camera commands exist without any cows
         observations[1].publish(footprint)
-        cows.publish(PoseArray(poses=[pose(5, 0)]))
+        publish_cows(driver, cows, executor, [(5, 0)])
         spin(executor, 5.0)
         for output in files:
             output.flush()
@@ -175,9 +200,9 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
         assert all(values for values in focuses)
         coverage = [re.findall(r'coverage=([0-9.]+)%', log)[-1] for log in logs]
         assert coverage[0] == coverage[1]
-        # Tracker-empty updates retire cow objectives but must not stop search.
+        # Own-camera empty evidence can retire cow cells without stopping search.
         count = len(targets[0])
-        cows.publish(PoseArray())
+        publish_cows(driver, cows, executor, [])
         spin(executor, 0.7)
         assert len(targets[0]) > count
         stopper.publish(Empty())
@@ -186,7 +211,7 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
         for i in (0, 1):
             poses[i].publish(pose(1, 1))
             observations[i].publish(footprint)
-        cows.publish(PoseArray(poses=[pose(6, 6)]))
+        publish_cows(driver, cows, executor, [(6, 6)])
         spin(executor, 0.7)
         assert lengths == [len(t) for t in targets]
         assert all(process.poll() is None for process in processes)
@@ -201,9 +226,7 @@ def test_live_coverage_search_herding_and_stop(tmp_path):
         rclpy.shutdown()
 
 
-def test_remembered_cow_drives_intermediate_targets_after_drone_moves_away(tmp_path):
-    from yolo_pkg.cow_tracker import CowTrackerManager
-
+def test_evidence_persists_out_of_view_and_clears_with_visible_misses(tmp_path):
     rclpy.init()
     driver = Node('cow_memory_test_driver')
     executor = SingleThreadedExecutor()
@@ -212,7 +235,7 @@ def test_remembered_cow_drives_intermediate_targets_after_drone_moves_away(tmp_p
     output = (tmp_path / 'memory_grid.log').open('w')
     parameters = dict(drone_index=0, total_drones=1, global_map_center_x=0.0,
                       global_map_center_y=0.0, global_map_width=100.0, global_map_height=100.0,
-                      drone_namespace_prefix='/memory_drone', cow_positions_topic='/memory_cows',
+                      drone_namespace_prefix='/memory_drone', cow_observations_topic='/memory_cows',
                       cow_exclusion_radius=2.0, push_point_margin=2.0, goal_x=-40.0, goal_y=0.0,
                       show_vector_grid=False, show_occupancy_grid=False, show_coverage_map=False)
     args = [executable, '--ros-args', '-r', '__node:=memory_grid0']
@@ -224,52 +247,37 @@ def test_remembered_cow_drives_intermediate_targets_after_drone_moves_away(tmp_p
         subscription = driver.create_subscription(Pose, '/memory_drone0/goto', targets.append, 10)
         position = driver.create_publisher(Pose, '/memory_drone0/gt_pose', 10)
         views = driver.create_publisher(PolygonStamped, '/memory_drone0/processed_view', 50)
-        cows = driver.create_publisher(PoseArray, '/memory_cows', 10)
-        tracker = CowTrackerManager(max_lost_frames=3, max_position_distance=3.0,
-                                    min_hits=1, reacquisition_distance=5.0)
-        camera = dict(x=20.0, y=10.0, yaw=0.0, horizontal_fov=2.09, max_range=20.0)
-        tracks = tracker.update([(25.0, 10.0)], timestamp=0.0, camera_views=[camera])
-        cow_id = tracks[0]['id']
+        cows = driver.create_publisher(CowObservation, '/memory_cows', 10)
         spin(executor, 0.8)
         # Synthetic full-field coverage isolates cow navigation from search.
-        # Cow memory and local intermediate targets are the regression here.
+        # Cell evidence and local intermediate targets are the regression here.
         footprint = PolygonStamped()
         footprint.header.frame_id = 'map'
         footprint.polygon.points = [Point32(x=x, y=y, z=0.0) for x, y in
                                     [(-50.0, -50.0), (50.0, -50.0), (50.0, 50.0), (-50.0, 50.0)]]
         views.publish(footprint)
         position.publish(pose(20, 10))
-        cows.publish(PoseArray(poses=[pose(t['x'], t['y']) for t in tracks]))
+        publish_cows(driver, cows, executor, [(25, 10)], camera=(20, 10, 0))
         spin(executor, 0.7)
         assert targets and process.poll() is None
-
-        # Visible misses beyond the old expiry limit cannot empty the cow map.
-        for step in range(1, 31):
-            tracks = tracker.update([], timestamp=step * 0.1, camera_views=[camera])
-        assert [(t['id'], t['x'], t['y']) for t in tracks] == [(cow_id, 25.0, 10.0)]
-        timestamp = 3.0
         for x, y in [(-20.0, -10.0), (-30.0, 20.0)]:
             position.publish(pose(x, y))
-            distant_camera = dict(camera, x=x, y=y)
-            for _ in range(30):
-                timestamp += 0.1
-                tracks = tracker.update([], timestamp=timestamp, camera_views=[distant_camera])
-            assert [(t['id'], t['x'], t['y']) for t in tracks] == [(cow_id, 25.0, 10.0)]
-            cows.publish(PoseArray(poses=[pose(t['x'], t['y']) for t in tracks]))
+            # Empty views elsewhere must not erase a distant confident cell.
+            publish_cows(driver, cows, executor, [], camera=(x, y, 0))
             spin(executor, 0.3)
             targets.clear()
             spin(executor, 0.8)
             assert targets and process.poll() is None
             assert any(p.position.x > x + 0.2 for p in targets)
-            if y < 10:
-                assert any(p.position.y > y + 0.01 for p in targets)
-            else:
-                assert any(p.position.y < y - 0.01 for p in targets)
-            assert all(abs(p.position.x - x) <= 0.51 and abs(p.position.y - y) <= 0.51
-                       for p in targets)  # local steps, never a jump to the far cow
-        position.publish(pose(20, 10))  # revisiting keeps the same real cow entry
-        tracks = tracker.update([(25.2, 10.0)], timestamp=timestamp + 0.1, camera_views=[camera])
-        assert len(tracks) == 1 and tracks[0]['id'] == cow_id and not tracks[0]['coasting']
+            assert any((p.position.y-y)*(10.25-y) > 0 for p in targets)
+            assert all(abs(p.position.x-x) <= .51 and abs(p.position.y-y) <= .51
+                       for p in targets)
+        position.publish(pose(20, 10))
+        publish_cows(driver, cows, executor, [], camera=(20, 10, 0))
+        spin(executor, .7)
+        targets.clear()
+        spin(executor, .7)
+        assert targets and all(p.position.x == 20 and p.position.y == 10 for p in targets)
     finally:
         process.terminate()
         process.wait(timeout=5)
@@ -290,7 +298,7 @@ def test_search_viewpoints_follow_approach_and_remain_until_observed(tmp_path):
     output = log_path.open('w')
     parameters = dict(drone_index=0, total_drones=1, global_map_center_x=0.0,
                       global_map_center_y=0.0, global_map_width=60.0, global_map_height=60.0,
-                      drone_namespace_prefix='/approach_drone', cow_positions_topic='/approach_cows',
+                      drone_namespace_prefix='/approach_drone', cow_observations_topic='/approach_cows',
                       cow_exclusion_radius=2.0, push_point_margin=2.0, goal_x=-10.0, goal_y=-10.0,
                       show_vector_grid=False, show_occupancy_grid=False, show_coverage_map=False)
     args = [executable, '--ros-args', '-r', '__node:=approach_grid0']
@@ -300,7 +308,7 @@ def test_search_viewpoints_follow_approach_and_remain_until_observed(tmp_path):
     try:
         position = driver.create_publisher(Pose, '/approach_drone0/gt_pose', 10)
         observations = driver.create_publisher(PolygonStamped, '/approach_drone0/processed_view', 50)
-        cows = driver.create_publisher(PoseArray, '/approach_cows', 10)
+        cows = driver.create_publisher(CowObservation, '/approach_cows', 10)
         targets = []
         subscription = driver.create_subscription(Pose, '/approach_drone0/goto', targets.append, 10)
         focuses = []
@@ -327,17 +335,18 @@ def test_search_viewpoints_follow_approach_and_remain_until_observed(tmp_path):
         assert 11 < float(first[-1][0]) < 24 and abs(float(first[-1][1])-11) < .01
         # The attraction is about 6.9 m away, the cow centroid is 9 m away,
         # and the patch is 13 m away. Compare the attraction, then FACE the patch.
-        cows.publish(PoseArray(poses=[pose(15, 9), pose(15, 13)]))
+        publish_cows(driver, cows, executor, [(15, 9), (15, 13)], camera=(24, 11, math.pi))
         spin(executor, 1.0)
         assert focuses and abs(focuses[-1].position.x-11) < 1e-6
         assert abs(focuses[-1].position.y-11) < 1e-6
         # The cow centroid moves closer (4 m), without blocking the attraction.
-        cows.publish(PoseArray(poses=[pose(20, 9), pose(20, 13)]))
+        publish_cows(driver, cows, executor, [], camera=(24, 11, math.pi))
+        publish_cows(driver, cows, executor, [(20, 9), (20, 13)], camera=(24, 11, math.pi))
         spin(executor, 1.0)
-        assert abs(focuses[-1].position.x-20) < 1e-6
-        assert abs(focuses[-1].position.y-11) < 1e-6
+        assert abs(focuses[-1].position.x-20.25) < 1e-6
+        assert abs(focuses[-1].position.y-11.25) < 1e-6
         # With no eligible cows, resume search attention.
-        cows.publish(PoseArray())
+        publish_cows(driver, cows, executor, [], camera=(24, 11, math.pi))
         spin(executor, 1.0)
         assert abs(focuses[-1].position.x-11) < 1e-6
         # Movement alone cannot relocate the selected attraction or complete coverage.
@@ -357,12 +366,12 @@ def test_search_viewpoints_follow_approach_and_remain_until_observed(tmp_path):
         spin(executor, 1.8)
         assert targets and targets[-1].position.x == -24 and targets[-1].position.y == 11
         # No search remains: eligible local cows still receive attention.
-        cows.publish(PoseArray(poses=[pose(-20, 9), pose(-20, 13)]))
+        publish_cows(driver, cows, executor, [(-20, 9), (-20, 13)], camera=(-24, 11, 0))
         spin(executor, 1.0)
-        assert abs(focuses[-1].position.x+20) < 1e-6
-        assert abs(focuses[-1].position.y-11) < 1e-6
+        assert abs(focuses[-1].position.x+19.75) < 1e-6
+        assert abs(focuses[-1].position.y-11.25) < 1e-6
         # Neither target exists: preserve the drone's current heading (+X).
-        cows.publish(PoseArray())
+        publish_cows(driver, cows, executor, [], camera=(-24, 11, 0))
         spin(executor, 1.0)
         assert abs(focuses[-1].position.x+14) < 1e-6
         assert abs(focuses[-1].position.y-11) < 1e-6
@@ -389,8 +398,8 @@ def test_cow_push_waypoint_is_not_a_terminal_hold(tmp_path):
     parameters = dict(drone_index=0, total_drones=1, global_map_center_x=0.0,
                       global_map_center_y=0.0, global_map_width=40.0, global_map_height=40.0,
                       drone_namespace_prefix='/cow_waypoint_drone',
-                      cow_positions_topic='/cow_waypoint_cows', cow_exclusion_radius=2.0,
-                      push_point_margin=2.0, goal_x=-10.0, goal_y=0.0,
+                      cow_observations_topic='/cow_waypoint_cows', cow_exclusion_radius=2.0,
+                      push_point_margin=2.0, goal_x=-10.0, goal_y=0.25,
                       show_vector_grid=False, show_occupancy_grid=False, show_coverage_map=False)
     args = [executable, '--ros-args', '-r', '__node:=cow_waypoint_grid']
     for key, value in parameters.items():
@@ -400,27 +409,28 @@ def test_cow_push_waypoint_is_not_a_terminal_hold(tmp_path):
         positions = driver.create_publisher(Pose, '/cow_waypoint_drone0/gt_pose', 10)
         observations = driver.create_publisher(
             PolygonStamped, '/cow_waypoint_drone0/processed_view', 10)
-        cows = driver.create_publisher(PoseArray, '/cow_waypoint_cows', 10)
+        cows = driver.create_publisher(CowObservation, '/cow_waypoint_cows', 10)
         targets = []
         subscription = driver.create_subscription(
             Pose, '/cow_waypoint_drone0/goto', targets.append, 10)
         spin(executor, 0.8)
-        # Full coverage isolates herding. Estimated cow x=6 gives a pushing
-        # waypoint x=10. The drone is already within the former 0.5 m hold zone.
+        # Full coverage isolates herding. Cow cell (6.25, .25) gives a
+        # pushing waypoint (10.25, .25). Stay .2 m past that waypoint,
+        # within the former .5 m hold zone.
         footprint = PolygonStamped()
         footprint.header.frame_id = 'map'
         footprint.polygon.points = [Point32(x=x, y=y, z=0.0) for x, y in
                                     [(-20.0, -20.0), (20.0, -20.0),
                                      (20.0, 20.0), (-20.0, 20.0)]]
         observations.publish(footprint)
-        cows.publish(PoseArray(poses=[pose(6, 0)]))
-        positions.publish(pose(10.2, 0))
+        publish_cows(driver, cows, executor, [(6.25, .25)])
+        positions.publish(pose(10.45, .25))
         spin(executor, 1.5)
         targets.clear()
         spin(executor, 1.0)
         assert process.poll() is None and targets, log_path.read_text()
-        assert any(p.position.x < 10.1 for p in targets), log_path.read_text()
-        assert all(math.hypot(p.position.x-10.2, p.position.y) <= .50001 for p in targets)
+        assert any(p.position.x < 10.35 for p in targets), log_path.read_text()
+        assert all(math.hypot(p.position.x-10.45, p.position.y-.25) <= .50001 for p in targets)
         assert subscription
     finally:
         process.terminate()

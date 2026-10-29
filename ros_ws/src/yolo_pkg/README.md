@@ -1,43 +1,38 @@
-The simulation selects its cow tracker through `config/yolo_config.xml`:
+The detector publishes raw per-camera observations with **cow tracking disabled**.
+Each processed image immediately publishes `/cow_observations` with the image
+timestamp, source drone index, interpolated camera pose, cone limits, global
+positions, position-valid flags, and bounding-box angular spans. Valid empty
+frames are published; missing pose or failed image processing is not empty evidence.
 
-```xml
-<tracker use_kalman_filter="false" ... />
-```
+`/cows_pos` remains a raw `PoseArray` for compatibility. It contains only valid
+positions from that camera frame, with the source index in `position.z`. Empty
+frames contain no poses. There is no batching across cameras, confirmation,
+association, prediction, or republishing of remembered cows.
 
-- `false` (default): `cow_tracker.py` associates detections by distance and
-  stores the latest measured position directly. It has no Kalman state,
-  smoothing, velocity estimation, or motion prediction.
-- `true`: `cow_tracker_with_kalman_filter.py` retains the Kalman filter and
-  prediction used to associate and smooth observed cow positions.
+`config/yolo_config.xml` configures detection, projection, and camera display.
+Tracker and tracker-plot settings are removed from the active configuration.
+Historical tracker modules and their standalone tests remain unused.
 
-Both versions confirm new cows using `min_confirmation_hits` and then retain
-them for the entire running mission. Missing detections, looking away, and
-leaving a drone's local map do not delete a confirmed cow or move its last
-mapped global position. Reacquisition updates that same entry when association
-succeeds. `max_lost_frames` (15 by default) expires only **unconfirmed candidates**
-after visible misses; out-of-view updates do not advance that counter.
-Camera synchronization and merging of overlapping
-camera detections remain common to both versions; unfiltered positions are
-the measurements produced by that existing detection pipeline.
+Navigation consumes `/cow_observations`, not `/cows_pos`. Each drone maintains
+cell confidence from 0 to 255: own hits +150, own visible empty space −30, then
+peer hits +150. Cells above 180 represent cows. Any hit in the current map update
+protects its cell from subtraction. Cow bounding boxes also protect occluded
+space in the own camera view. See the repository README for visibility and
+multi-drone update semantics. The existing empirical position calibration is unchanged.
 
-Visibility still uses the horizontal FOV and range approximation. Switching
-trackers does not correct its known vertical-view, camera-attitude, or
-occlusion limitations.
-
-Build inside the simulation container, then launch the simulation normally.
-An already running YOLO node must be restarted to load a changed selection.
-The startup log reports the selected tracker module.
+Build the interfaces and consumers together, then restart the simulation nodes:
 
 ```bash
 cd /ros2_ws
 source /opt/ros/iron/setup.bash
-colcon build --packages-select yolo_pkg
+colcon build --packages-select cow_mapping_interfaces yolo_pkg grid_visualizer_pkg sjtu_drone_bringup
 source install/setup.bash
 ```
 
-Run the tracker regression tests without starting Gazebo:
+Test deterministic camera callbacks without Gazebo or model downloads:
 
 ```bash
-PYTHONPATH=src/yolo_pkg python3 -m unittest discover \
-  -s src/yolo_pkg/test -p test_cow_tracker.py -v
+ROS_DOMAIN_ID=162 PYTHONPATH=src/yolo_pkg python3 -m pytest -q \
+  src/yolo_pkg/test/test_raw_observations.py \
+  src/yolo_pkg/test/test_search_observation.py
 ```

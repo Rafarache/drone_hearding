@@ -19,6 +19,8 @@
 #include "geometry_msgs/msg/polygon_stamped.hpp"
 #include "std_msgs/msg/empty.hpp"
 #include "grid_visualizer_pkg/search_coverage.hpp"
+#include "grid_visualizer_pkg/cow_evidence.hpp"
+#include "cow_mapping_interfaces/msg/cow_observation.hpp"
 #include "grid_visualizer_pkg/goal_quiet_zone.hpp"
 #include "grid_visualizer_pkg/stall_recovery.hpp"
 #include "grid_visualizer_pkg/distance_recovery.hpp"
@@ -318,8 +320,8 @@ public:
       "global_map_height", -1.0);
     drone_namespace_prefix_ = this->declare_parameter<std::string>(
       "drone_namespace_prefix", "");
-    cows_position_topic_ = this->declare_parameter<std::string>(
-      "cow_positions_topic", "");
+    cow_observations_topic_ = this->declare_parameter<std::string>(
+      "cow_observations_topic", "/cow_observations");
     cow_exclusion_radius_ = this->declare_parameter<double>(
       "cow_exclusion_radius", -1.0);
     push_point_margin_ = this->declare_parameter<double>(
@@ -345,7 +347,7 @@ public:
       global_map_width_ <= 0.0 ||
       global_map_height_ <= 0.0 ||
       drone_namespace_prefix_.empty() ||
-      cows_position_topic_.empty())
+      cow_observations_topic_.empty())
     {
       throw std::invalid_argument(
         "global map geometry and topic parameters are invalid");
@@ -370,6 +372,9 @@ public:
       std::string(drone_namespace_prefix_) + std::to_string(drone_index_);
     coverage_ = std::make_unique<grid_visualizer_pkg::SearchCoverage>(
       global_map_min_x_, global_map_min_y_, global_map_width_, global_map_height_, config_.cell_size);
+    cow_evidence_ = std::make_unique<grid_visualizer_pkg::CowEvidence>(
+      global_map_min_x_, global_map_min_y_, global_map_width_, global_map_height_,
+      config_.cell_size, drone_index_, total_drones_);
     grid_name_ = "grid" + std::to_string(drone_index_);
     occupancy_window_name_ = "Occupancy Grid - " + grid_name_;
     vector_window_name_ = "Vector Movement Grid - " + grid_name_;
@@ -421,8 +426,8 @@ public:
       config_.cell_size);
     RCLCPP_INFO(this->get_logger(), "Drone Pose Sub Topic: %s", drone_gt_topic.c_str());
     RCLCPP_INFO(
-      this->get_logger(), "Cows Pose Sub Topic: %s",
-      cows_position_topic_.c_str());
+      this->get_logger(), "Cow observations (no tracking): %s",
+      cow_observations_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "Drone Goto Pub Topic: %s", goto_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Drone Focus Pub Topic: %s", focus_topic.c_str());
 
@@ -481,9 +486,9 @@ public:
         peer_topic.c_str());
     }
 
-    cow_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
-      cows_position_topic_,
-      10,
+    cow_sub_ = this->create_subscription<cow_mapping_interfaces::msg::CowObservation>(
+      cow_observations_topic_,
+      50,
       std::bind(&OccupancyGridVisualizer::cow_callback, this, std::placeholders::_1)
     );
 
@@ -598,27 +603,48 @@ private:
     }
   }
 
-  void cow_callback(
-    const geometry_msgs::msg::PoseArray::SharedPtr msg)
+  void cow_callback(const cow_mapping_interfaces::msg::CowObservation::SharedPtr msg)
   {
-    // The tracker publishes the full persistent map of confirmed cows, even
-    // when none are currently visible. Keep global positions here: clipping
-    // for this drone's moving local grid must never modify this snapshot.
-    auto valid_cows =
-      std::make_shared<geometry_msgs::msg::PoseArray>();
-    valid_cows->header = msg->header;
-    for (const auto& pose : msg->poses) {
-      if (
-        is_inside_global_map(
-          pose.position.x,
-          pose.position.y))
-      {
-        valid_cows->poses.push_back(pose);
-      }
+    if (stopped_ || msg->header.frame_id != "map" ||
+      msg->source_drone_index >= static_cast<unsigned>(total_drones_)) {return;}
+    const auto& q=msg->camera_pose.orientation;
+    const double norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+    if (!std::isfinite(norm) || norm < 1e-12) {return;}
+    grid_visualizer_pkg::EvidenceFrame frame;
+    frame.source=static_cast<int>(msg->source_drone_index);
+    frame.stamp_ns=static_cast<int64_t>(msg->header.stamp.sec)*1000000000LL+msg->header.stamp.nanosec;
+    frame.x=msg->camera_pose.position.x;
+    frame.y=msg->camera_pose.position.y;
+    frame.yaw=std::atan2(2*(q.w*q.z+q.x*q.y),norm-2*(q.y*q.y+q.z*q.z));
+    frame.near=msg->near_range_m;
+    frame.far=msg->far_range_m;
+    frame.fov=msg->horizontal_fov_rad;
+    for (const auto& d : msg->detections) {
+      frame.detections.push_back({d.position.x,d.position.y,d.position_valid,
+        d.bearing_min_rad,d.bearing_max_rad});
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    latest_cows_ = valid_cows;
-    received_cows_ = true;
+    cow_evidence_->advance_time(now().nanoseconds());
+    cow_evidence_->enqueue(std::move(frame));
+  }
+
+  void update_cow_evidence()
+  {
+    // Called under mutex on the map timer, before taking the navigation snapshot.
+    cow_evidence_->advance_time(now().nanoseconds());
+    cow_evidence_->update();
+    auto cows=std::make_shared<geometry_msgs::msg::PoseArray>();
+    cows->header.frame_id="map";
+    cows->header.stamp=now();
+    for (const auto& p : cow_evidence_->active_positions()) {
+      geometry_msgs::msg::Pose pose;
+      pose.position.x=p.first;
+      pose.position.y=p.second;
+      pose.orientation.w=1;
+      cows->poses.push_back(pose);
+    }
+    latest_cows_=cows;
+    received_cows_=true;
   }
 
   // -------------------------------------------------------------
@@ -929,6 +955,7 @@ private:
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      update_cow_evidence();
       drone_pose = latest_drone_pose_;
       cows = latest_cows_;
       peer_drone_poses = latest_peer_drone_poses_;
@@ -1012,8 +1039,7 @@ private:
       }
     }
 
-    // Cow state remains global. Reproject every cow into this drone's local
-    // moving window instead of shifting or mutating remembered positions.
+    // Project active global confidence cells into this moving local window.
     if (has_cows && cows) {
       for (const auto& cow_pose : cows->poses) {
         const float cow_x = cow_pose.position.x;
@@ -2280,7 +2306,7 @@ private:
   std::vector<
     rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr>
     peer_drone_subs_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr cow_sub_;
+  rclcpp::Subscription<cow_mapping_interfaces::msg::CowObservation>::SharedPtr cow_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr goto_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr focusin_pub_;
 
@@ -2290,6 +2316,7 @@ private:
   GridConfig config_;
   std::unique_ptr<grid_visualizer_pkg::GoalQuietZone> goal_quiet_zone_;
   std::unique_ptr<grid_visualizer_pkg::SearchCoverage> coverage_;
+  std::unique_ptr<grid_visualizer_pkg::CowEvidence> cow_evidence_;
   std::vector<grid_visualizer_pkg::SearchView> latest_search_views_;
   std::vector<std::pair<grid_visualizer_pkg::SearchPoint,double>> failed_views_;
   std::map<int,int> failed_observations_;
@@ -2327,7 +2354,7 @@ private:
   double cow_exclusion_radius_{0.0};
   double push_point_margin_{0.0};
   std::string drone_namespace_prefix_;
-  std::string cows_position_topic_;
+  std::string cow_observations_topic_;
   cv::Point2f global_map_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_center_{0.0f, 0.0f};
   cv::Point2f latest_grid_offset_{0.0f, 0.0f};

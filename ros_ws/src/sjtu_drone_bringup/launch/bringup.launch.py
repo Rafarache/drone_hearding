@@ -121,6 +121,7 @@ def _load_simulation_config(source_path):
         'cow_name_prefix': _required_text(
             interfaces, 'cow_name_prefix', source_path
         ),
+        'cow_observations_topic': interfaces.get('cow_observations_topic', '/cow_observations').strip(),
         'cow_positions_topic': _required_text(
             interfaces, 'cow_positions_topic', source_path
         ),
@@ -171,6 +172,7 @@ def _load_simulation_config(source_path):
         'drone_namespace_prefix',
         'cow_name_prefix',
         'cow_positions_topic',
+        'cow_observations_topic',
     ):
         if not config[name]:
             raise ValueError(f'{name} cannot be empty in {source_path}')
@@ -350,6 +352,7 @@ def _launch_setup(context):
                     'drone_namespace_prefix': namespace_prefix,
                     'number_of_drones': number_of_drones,
                     'cow_positions_topic': config['cow_positions_topic'],
+                    'cow_observations_topic': config['cow_observations_topic'],
                     **{key: config[key] for key in ('search_near_m', 'search_far_m', 'search_fov_rad',
                                                    'search_observation_period_s')},
                 }
@@ -405,8 +408,7 @@ def _launch_setup(context):
                             'global_map_width': config['map_width_m'],
                             'global_map_height': config['map_height_m'],
                             'drone_namespace_prefix': namespace_prefix,
-                            'cow_positions_topic':
-                                config['cow_positions_topic'],
+                            'cow_observations_topic': config['cow_observations_topic'],
                             'cow_exclusion_radius':
                                 config['drone_approach_radius'],
                             'push_point_margin':

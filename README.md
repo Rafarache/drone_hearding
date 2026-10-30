@@ -167,38 +167,49 @@ this implementation; the existing cow, peer-drone, and field exclusions apply.
 
 ## Simultaneous objectives
 
-By default, MMPF-inspired selection searches **from the borders inward**. It groups
-fixed, cell-aligned patches up to 2 m square into bands by distance from the
-nearest field edge, with band width equal to half the camera range (5 m by
-default). It uses the outermost band with a reachable, non-retired viewpoint.
-Once that band has been observed, selection moves inward; unavailable outer
-bands are reconsidered on later planning updates.
+Search ranks fixed, cell-aligned patches up to 2 m square using a distance-only
+cost. For each unfinished patch, its camera viewpoint is placed on the line from
+the drone toward the patch center, offset by the middle of the modeled camera
+footprint (about 6.1 m with the defaults). If already too close, the camera's
+minimum viewing distance can require stepping back. Blocked, retired, or
+geometrically invalid viewpoints use the nearest valid alternative angle. Every
+candidate must fit the entire patch with a 0.5 m margin.
 
-When selecting a new patch, its viewing position is placed on the line from the
-current drone position toward the patch center, offset from that center by the
-middle of the modeled camera footprint (about 6.1 m with the defaults). This
-puts the attraction between the drone and patch when there is enough viewing
-distance. A drone outside an inner patch can therefore look inward instead of
-flying past it to a permanently border-facing viewpoint. If already too close,
-the camera's minimum viewing distance can require stepping back. Blocked,
-retired, or geometrically invalid viewpoints use the nearest valid alternative
-angle. Every candidate must fit the entire patch with the 0.5 m margin.
+The lowest-cost reachable viewpoint is selected across the whole field:
 
-Selection scores obstacle-aware travel distance and peer crowding as
-`1 / (1 + travel_distance / camera_range) / crowding_penalty`, with the existing
-outward startup preference on the first selection. Each drone retains one
-selected attraction and direction until the patch is observed or invalidated;
-its viewpoint does not move as the drone approaches or as coverage is partial.
-Camera attention compares the distance to this selected attraction against the
-distance to the eligible local cow-group center, facing the patch when the
-attraction is closer and the cows otherwise.
+```text
+cost = travel_cells
+     + search_wall_weight * min(wall_distance_cells, search_wall_cap_cells)
+     + search_peer_weight * sum(max(0, search_peer_radius_cells - peer_distance_cells))
+```
 
-Set `<search_border_first>0</search_border_first>` in `grid_config.xml` (or the
-boolean `search_border_first` ROS parameter at startup) to select nearby
-unfinished patches across all bands. Both settings share the same controller.
-Wavefront travel rejects exclusions and diagonal corner cutting. A viewpoint
-that produces no new coverage in three aligned arrival observations is retired
-for 10 simulation seconds so an alternative can be selected.
+Travel is an eight-neighbor shortest-path distance around cow and peer exclusions,
+with diagonal corner cutting forbidden. Wall distance is the viewpoint's distance
+to the nearest field edge; peer distance is from that viewpoint to each other
+drone. All distances are in 0.5 m coverage cells by default. There are no border
+bands, startup scoring bias, information-gain score, or exclusive territories.
+Observed cells only determine whether a patch is still unfinished.
+
+Tune these values in `grid_config.xml` or the corresponding startup ROS parameters:
+
+| Parameter | Default | Effect |
+| --- | --- | --- |
+| `search_wall_weight` | 0.2 | Small preference for nearby field borders |
+| `search_wall_cap_cells` | 10 | Caps the wall cost at 2 with the default weight |
+| `search_peer_weight` | 2.0 | Strength of the nearby-drone penalty |
+| `search_peer_radius_cells` | 10 | Peer influence ends at 5 m with 0.5 m cells |
+
+All values must be finite and nonnegative. Zero weight disables that term. These
+parameters replace `search_border_first`; rebuild the package and restart its
+nodes after editing XML. Positive attraction strength is `1 / (1 + cost)`.
+Equal-cost viewpoints prefer the current travel heading, using the initial
+separation heading while the startup turn is pending. Each drone retains one
+selected viewpoint until its patch is observed, blocked, or retired, so partial
+coverage and peer motion do not continuously move the target. A viewpoint that
+makes no patch-coverage progress in three aligned arrival observations is retired
+for 10 simulation seconds. Camera attention compares the distance to the selected
+viewpoint against the eligible local cow-group center, facing the patch when the
+viewpoint is closer and the cows otherwise.
 
 Global search destination selection runs at most once per second by default
 (`search_planning_period_s`, a positive startup parameter on each grid node).
@@ -227,12 +238,9 @@ both versions used `-O2`; each heading is now evaluated once instead of twice.
 These are isolated CPU timings, not a measurement of full simulation speed.
 
 Search viewpoints and existing cow push points feed **one scalar field every
-cycle**. There are no search/herding phases. Each active group starts with equal
-weight; scores are normalized within groups. Lack of coverage or cow-distance
-progress increases that group's weight by a bounded multiplier from 1 to 2 over
-30 simulation seconds. Cow progress uses geometric association and two 5-second
-median distance windows. When only one group has objectives, it receives the
-full weight.
+cycle**. There are no search/herding phases. The configured attraction split is
+60% search and 40% cow pushing by default; scores are normalized within groups.
+When only one group has objectives, it receives the full weight.
 
 Objective cells are weighted absorbing cells, with the discrete update
 `U = (left + right + up + down) / (4 + lambda)`. Other free cells use Laplace's
@@ -241,8 +249,8 @@ The absorption budget is 32 at 0.5 m resolution, scaled by cell area; coincident
 objectives accumulate with a cap. This allows strengths to affect the same
 solve without making weak targets repulsive. Existing gradient navigation and
 geodesic recovery use this field. Invalid/nonconverged fields publish a hold,
-replacing stale waypoints. Camera heading scores both new coverage and visible
-active cows with the same group weights.
+replacing stale waypoints. Camera attention follows the nearer search viewpoint
+or eligible local cow-group center independently of these attraction weights.
 
 This is a heuristic balance, not a guarantee of complete coverage or finite-time
 herding for every layout. Peer crowding reduces duplicate effort without a
@@ -298,8 +306,8 @@ is chosen from the drone's current approach side, then its viewing position and
 direction remain fixed until the patch is fully observed, blocked, or retired.
 Partial observations never shift a patch or its selected attraction. Local and peer camera reports remove
 completed patches; reaching a viewpoint alone does not count as coverage.
-Outer bands are searched before inner bands, with nearby reachable patches
-preferred within a band. Search and cow pushing still share the potential field.
+Nearby reachable viewpoints are preferred using the capped wall cost and local
+peer penalty described above. Search and cow pushing still share the potential field.
 
 A cow-pushing intermediate goal inside or exactly on any cow's 2 m exclusion
 radius is omitted. It creates no green goal, attraction, or recovery target;
@@ -310,10 +318,11 @@ each local update and return when the blocking cow moves clear.
 On startup, drones wait for peer poses and initially turn away from the other
 drones' centroid before translating. For two drones these headings are opposite.
 Coincident starting positions use deterministic headings spaced by drone index.
-The first search attraction is biased in that same outward direction; subsequent
-patches use normal border-first selection. This discourages duplicate searching
-without assigning SEARCH/HERD modes or exclusive territories. Cow forces can
-still influence the eventual path. A single drone skips the initial turn.
+The first and subsequent search attractions use the same distance-only cost;
+the outward direction breaks equal-cost ties during the initial turn. The nearby
+peer penalty discourages duplicate searching without assigning SEARCH/HERD modes
+or exclusive territories. Cow forces can still influence the eventual path.
+A single drone skips the initial turn.
 
 Camera attention compares two planar distances from the drone: the distance to
 the selected global search **attraction/viewpoint**, and the distance to the

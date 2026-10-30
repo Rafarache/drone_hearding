@@ -47,7 +47,7 @@ struct GridConfig
   bool show_occupancy_grid{false};
   bool show_vector_grid{false};
   bool show_coverage_map{false};
-  bool search_border_first{true};
+  grid_visualizer_pkg::SearchSelectionSettings search_selection;
   double stall_window_s{6},stall_motion_m{0.4},recovery_release_m{1};
   grid_visualizer_pkg::RecoverySettings recovery;
   double search_attraction_percent{60.0};
@@ -130,8 +130,11 @@ GridConfig load_grid_config(const std::string& source_path = "")
     read_required<int>(storage, "show_vector_grid") != 0;
   config.show_coverage_map =
     read_required<int>(storage, "show_coverage_map") != 0;
-  config.search_border_first =
-    read_required<int>(storage, "search_border_first") != 0;
+  config.search_selection.wall_weight = read_required<double>(storage, "search_wall_weight");
+  config.search_selection.wall_cap_cells = read_required<double>(storage, "search_wall_cap_cells");
+  config.search_selection.peer_weight = read_required<double>(storage, "search_peer_weight");
+  config.search_selection.peer_radius_cells = read_required<double>(storage, "search_peer_radius_cells");
+  config.search_selection.validate();
   config.search_attraction_percent = read_required<double>(storage, "search_attraction_percent");
   config.cow_attraction_percent = read_required<double>(storage, "cow_attraction_percent");
   if (!std::isfinite(config.search_attraction_percent) ||
@@ -317,7 +320,12 @@ public:
     config_.show_vector_grid = declare_parameter<bool>("show_vector_grid", config_.show_vector_grid);
     config_.show_occupancy_grid = declare_parameter<bool>("show_occupancy_grid", config_.show_occupancy_grid);
     config_.show_coverage_map = declare_parameter<bool>("show_coverage_map", config_.show_coverage_map);
-    config_.search_border_first = declare_parameter<bool>("search_border_first", config_.search_border_first);
+    auto& selection=config_.search_selection;
+    selection.wall_weight=declare_parameter<double>("search_wall_weight",selection.wall_weight);
+    selection.wall_cap_cells=declare_parameter<double>("search_wall_cap_cells",selection.wall_cap_cells);
+    selection.peer_weight=declare_parameter<double>("search_peer_weight",selection.peer_weight);
+    selection.peer_radius_cells=declare_parameter<double>("search_peer_radius_cells",selection.peer_radius_cells);
+    selection.validate();
     search_near_ = declare_parameter<double>("search_near_m", 2.0);
     search_far_ = declare_parameter<double>("search_far_m", 10.0);
     search_fov_ = declare_parameter<double>("search_fov_rad", 2.09);
@@ -1303,12 +1311,16 @@ private:
       if (latest_search_views_.empty() || blocked(latest_search_views_.front().position) ||
         retired(latest_search_views_.front().position) || coverage_->patch_remaining(
           latest_search_views_.front().look_at,search_near_,search_far_,search_fov_)==0) {
+        const double yaw=std::atan2(2*(drone_pose->orientation.w*drone_pose->orientation.z+
+          drone_pose->orientation.x*drone_pose->orientation.y),
+          1-2*(drone_pose->orientation.y*drone_pose->orientation.y+
+          drone_pose->orientation.z*drone_pose->orientation.z));
+        const grid_visualizer_pkg::SearchPoint direction=startup_heading_pending_ ?
+          startup_direction_ : grid_visualizer_pkg::SearchPoint{std::cos(yaw),std::sin(yaw)};
         latest_search_views_ = coverage_->views(
         {grid_center.x, grid_center.y}, peers, blocked, search_near_, search_far_, search_fov_,
-        1, retired, config_.search_border_first,
-        first_search_selected_ ? nullptr : &startup_direction_);
+        1, retired, config_.search_selection, &direction);
         if(!latest_search_views_.empty()) {
-          first_search_selected_=true;
           const auto& view=latest_search_views_.front();
           RCLCPP_INFO(get_logger(),
             "search viewpoint: patch=(%.2f,%.2f) attraction=(%.2f,%.2f) from=(%.2f,%.2f)",
@@ -1325,8 +1337,6 @@ private:
       [&](const auto& view) {
         return blocked(view.position) || retired(view.position) || coverage_->patch_remaining(view.look_at,search_near_,search_far_,search_fov_)==0;
       }), search_views.end());
-    active_search_max_depth_ = search_views.empty() ? std::numeric_limits<double>::infinity() :
-      search_views.front().max_border_depth;
     // Fixed configured split; unused attraction budget goes to the available task.
     const bool searching = !search_views.empty();
     const bool herding = !current_push_objectives.empty();
@@ -2461,10 +2471,9 @@ private:
   cv::Point2f commanded_movement_{0,0};
   cv::Point2f command_origin_{0,0};
   double search_weight_{0},herd_weight_{0};
-  bool startup_heading_initialized_{false},startup_heading_pending_{false},first_search_selected_{false};
+  bool startup_heading_initialized_{false},startup_heading_pending_{false};
   grid_visualizer_pkg::SearchPoint startup_direction_{0,0};
   std::map<int,std::size_t> patch_previous_remaining_;
-  double active_search_max_depth_{std::numeric_limits<double>::infinity()};
   bool stopped_{false};
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PolygonStamped>::SharedPtr observation_sub_;

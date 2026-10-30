@@ -13,7 +13,7 @@ int main()
   double checksum=0;
   auto start=std::chrono::steady_clock::now();
   for (int n=0;n<30;++n) {
-    auto views=coverage.views({n*.01,0},{{0,2}},blocked,2,10,2.09,12,{},true);
+    auto views=coverage.views({n*.01,0},{{0,2}},blocked,2,10,2.09,12);
     for (auto view:views) {checksum+=view.score;}
   }
   auto middle=std::chrono::steady_clock::now();

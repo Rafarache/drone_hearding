@@ -40,7 +40,27 @@ struct SearchView
   SearchPoint position;
   SearchPoint look_at;
   double score;
-  double max_border_depth{std::numeric_limits<double>::infinity()};
+};
+
+// All distances in the selection cost are measured in coverage cells. Keep the
+// border preference bounded so a distant edge cannot override nearby work.
+struct SearchSelectionSettings
+{
+  double wall_weight{0.2};
+  double wall_cap_cells{10.0};
+  double peer_weight{2.0};
+  double peer_radius_cells{10.0};
+
+  void validate() const
+  {
+    if (!std::isfinite(wall_weight) || wall_weight < 0 ||
+      !std::isfinite(wall_cap_cells) || wall_cap_cells < 0 ||
+      !std::isfinite(peer_weight) || peer_weight < 0 ||
+      !std::isfinite(peer_radius_cells) || peer_radius_cells < 0)
+    {
+      throw std::invalid_argument("Search distance weights and limits must be finite and nonnegative");
+    }
+  }
 };
 
 // Same conservative camera box as yolo_pkg.search_observation. Coordinates are
@@ -121,8 +141,7 @@ public:
     return added;
   }
 
-  std::size_t gain(SearchPoint p, double yaw, double near, double far, double fov,
-    double max_border_depth=std::numeric_limits<double>::infinity()) const
+  std::size_t gain(SearchPoint p, double yaw, double near, double far, double fov) const
   {
     const auto bounds=window(p.x-far,p.y-far,p.x+far,p.y+far);
     const ObservationBox box(near,far,fov);
@@ -133,7 +152,6 @@ public:
         int i=r*cols_+c;
         if (seen_[i]) {continue;}
         auto q=point(i);
-        if (border_depth(q)>=max_border_depth) {continue;}
         const double dx=q.x-p.x, dy=q.y-p.y;
         const double forward=dx*cosine+dy*sine, lateral=-dx*sine+dy*cosine;
         if (forward>=box.front-1e-9 && forward<=box.back+1e-9 &&
@@ -189,8 +207,10 @@ public:
     SearchPoint drone, const std::vector<SearchPoint>& peers,
     const std::function<bool(SearchPoint)>& blocked,
     double near, double far, double fov, int max_views=12,
-    const std::function<bool(SearchPoint)>& retired={}, bool border_first=false, const SearchPoint* preferred_direction=nullptr) const
+    const std::function<bool(SearchPoint)>& retired={},
+    const SearchSelectionSettings& settings={}, const SearchPoint* travel_direction=nullptr) const
   {
+    settings.validate();
     if (count_==seen_.size() || max_views<=0) {return {};}
     // One global wavefront per planning update; disallow diagonal corner cutting.
     std::vector<uint8_t> free(seen_.size());
@@ -228,12 +248,9 @@ public:
     const ObservationBox box(near,far,fov);
     const double offset=(box.front+box.back)/2;
     std::vector<SearchView> result;
-    int best_band=std::numeric_limits<int>::max();
     for(const auto& patch:patches_) {
       const auto target=patch.center;
       if(!patch_remaining(target,near,far,fov)) {continue;}
-      const int band=border_first ? static_cast<int>(border_depth(target)/(far/2)):0;
-      if(band>best_band) {continue;}
       const double bearing=std::atan2(target.y-drone.y,target.x-drone.x);
       const double pi=std::acos(-1.0);
       SearchPoint view{};
@@ -272,19 +289,25 @@ public:
         for(double heading:headings) {if(choose_view(heading)) {break;}}
       }
       if(j<0) {continue;}
-      if(band<best_band) {result.clear();best_band=band;}
-      double crowd=1;
-      for(auto peer:peers) {crowd+=std::max(0.0,1-distance(view,peer)/far);}
-      double preference=1;
-      if(preferred_direction) {
-        double dx=target.x-drone.x,dy=target.y-drone.y,d=std::hypot(dx,dy);
-        if(d>0) {preference=std::exp(4*(dx*preferred_direction->x+dy*preferred_direction->y)/d);}
+      double cost=costs[j]/cell_ + settings.wall_weight *
+        std::min(border_depth(view)/cell_,settings.wall_cap_cells);
+      for(auto peer:peers) {
+        cost+=settings.peer_weight *
+          std::max(0.0,settings.peer_radius_cells-distance(view,peer)/cell_);
       }
-      result.push_back({view,target,preference/((1+costs[j]/far)*crowd),
-        border_first ? (band+1)*far/2:inf});
+      // Retain the positive attraction-strength interface: higher score means
+      // lower distance cost. No observation-gain term enters the ranking.
+      result.push_back({view,target,1.0/(1.0+cost)});
     }
-    std::stable_sort(result.begin(),result.end(),[](const SearchView& a,const SearchView& b) {
-      return a.score>b.score;
+    std::stable_sort(result.begin(),result.end(),[&](const SearchView& a,const SearchView& b) {
+      if(a.score!=b.score) {return a.score>b.score;}
+      if(!travel_direction) {return false;}
+      const double heading=std::atan2(travel_direction->y,travel_direction->x);
+      auto turn=[&](const SearchView& view) {
+        return std::abs(angle_difference(std::atan2(view.position.y-drone.y,
+          view.position.x-drone.x),heading));
+      };
+      return turn(a)<turn(b);
     });
     if(static_cast<int>(result.size())>max_views) {result.resize(max_views);}
     return result;

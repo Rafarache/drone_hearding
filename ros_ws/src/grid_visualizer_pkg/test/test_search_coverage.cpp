@@ -116,44 +116,105 @@ int main()
   edge.observe({{0,0},{4,0},{4,4},{0,4}});
   assert(!edge.views({2,2},{},free,2,10,2.09).empty());
 
-  // A central starting footprint must not pull outside-in search toward the
-  // nearby frontier: all targets belong to the outermost unvisited 5 m band.
-  SearchCoverage outside_in(-50,-30,100,60,0.5);
-  outside_in.observe(patch);
-  auto border_views=outside_in.views({0,0},{},free,2,10,2.09,12,{},true);
-  assert(!border_views.empty());
-  for (const auto& view:border_views) {
-    assert(outside_in.border_depth(view.look_at)<5);
-    assert(view.max_border_depth==5);
-    assert(distance({0,0},view.position)>19);
-    assert(outside_in.gain(view.position,
-      std::atan2(view.look_at.y-view.position.y,view.look_at.x-view.position.x),
-      2,10,2.09,view.max_border_depth)>0);
+  // Leave only specified 2 m patches unfinished in a controlled scenario.
+  auto leave_patches=[](SearchCoverage& coverage,const std::vector<SearchPoint>& centers) {
+    for(int r=0;r<coverage.rows();++r) {for(int c=0;c<coverage.cols();++c) {
+      auto q=coverage.point(r*coverage.cols()+c);
+      bool keep=false;
+      for(auto center:centers) {
+        keep=keep || (std::abs(q.x-center.x)<1 && std::abs(q.y-center.y)<1);
+      }
+      if(!keep) {coverage.observe({{q.x-.25,q.y-.25},{q.x+.25,q.y-.25},
+        {q.x+.25,q.y+.25},{q.x-.25,q.y+.25}});}
+    }}
+  };
+  // Nearby unfinished work wins even while remote border patches remain.
+  SearchCoverage local(-50,-30,100,60,.5);
+  leave_patches(local,{{7,1},{-49,-29}});
+  auto nearby=local.views({0,0},{},free,2,10,2.09,1);
+  assert(nearby.size()==1 && distance(nearby.front().look_at,{7,1})<1e-9);
+  assert(distance(nearby.front().position,{0,0})<2);
+  assert(local.border_depth(nearby.front().look_at)>5);
+
+  // The wall preference can change the choice among nearby candidates, but is
+  // bounded: a sufficiently remote border cannot dominate travel distance.
+  SearchCoverage wall(0,0,40,40,.5);
+  leave_patches(wall,{{3,11},{17,11}});
+  SearchSelectionSettings settings;
+  settings.wall_weight=0;
+  auto closest=wall.views({10,10},{},free,2,10,2.09,1,{},settings).front();
+  assert(distance(closest.look_at,{17,11})<1e-9);
+  settings.wall_weight=1;
+  settings.wall_cap_cells=100;
+  auto near_wall=wall.views({10,10},{},free,2,10,2.09,1,{},settings).front();
+  assert(distance(near_wall.look_at,{3,11})<1e-9);
+  assert(wall.border_depth(near_wall.position)<wall.border_depth(closest.position));
+  settings.wall_cap_cells=1;
+  assert(distance(wall.views({10,10},{},free,2,10,2.09,1,{},settings).front().look_at,
+    closest.look_at)<1e-9);
+
+  // A peer near the otherwise preferred viewpoint changes the selection.
+  // Beyond the finite penalty radius it has no effect at all.
+  settings=SearchSelectionSettings{};
+  settings.wall_weight=0;
+  auto separated=wall.views({10,10},{closest.position},free,2,10,2.09,1,{},settings).front();
+  assert(distance(separated.look_at,{3,11})<1e-9);
+  auto distant_peer=wall.views({10,10},{{100,100}},free,2,10,2.09,1,{},settings).front();
+  assert(distance(distant_peer.look_at,closest.look_at)<1e-9);
+  assert(distant_peer.score==closest.score);
+  settings.peer_weight=0;
+  assert(distance(wall.views({10,10},{closest.position},free,2,10,2.09,1,{},settings)
+    .front().look_at,closest.look_at)<1e-9);
+
+  // Partial coverage does not enter the cost or shift the viewpoint. Only
+  // completion removes the patch, after which the other patch is selected.
+  wall.observe({{16,10},{17,10},{17,12},{16,12}});
+  auto partial_cost=wall.views({10,10},{},free,2,10,2.09,1,{},settings).front();
+  assert(distance(partial_cost.look_at,closest.look_at)<1e-9);
+  assert(partial_cost.score==closest.score);
+  wall.observe({{17,10},{18,10},{18,12},{17,12}});
+  assert(distance(wall.views({10,10},{},free,2,10,2.09,1,{},settings).front().look_at,
+    near_wall.look_at)<1e-9);
+  assert(wall.views({10,10},{},free,2,10,2.09,1,[](SearchPoint){return true;}).empty());
+
+  // A full-height exclusion makes the opposite-side patch unreachable.
+  SearchCoverage divided(-20,-20,40,40,.5);
+  leave_patches(divided,{{-3,1},{7,1}});
+  auto barrier=[](SearchPoint p) {return std::abs(p.x)<=.5;};
+  auto reachable=divided.views({-10,1},{},barrier,2,10,2.09,12);
+  assert(reachable.size()==1 && distance(reachable.front().look_at,{-3,1})<1e-9);
+
+  // Direction is only a tie-break: it cannot displace a lower-cost viewpoint.
+  SearchCoverage ties(-20,-20,40,40,.5);
+  settings.wall_weight=0;
+  auto equal_views=ties.views({.25,.25},{},free,2,10,2.09,10000,{},settings);
+  assert(equal_views.size()>1 && equal_views[0].score==equal_views[1].score);
+  auto preferred=equal_views[1].position;
+  SearchPoint direction{preferred.x-.25,preferred.y-.25};
+  auto aligned=ties.views({.25,.25},{},free,2,10,2.09,1,{},settings,&direction).front();
+  assert(aligned.score==equal_views[0].score && distance(aligned.position,preferred)<1e-9);
+  direction={-1,0};
+  assert(distance(local.views({0,0},{},free,2,10,2.09,1,{},settings,&direction)
+    .front().look_at,{7,1})<1e-9);
+
+  // Invalid startup/ROS tuning must fail before it can seed NaN strengths.
+  for(double invalid:{-1.0,std::numeric_limits<double>::infinity(),
+    std::numeric_limits<double>::quiet_NaN()}) {
+    for(int parameter=0;parameter<4;++parameter) {
+      settings=SearchSelectionSettings{};
+      double* values[]={&settings.wall_weight,&settings.wall_cap_cells,
+        &settings.peer_weight,&settings.peer_radius_cells};
+      *values[parameter]=invalid;
+      bool rejected=false;
+      try {local.views({0,0},{},free,2,10,2.09,1,{},settings);}
+      catch(const std::invalid_argument&) {rejected=true;}
+      assert(rejected);
+    }
   }
-  assert(outside_in.gain({0,0},0,2,10,2.09,5)==0);
-  // If all outer viewpoints are temporarily retired, a deeper reachable band
-  // remains useful instead of stopping the entire search.
-  auto deeper=outside_in.views({0,0},{},free,2,10,2.09,12,
-    [&](SearchPoint p) {return outside_in.border_depth(p)<10;},true);
-  assert(!deeper.empty() && deeper.front().max_border_depth>5);
-  assert(outside_in.views({0,0},{},free,2,10,2.09,12,
-    [](SearchPoint) {return true;},true).empty());
-  outside_in.observe({{-50,-30},{50,-30},{50,-25},{-50,-25}});
-  outside_in.observe({{-50,25},{50,25},{50,30},{-50,30}});
-  outside_in.observe({{-50,-25},{-45,-25},{-45,25},{-50,25}});
-  outside_in.observe({{45,-25},{50,-25},{50,25},{45,25}});
-  border_views=outside_in.views({0,0},{},free,2,10,2.09,12,{},true);
-  assert(!border_views.empty());
-  for (const auto& view:border_views) {
-    assert(view.max_border_depth==10);
-    assert(outside_in.border_depth(view.look_at)>=5 && outside_in.border_depth(view.look_at)<10);
-  }
-  outside_in.observe({{-50,-30},{50,-30},{50,30},{-50,30}});
-  assert(outside_in.views({0,0},{},free,2,10,2.09,12,{},true).empty());
 
   // A single correctly oriented observation covers the selected fixed patch.
   SearchCoverage fixed(-50,-50,100,100,.5);
-  auto first=fixed.views({0,0},{},free,2,10,2.09,1,{},true).front();
+  auto first=fixed.views({0,0},{},free,2,10,2.09,1).front();
   const auto before=fixed.patch_remaining(first.look_at,2,10,2.09);
   const double yaw=std::atan2(first.look_at.y-first.position.y,first.look_at.x-first.position.x);
   assert(fixed.patch_gain(first.look_at,first.position,yaw,2,10,2.09)==before);
@@ -161,7 +222,7 @@ int main()
     {first.look_at.x,first.look_at.y-1},{first.look_at.x,first.look_at.y+1},
     {first.look_at.x-1,first.look_at.y+1}});
   assert(fixed.patch_remaining(first.look_at,2,10,2.09)>0);
-  auto partial=fixed.views({0,0},{},free,2,10,2.09,10000,{},true);
+  auto partial=fixed.views({0,0},{},free,2,10,2.09,10000);
   assert(std::any_of(partial.begin(),partial.end(),[&](auto v) {
     return distance(v.look_at,first.look_at)<1e-8 && distance(v.position,first.position)<1e-8;
   }));
@@ -175,7 +236,6 @@ int main()
   }
   fixed.observe(polygon);
   assert(fixed.patch_remaining(first.look_at,2,10,2.09)==0);
-  SearchCoverage spread(-50,-50,100,100,.5);
   auto north=separation_direction({0,2},{{0,0}},1,2);
   auto south=separation_direction({0,0},{{0,2}},0,2);
   assert(north.x==0 && north.y==1 && south.x==0 && south.y== -1);
@@ -183,9 +243,8 @@ int main()
   auto overlap1=separation_direction({0,0},{{0,0}},1,2);
   assert(distance(overlap0,overlap1)>1.99);
   assert(distance(separation_direction({0,0},{},0,1),{0,0})==0);
-  auto n=spread.views({0,2},{{0,0}},free,2,10,2.09,1,{},true,&north).front();
-  auto south_view=spread.views({0,0},{{0,2}},free,2,10,2.09,1,{},true,&south).front();
-  assert(n.look_at.y>40 && south_view.look_at.y< -40);
+  // Startup directions still turn the drones apart; target ranking now uses
+  // exactly the same three distance terms for first and subsequent selections.
 
   // Solve a small domain and verify the absorption maximum principle and
   // monotonic response to stronger targets, rather than just its update formula.

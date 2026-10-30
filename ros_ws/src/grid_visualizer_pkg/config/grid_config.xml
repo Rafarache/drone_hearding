@@ -29,8 +29,12 @@
   <recovery_backtrack_m>1.0</recovery_backtrack_m>
   <recovery_opposition_s>1.0</recovery_opposition_s>
   <recovery_arrival_m>0.5</recovery_arrival_m>
-  <!-- Search the outermost reachable unvisited band before moving inward. -->
-  <search_border_first>1</search_border_first>
+  <!-- Minimize travel + capped wall distance + nearby peer distance penalty.
+       All distances are in coverage cells; 10 cells = 5 m at this resolution. -->
+  <search_wall_weight>0.2</search_wall_weight>
+  <search_wall_cap_cells>10.0</search_wall_cap_cells>
+  <search_peer_weight>2.0</search_peer_weight>
+  <search_peer_radius_cells>10.0</search_peer_radius_cells>
   <!-- Fixed attraction budget split when both search and cow targets exist. -->
   <search_attraction_percent>60.0</search_attraction_percent>
   <cow_attraction_percent>40.0</cow_attraction_percent>

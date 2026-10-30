@@ -15,14 +15,36 @@ test("scenario editor, batch repeats, replay controls, configuration, comparison
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await dialog.getByLabel("Scenario name").fill(temporaryName);
-  await dialog.getByLabel("Occupancy grids", {exact:true}).check();
-  await dialog.getByLabel("Gazebo simulation", {exact:true}).check();
+  await expect(
+    dialog.getByLabel("Goal radius (m)", { exact: true }),
+  ).toHaveValue("3");
+  await expect(
+    dialog.getByLabel("Completion radius (m)", { exact: true }),
+  ).toHaveValue("5");
+  await expect(
+    dialog.getByLabel("Extended goal radius (m)", { exact: true }),
+  ).toHaveValue("5");
+  await dialog.getByLabel("Goal radius (m)", { exact: true }).fill("3.2");
+  await dialog.getByLabel("Completion radius (m)", { exact: true }).fill("5.7");
+  await dialog
+    .getByLabel("Extended goal radius (m)", { exact: true })
+    .fill("6.4");
+  await dialog.getByLabel("Occupancy grids", { exact: true }).check();
+  await dialog.getByLabel("Gazebo simulation", { exact: true }).check();
   await dialog.getByLabel("Cows · linear (m/s)").fill("0.3");
   await dialog.getByLabel("Limit (simulated minutes)").fill("1");
   await dialog
     .getByRole("button", { name: "Save scenario", exact: true })
     .click();
   await expect(dialog).not.toBeVisible();
+  const savedScenario = (
+    await (await request.get("/api/scenarios")).json()
+  ).find((s: { name: string }) => s.name === temporaryName);
+  expect(savedScenario.goal).toMatchObject({
+    radius_m: 3.2,
+    completion_radius_m: 5.7,
+    extended_radius_m: 6.4,
+  });
   await page
     .getByRole("navigation")
     .getByRole("button", { name: /Scenarios/ })
@@ -47,9 +69,17 @@ test("scenario editor, batch repeats, replay controls, configuration, comparison
     .click();
   const runs = await (await request.get("/api/runs")).json();
   const recorded = runs
-    .filter((run: {status:string;simulation_duration_s?:number}) =>
-      ['success','timed_out','cancelled'].includes(run.status) && (run.simulation_duration_s||0)>10)
-    .sort((a:{simulation_duration_s:number},b:{simulation_duration_s:number})=>b.simulation_duration_s-a.simulation_duration_s)[0];
+    .filter(
+      (run: { status: string; simulation_duration_s?: number }) =>
+        ["success", "timed_out", "cancelled"].includes(run.status) &&
+        (run.simulation_duration_s || 0) > 10,
+    )
+    .sort(
+      (
+        a: { simulation_duration_s: number },
+        b: { simulation_duration_s: number },
+      ) => b.simulation_duration_s - a.simulation_duration_s,
+    )[0];
   if (recorded) {
     await page
       .getByRole("button")
@@ -58,7 +88,9 @@ test("scenario editor, batch repeats, replay controls, configuration, comparison
     const slider = page.getByRole("slider", {
       name: "Replay time in simulation seconds",
     });
-    await slider.fill(String(Math.round(recorded.simulation_duration_s * 10) / 20));
+    await slider.fill(
+      String(Math.round(recorded.simulation_duration_s * 10) / 20),
+    );
     await page.getByLabel("Playback speed").selectOption("4");
     await page.getByLabel("Path trail duration").selectOption("full");
     await page
@@ -117,10 +149,11 @@ test("scenario editor, batch repeats, replay controls, configuration, comparison
     await request.delete("/api/scenarios/" + s.id);
 });
 
-
 test.afterEach(async ({ request }) => {
-  const scenarios = await (await request.get('/api/scenarios')).json();
-  for (const scenario of scenarios.filter((s: {name:string}) => s.name.startsWith('Browser validation scenario'))) {
-    await request.delete('/api/scenarios/' + scenario.id);
+  const scenarios = await (await request.get("/api/scenarios")).json();
+  for (const scenario of scenarios.filter((s: { name: string }) =>
+    s.name.startsWith("Browser validation scenario"),
+  )) {
+    await request.delete("/api/scenarios/" + scenario.id);
   }
 });

@@ -55,6 +55,24 @@ def test_success_requires_all_cows_and_clears_at_one_snapshot(tmp_path, manifest
     writer.close()
 
 
+def test_completion_and_metrics_use_completion_radius_not_herding_radius(tmp_path, manifest):
+    manifest['scenario']['goal'] = {'x': 0, 'y': 0, 'radius_m': 3,
+                                    'completion_radius_m': 5, 'extended_radius_m': 5}
+    path = tmp_path / 'positions.sqlite3'
+    writer = TrajectoryWriter(path)
+    recorder = Recording(manifest, writer)
+    recorder.update_clock(0)
+    recorder.update_positions(entities(x=5.1))
+    assert recorder.outcome is None
+    recorder.update_clock(.1)
+    recorder.update_positions(entities(x=5))
+    assert recorder.outcome == 'success'
+    writer.close()
+    result = summarize(path, manifest['scenario'], ['cow0'])
+    assert result['cows_at_goal'] == 1
+    assert result['entities'][0]['first_goal_arrival_s'] == .1
+
+
 def test_metrics_stops_3d_and_gaps(tmp_path, manifest):
     path = tmp_path / 'positions.sqlite3'
     writer = TrajectoryWriter(path)

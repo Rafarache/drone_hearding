@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useRef } from "react";
-import { Scenario, Frame, Detection, Point, label } from "./types";
+import {
+  Scenario,
+  Frame,
+  Detection,
+  Point,
+  label,
+  completionRadius,
+  extendedRadius,
+} from "./types";
 import { interpolate, trailOpacity, searchAtTime } from "./replay";
 const drones = ["#2684de", "#5469d4", "#198c93", "#865ad3"];
 const cows = ["#d86f4d", "#b98b2e", "#ca565e", "#9b6b51"];
@@ -193,6 +201,28 @@ export function MapCanvas({
     context.lineWidth = 1.5;
     context.stroke();
     context.setLineDash([]);
+    const completion = completionRadius(scenario.goal);
+    const extended = extendedRadius(scenario.goal);
+    if (completion !== scenario.goal.radius_m) {
+      context.beginPath();
+      context.arc(goal[0], goal[1], completion * scale, 0, Math.PI * 2);
+      context.setLineDash([8, 4]);
+      context.strokeStyle = "#198c93";
+      context.stroke();
+    }
+    if (
+      scenario.goal.extended_radius_m !== undefined &&
+      extended !== completion &&
+      extended !== scenario.goal.radius_m
+    ) {
+      context.beginPath();
+      context.arc(goal[0], goal[1], extended * scale, 0, Math.PI * 2);
+      context.setLineDash([2, 4]);
+      context.strokeStyle = "#7b8c99";
+      context.stroke();
+    }
+    context.setLineDash([]);
+    context.strokeStyle = "#2ca783";
     context.beginPath();
     context.moveTo(goal[0] - 6, goal[1]);
     context.lineTo(goal[0] + 6, goal[1]);

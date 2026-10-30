@@ -29,10 +29,13 @@ def defaults(sources=None):
     drone = ET.parse(sources['drone_control_config.xml']).getroot().find('motion')
     field = simulation.find('map').attrib
     goal = simulation.find('herding').attrib
+    grid = ET.parse(sources['grid_config.xml']).getroot()
     return Scenario(name='Default field',
                     map={k: float(field[k]) for k in ('center_x', 'center_y', 'width_m', 'height_m')},
                     goal={'x': float(goal['goal_x']), 'y': float(goal['goal_y']),
-                          'radius_m': float(goal['final_goal_reached_radius_m'])},
+                          'radius_m': float(goal.get('goal_radius_m', goal['final_goal_reached_radius_m'])),
+                          'completion_radius_m': float(goal['final_goal_reached_radius_m']),
+                          'extended_radius_m': float(grid.find('goal_quiet_radius_m').text)},
                     drones=[{'x': float(p.get('x')), 'y': float(p.get('y'))} for p in simulation.find('drones')],
                     cows=[{k: float(p.get(k)) for k in ('x', 'y', 'z')} for p in simulation.find('cows')],
                     speeds={'cow_linear_mps': float(cow.get('linear_velocity_mps')),
@@ -59,7 +62,7 @@ def snapshot(run_dir, scenario, sources=None, resolve_world=None):
     target.mkdir(parents=True)
     for name, source in sources.items():
         shutil.copyfile(source, target / name)
-    scenario = scenario.model_dump() if isinstance(scenario, Scenario) else scenario
+    scenario = Scenario.model_validate(scenario).model_dump()
     trees = {name: ET.parse(target / name) for name in FILES if name.endswith('.xml')}
     root = trees['simulation.xml'].getroot()
     runtime = root.find('runtime')
@@ -79,7 +82,8 @@ def snapshot(run_dir, scenario, sources=None, resolve_world=None):
     for key, value in scenario['map'].items():
         root.find('map').set(key, str(value))
     for key, value in [('goal_x', scenario['goal']['x']), ('goal_y', scenario['goal']['y']),
-                       ('final_goal_reached_radius_m', scenario['goal']['radius_m'])]:
+                       ('goal_radius_m', scenario['goal']['radius_m']),
+                       ('final_goal_reached_radius_m', scenario['goal']['completion_radius_m'])]:
         root.find('herding').set(key, str(value))
     for group, tag in [('drones', 'drone'), ('cows', 'cow')]:
         parent = root.find(group)
@@ -93,10 +97,9 @@ def snapshot(run_dir, scenario, sources=None, resolve_world=None):
     drone = trees['drone_control_config.xml'].getroot().find('motion')
     drone.set('max_linear_velocity_mps', str(speeds['drone_linear_mps']))
     drone.set('max_angular_velocity_radps', str(speeds['drone_angular_radps']))
-    # Freeze goal quiet radius consistently for scenarios with a larger goal.
     grid = trees['grid_config.xml'].getroot()
     quiet = grid.find('goal_quiet_radius_m')
-    quiet.text = str(max(float(quiet.text), scenario['goal']['radius_m'] + .5))
+    quiet.text = str(scenario['goal']['extended_radius_m'])
     for name, setting in (('show_vector_grid', 'vectors'), ('show_occupancy_grid', 'occupancy'),
                           ('show_coverage_map', 'visited')):
         grid.find(name).text = '1' if views.get(setting) else '0'

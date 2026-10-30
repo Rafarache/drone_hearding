@@ -136,6 +136,9 @@ def _load_simulation_config(source_path):
         'goal_x': _required_float(herding, 'goal_x', source_path),
         'goal_y': _required_float(herding, 'goal_y', source_path),
         'final_goal_reached_radius': _required_float(herding, 'final_goal_reached_radius_m', source_path),
+        'goal_radius': _required_float(herding,
+            'goal_radius_m' if herding.get('goal_radius_m') is not None else 'final_goal_reached_radius_m',
+            source_path),
         'search_near_m': _required_float(search, 'near_m', source_path),
         'search_far_m': _required_float(search, 'far_m', source_path),
         'search_fov_rad': _required_float(search, 'horizontal_fov_rad', source_path),
@@ -151,6 +154,7 @@ def _load_simulation_config(source_path):
     if not (math.isfinite(config['search_observation_period_s']) and
             config['search_observation_period_s'] > 0 and
             config['final_goal_reached_radius'] > 0 and
+            config['goal_radius'] > 0 and
             0 <= config['search_near_m'] < 5 < config['search_far_m'] and
             0 < config['search_fov_rad'] <= 2 * math.pi):
         raise ValueError(f'Invalid goal radius or search footprint in {source_path}')
@@ -416,7 +420,7 @@ def _launch_setup(context):
                     name=f'grid{index}',
                     parameters=[
                         {
-                            **{key: config[key] for key in ('goal_x', 'goal_y', 'final_goal_reached_radius',
+                            **{key: config[key] for key in ('goal_x', 'goal_y', 'goal_radius',
                                                            'search_near_m', 'search_far_m', 'search_fov_rad')},
                             'config_file': overrides['grid_config_file'],
                             **({'show_vector_grid': False, 'show_occupancy_grid': False,

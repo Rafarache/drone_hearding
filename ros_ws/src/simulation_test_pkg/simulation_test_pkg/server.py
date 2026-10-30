@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 import csv
 import io
 import json
+import copy
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -185,8 +187,16 @@ def create_app(data_dir='/ros2_ws/test_results', web_dir=None, manage_worker=Tru
         original_world = store.run_dir(run_id) / 'config' / 'world.original.world'
         if not original_world.exists():
             original_world = store.run_dir(run_id) / 'config' / 'world.world'
+        scenario = copy.deepcopy(previous['scenario'])
+        # Older recordings had one shared radius; recover the frozen quiet
+        # radius too, rather than replacing it with today's scenario default.
+        herding = ET.parse(sources['simulation.xml']).getroot().find('herding')
+        goal = scenario['goal']
+        goal.setdefault('completion_radius_m', float(herding.get('final_goal_reached_radius_m')))
+        goal.setdefault('extended_radius_m', float(ET.parse(sources['grid_config.xml']).getroot()
+                                                   .find('goal_quiet_radius_m').text))
         batch_id = submit_batch(store, {'name': f"Rerun · {previous['scenario']['name']}",
-                                        'items': [{'scenario': previous['scenario']}]},
+                                        'items': [{'scenario': scenario}]},
                                 snapshotter=lambda directory, scenario: snapshot(
                                     directory, scenario, sources, lambda *args: original_world))
         return {'batch_id': batch_id}

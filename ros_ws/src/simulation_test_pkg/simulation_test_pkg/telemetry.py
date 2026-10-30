@@ -60,7 +60,8 @@ class Recording:
             self.sample(t)
         goal = self.scenario['goal']
         cows = [self.latest.get(name) for name, e in self.expected.items() if e['kind'] == 'cow']
-        if cows and all(e and math.hypot(e['pose'][0] - goal['x'], e['pose'][1] - goal['y']) <= goal['radius_m']
+        completion_radius = goal.get('completion_radius_m', goal['radius_m'])
+        if cows and all(e and math.hypot(e['pose'][0] - goal['x'], e['pose'][1] - goal['y']) <= completion_radius
                         for e in cows):
             self.sample(t)
             self.finish('success', 'All configured cows reached the goal in one snapshot')

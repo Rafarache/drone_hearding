@@ -62,7 +62,11 @@ export type Scenario = {
     width_m: number;
     height_m: number;
   };
-  goal: Point & { radius_m: number };
+  goal: Point & {
+    radius_m: number;
+    completion_radius_m?: number;
+    extended_radius_m?: number;
+  };
   drones: Point[];
   cows: Point[];
   speeds: {
@@ -179,11 +183,19 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   }
   return response.status === 204 ? (undefined as T) : response.json();
 }
+export const completionRadius = (goal: Scenario["goal"]) =>
+  goal.completion_radius_m ?? goal.radius_m;
+export const extendedRadius = (goal: Scenario["goal"]) =>
+  goal.extended_radius_m ?? Math.max(5, goal.radius_m + 0.5);
 export const scenarioOnly = (s: Scenario): Scenario => ({
   name: s.name,
   description: s.description,
   map: { ...s.map },
-  goal: { ...s.goal },
+  goal: {
+    ...s.goal,
+    completion_radius_m: completionRadius(s.goal),
+    extended_radius_m: extendedRadius(s.goal),
+  },
   drones: s.drones.map((p) => ({ ...p })),
   cows: s.cows.map((p) => ({ ...p })),
   speeds: { ...s.speeds },

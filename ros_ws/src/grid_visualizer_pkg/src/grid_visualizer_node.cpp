@@ -59,7 +59,7 @@ struct GridConfig
   int peer_drone_obstacle_radius_cells{1};
   double peer_drone_repulsion_potential{1.0};
   cv::Point2f goal_position{0.0f, 0.0f};
-  double final_goal_reached_radius{0.0};
+  double goal_radius{0.0};
   double goal_quiet_radius{0.0};
   double goal_quiet_duration_seconds{0.0};
   double max_goto_movement{0.0};
@@ -169,7 +169,7 @@ GridConfig load_grid_config(const std::string& source_path = "")
   config.control_period_ms =
     read_required<int>(storage, "control_period_ms");
   // Goal values are supplied by the authoritative simulation launch.
-  config.final_goal_reached_radius = 2.0;
+  config.goal_radius = 2.0;
   config.goal_quiet_radius =
     read_required<double>(storage, "goal_quiet_radius_m");
   config.goal_quiet_duration_seconds =
@@ -265,10 +265,10 @@ GridConfig load_grid_config(const std::string& source_path = "")
   if (
     !std::isfinite(config.goal_position.x) ||
     !std::isfinite(config.goal_position.y) ||
-    !std::isfinite(config.final_goal_reached_radius) ||
-    config.final_goal_reached_radius <= 0.0 ||
+    !std::isfinite(config.goal_radius) ||
+    config.goal_radius <= 0.0 ||
     !std::isfinite(config.goal_quiet_radius) ||
-    config.goal_quiet_radius <= config.final_goal_reached_radius ||
+    config.goal_quiet_radius <= 0.0 ||
     !std::isfinite(config.goal_quiet_duration_seconds) ||
     config.goal_quiet_duration_seconds <= 0.0 ||
     !std::isfinite(config.max_goto_movement) ||
@@ -303,16 +303,17 @@ public:
   {
     config_.goal_position = cv::Point2f(
       declare_parameter<double>("goal_x", -10.0), declare_parameter<double>("goal_y", -10.0));
-    config_.final_goal_reached_radius = declare_parameter<double>("final_goal_reached_radius", 2.0);
+    const double legacy_goal_radius = declare_parameter<double>("final_goal_reached_radius", 2.0);
+    config_.goal_radius = declare_parameter<double>("goal_radius", legacy_goal_radius);
     if (!std::isfinite(config_.goal_position.x) || !std::isfinite(config_.goal_position.y) ||
-      !std::isfinite(config_.final_goal_reached_radius) || config_.final_goal_reached_radius <= 0 ||
-      config_.goal_quiet_radius <= config_.final_goal_reached_radius) {
+      !std::isfinite(config_.goal_radius) || config_.goal_radius <= 0 ||
+      config_.goal_quiet_radius <= config_.goal_radius) {
       throw std::invalid_argument("Invalid goal parameters");
     }
     goal_quiet_zone_ = std::make_unique<grid_visualizer_pkg::GoalQuietZone>(
       grid_visualizer_pkg::CowPoint{config_.goal_position.x, config_.goal_position.y},
-      config_.final_goal_reached_radius, config_.goal_quiet_radius, config_.goal_quiet_duration_seconds);
-    latest_effective_goal_radius_ = config_.final_goal_reached_radius;
+      config_.goal_radius, config_.goal_quiet_radius, config_.goal_quiet_duration_seconds);
+    latest_effective_goal_radius_ = config_.goal_radius;
     config_.show_vector_grid = declare_parameter<bool>("show_vector_grid", config_.show_vector_grid);
     config_.show_occupancy_grid = declare_parameter<bool>("show_occupancy_grid", config_.show_occupancy_grid);
     config_.show_coverage_map = declare_parameter<bool>("show_coverage_map", config_.show_coverage_map);
@@ -429,7 +430,7 @@ public:
       "Goal quiet zone: %.2f m for %.2f s after a cow reaches %.2f m",
       config_.goal_quiet_radius,
       config_.goal_quiet_duration_seconds,
-      config_.final_goal_reached_radius);
+      config_.goal_radius);
     RCLCPP_INFO(
       this->get_logger(),
       "Cow objective priority: max potential %.2f, minimum spread %.2f m, "
@@ -1086,7 +1087,7 @@ private:
           direction_to_goal.x,
           direction_to_goal.y);
 
-        // The goal radius widens for five seconds after a cow arrives.
+        // A cow entering the normal goal radius temporarily widens the no-push area.
         // Cows inside the active radius cannot create push objectives.
         if (goal_distance > effective_goal_radius) {
           const cv::Point2f normalized_direction(
@@ -1099,7 +1100,9 @@ private:
 
           if (
             std::isfinite(global_push_point.x) &&
-            std::isfinite(global_push_point.y))
+            std::isfinite(global_push_point.y) &&
+            !grid_visualizer_pkg::inside_cow_exclusion(
+              {global_push_point.x, global_push_point.y}, cow_points, cow_exclusion_radius_))
           {
             PushObjective objective;
             objective.global_point=global_push_point;
@@ -1393,6 +1396,15 @@ private:
       }
       desired_row = std::clamp(desired_row, 1, config_.grid_size - 2);
       desired_col = std::clamp(desired_col, 1, config_.grid_size - 2);
+
+      // Suppress a cow-blocked pushing waypoint rather than moving it to a
+      // different pushing position. Check the clipped/rasterized cell too.
+      const auto desired_cell = grid_to_global(desired_row, desired_col, grid_center);
+      if (!push_objective.is_search && grid_visualizer_pkg::inside_cow_exclusion(
+          {desired_cell.x, desired_cell.y}, cow_points, cow_exclusion_radius_))
+      {
+        continue;
+      }
 
       int objective_row = -1;
       int objective_col = -1;
@@ -2394,7 +2406,7 @@ private:
       if(std::abs(x-drone_x)>config_.map_half_width ||
         std::abs(y-drone_y)>config_.map_half_width) {continue;}
       if(std::hypot(x-config_.goal_position.x,y-config_.goal_position.y)<=
-        config_.final_goal_reached_radius) {continue;}
+        config_.goal_radius) {continue;}
       center_x+=x;center_y+=y;++local_cows;
     }}
     geometry_msgs::msg::Pose focus=*drone_pose;

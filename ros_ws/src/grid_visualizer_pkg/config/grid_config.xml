@@ -42,7 +42,7 @@
   <visualization_period_ms>200</visualization_period_ms>
   <control_period_ms>500</control_period_ms>
 
-  <goal_quiet_radius_m>8.0</goal_quiet_radius_m>
+  <goal_quiet_radius_m>5.0</goal_quiet_radius_m>
   <goal_quiet_duration_seconds>20.0</goal_quiet_duration_seconds>
   <max_goto_movement_m>0.5</max_goto_movement_m>
 

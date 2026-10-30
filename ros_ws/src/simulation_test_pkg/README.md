@@ -28,7 +28,7 @@ The dashboard can be closed while the local server keeps running.
 **The 20-minute limit uses simulation time**, starting at the first valid clock
 and complete configured model snapshot. Real elapsed time and startup time are
 recorded separately. Success ends a test early when all cows are simultaneously
-inside the goal radius. Slow simulations may take more than 20 real minutes.
+inside the completion radius. Slow simulations may take more than 20 real minutes.
 Startup fails after 120 real seconds; a clock or expected-model telemetry outage
 fails after 60 real seconds. Errors retain partial trajectories and logs, and
 the queue continues. Cancelling one test continues the queue; cancelling a batch
@@ -56,6 +56,34 @@ Select run checkboxes and **Compare** to inspect results and saved speed limits.
 Each run exposes metrics/trajectory CSV downloads, configuration snapshots,
 provenance and full logs. **Rerun** reuses that run's frozen configuration files;
 cloning its settings into a scenario uses current defaults for other settings.
+
+## Scenario goal radii
+
+The scenario editor exposes three independent radii, all measured from the goal
+center in planar meters:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| Goal radius | 3 m | Cows inside stop generating pushing goals. A new arrival activates the extension. |
+| Completion radius | 5 m | All cows inside simultaneously completes the test; metrics use this radius too. |
+| Extended goal radius | 5 m | No-push radius for 20 seconds after a new arrival inside the normal goal. |
+
+The extended radius must exceed the normal goal radius. Replay displays the
+normal goal circle and a dashed completion circle; a different extended radius
+gets a dotted circle. These rings show configured limits. Radius values are
+saved in each run's scenario and immutable XML configuration.
+
+JSON/CLI scenarios use `goal.radius_m`, `goal.completion_radius_m` and
+`goal.extended_radius_m`. For example:
+
+```json
+"goal": {"x": -10, "y": -10, "radius_m": 3, "completion_radius_m": 5, "extended_radius_m": 5}
+```
+
+Older scenarios with only `radius_m` retain that shared navigation/completion
+radius. Historical results keep their original completion definition, and reruns
+recover the extended radius from the frozen grid configuration. New scenarios
+use the current defaults shown above; existing saved scenarios can be edited.
 
 ## Terminal batteries
 

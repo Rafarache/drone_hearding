@@ -42,6 +42,8 @@ import {
   terminal,
   Trajectory,
   emptyVisualizations,
+  completionRadius,
+  extendedRadius,
 } from "./types";
 import { MapCanvas } from "./MapCanvas";
 import { SearchControls, useSearchHistory } from "./SearchControls";
@@ -542,7 +544,10 @@ function Replay({
           </span>
           <span>
             <i className="legend-goal" />
-            Goal area
+            Goal {run.scenario.goal.radius_m} m · Completion{" "}
+            {completionRadius(run.scenario.goal)} m
+            {run.scenario.goal.extended_radius_m !== undefined &&
+              ` · Extended ${run.scenario.goal.extended_radius_m} m`}
           </span>
           <span>
             <i className="legend-detection" />
@@ -984,6 +989,28 @@ function ScenarioEditor({
                 }
               />
               <Numeric
+                label="Completion radius (m)"
+                value={completionRadius(draft.goal)}
+                min={0.1}
+                onChange={(completion_radius_m) =>
+                  setDraft({
+                    ...draft,
+                    goal: { ...draft.goal, completion_radius_m },
+                  })
+                }
+              />
+              <Numeric
+                label="Extended goal radius (m)"
+                value={extendedRadius(draft.goal)}
+                min={draft.goal.radius_m}
+                onChange={(extended_radius_m) =>
+                  setDraft({
+                    ...draft,
+                    goal: { ...draft.goal, extended_radius_m },
+                  })
+                }
+              />
+              <Numeric
                 label="Limit (simulated minutes)"
                 value={draft.duration_s / 60}
                 min={0.01}
@@ -993,6 +1020,12 @@ function ScenarioEditor({
                 }
               />
             </div>
+            <p className="hint">
+              Completion requires all cows inside the completion radius. Cows
+              inside the goal radius stop generating pushing goals; a new
+              arrival extends that area for 20 seconds. The extended radius must
+              exceed the goal radius.
+            </p>
             <h3>Speed limits</h3>
             <div className="form-grid">
               {(Object.keys(draft.speeds) as (keyof Scenario["speeds"])[]).map(

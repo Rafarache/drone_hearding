@@ -27,7 +27,29 @@ class MapSettings(Model):
 
 
 class Goal(Point):
-    radius_m: Positive = 2
+    radius_m: Positive = 3
+    completion_radius_m: Positive = 5
+    extended_radius_m: Positive = 5
+
+    @model_validator(mode='before')
+    @classmethod
+    def legacy_radii(cls, value):
+        # Older scenarios used radius_m for both navigation and completion.
+        if isinstance(value, dict) and 'radius_m' in value:
+            value = dict(value)
+            value.setdefault('completion_radius_m', value['radius_m'])
+            if 'extended_radius_m' not in value:
+                try:
+                    value['extended_radius_m'] = max(5.0, float(value['radius_m']) + .5)
+                except (TypeError, ValueError, OverflowError):
+                    pass  # The normal numeric field validation reports the invalid radius.
+        return value
+
+    @model_validator(mode='after')
+    def extended_outside_goal(self):
+        if self.extended_radius_m <= self.radius_m:
+            raise ValueError('Extended goal radius must be greater than the goal radius')
+        return self
 
 
 class Speeds(Model):

@@ -18,6 +18,14 @@ struct CowPoint
   double y;
 };
 
+inline bool inside_cow_exclusion(
+  CowPoint point, const std::vector<CowPoint> & cows, double radius)
+{
+  return std::any_of(cows.begin(), cows.end(), [&](const CowPoint & cow) {
+    return std::hypot(point.x - cow.x, point.y - cow.y) <= radius;
+  });
+}
+
 inline std::size_t closest_cow_outside_goal(
   const std::vector<CowPoint> & cows, CowPoint drone, CowPoint goal,
   double goal_radius)
@@ -99,7 +107,7 @@ public:
         previous_cows_[old_for_new[index]].arrival_latched;
 
       // A cow must leave the entire quiet zone before another entry can
-      // restart the timer. Readings that wobble across 2 m cannot extend it.
+      // restart the timer. Readings that wobble across the normal goal radius cannot extend it.
       if (goal_distance > quiet_radius_) {
         arrival_latched = false;
       } else if (goal_distance <= goal_radius_ && !arrival_latched) {

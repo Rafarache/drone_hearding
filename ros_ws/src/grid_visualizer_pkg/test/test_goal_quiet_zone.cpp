@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cassert>
 #include <stdexcept>
 #include <vector>
 
@@ -17,6 +18,23 @@ void expect_radius(double actual, double expected)
 
 int main()
 {
+  // Cow A's pushing point is (8,0). Cow B suppresses it on the closed
+  // exclusion boundary, regardless of input order; moving B clear restores it.
+  using grid_visualizer_pkg::inside_cow_exclusion;
+  assert(inside_cow_exclusion({8,0}, {{4,0},{8,0}}, 2));
+  assert(inside_cow_exclusion({8,0}, {{4,0},{10,0}}, 2));
+  assert(inside_cow_exclusion({8,0}, {{10,0},{4,0}}, 2));
+  assert(!inside_cow_exclusion({8,0}, {{4,0},{10.001,0}}, 2));
+  assert(!inside_cow_exclusion({8,0}, {{4,0}}, 2));
+  assert(!inside_cow_exclusion({8,0}, {}, 2));
+
+  const GoalQuietZone::TimePoint arrival{};
+  GoalQuietZone separate_radii({0,0}, 3.0, 5.0, 20.0);
+  expect_radius(separate_radii.update({{4,0}}, arrival), 3.0);
+  expect_radius(separate_radii.update({{3,0},{4,0}}, arrival), 5.0);
+  expect_radius(separate_radii.update({{3,0},{4,0}}, arrival + std::chrono::seconds(19)), 5.0);
+  expect_radius(separate_radii.update({{3,0},{4,0}}, arrival + std::chrono::seconds(20)), 3.0);
+
   const GoalQuietZone::TimePoint start{};
   GoalQuietZone zone({0.0, 0.0}, 2.0, 4.0, 5.0);
 

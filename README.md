@@ -20,13 +20,26 @@ terminals, plus the Gazebo models and YOLO weights used by this repository.
 
 `ros_ws/src/sjtu_drone_bringup/config/simulation.xml` defines the field bounds,
 drone and cow starting positions, goal, completion radius, and search footprint.
-The goal and radius are passed to both navigation and completion monitoring;
-they no longer come from the local grid configuration. The default field is
+The launch passes the normal goal radius to navigation and the separate
+completion radius to the mission monitor. The default field is
 **40 m × 40 m**, centered at the origin (X and Y from -20 to 20 m). At 0.5 m
 resolution this uses 6,400 global coverage cells, down from 40,000. Defaults are a goal at
-`(-10, -10)`, a **2 m planar completion radius**, and a conservative rectangular
+`(-10, -10)`, a **5 m planar completion radius**, a **3 m normal goal radius**, and a conservative rectangular
 observation footprint inside a camera sector with a 2–10 m range and 2.09 rad
 horizontal field of view.
+
+The goal settings have distinct purposes:
+
+- `goal_radius_m="3.0"` in `simulation.xml`: cows inside this radius stop
+  generating pushing goals; a new arrival triggers the temporary extension.
+- `final_goal_reached_radius_m="5.0"` in `simulation.xml`: all cows must be
+  inside this radius simultaneously for mission completion.
+- `goal_quiet_radius_m` (5.0) in `grid_config.xml`: temporarily expands the
+  no-push area for `goal_quiet_duration_seconds` (20 seconds). It must be
+  greater than the normal goal radius; it is independent of completion.
+
+All three radii can be changed independently in a Test Lab scenario's
+**Field & goal** section and are frozen with each experiment.
 
 To run another starting layout, copy this XML, change the positions, and launch:
 
@@ -81,7 +94,7 @@ ros2 param set /simple_drone0/grid0 show_coverage_map true
 `cow_repulsion_shape` is reduced from 8 to 3 so repulsion is appreciable before
 the 2 m-long cow bodies touch. At 3 m separation, the repulsive magnitude is
 0.064 instead of approximately 0.000015. This produces a more spread-out herd;
-the 2 m mission completion radius is unchanged.
+mission completion uses its separate 5 m radius.
 
 Both forward speed and turning now taper with resultant force. Resultants at or
 below `force_stop_threshold` (0.001) stop both, and `heading_tolerance_rad`
@@ -240,7 +253,7 @@ move into previously inspected regions.
 
 `cow_pkg/simulation_completion_monitor` subscribes to `/gazebo/model_states`.
 It requires every configured cow, with a unique name and finite position, to be
-inside the goal radius in the **same snapshot**. There is no dwell time or
+inside the 5 m completion radius in the **same snapshot**. There is no dwell time or
 coverage-completion requirement, and detector tracks are not used for this
 decision.
 
@@ -288,6 +301,12 @@ completed patches; reaching a viewpoint alone does not count as coverage.
 Outer bands are searched before inner bands, with nearby reachable patches
 preferred within a band. Search and cow pushing still share the potential field.
 
+A cow-pushing intermediate goal inside or exactly on any cow's 2 m exclusion
+radius is omitted. It creates no green goal, attraction, or recovery target;
+the node does not relocate it to a nearby free cell. This also applies when its
+clipped local grid cell falls within a cow exclusion. Goals are reevaluated on
+each local update and return when the blocking cow moves clear.
+
 On startup, drones wait for peer poses and initially turn away from the other
 drones' centroid before translating. For two drones these headings are opposite.
 Coincident starting positions use deterministic headings spaced by drone index.
@@ -304,8 +323,8 @@ the search **patch center**; otherwise it faces the cow-group center. Equal
 distances favor the cows. The comparison uses the real attraction rather than
 the local grid's clipped intermediate waypoint or the patch center itself.
 
-Cows inside the permanent 2 m goal completion radius are excluded. Local-map
-membership is independent of camera heading/range and the temporary 8 m herding
+Cows inside the normal 3 m goal radius are excluded from camera attention. Local-map
+membership is independent of camera heading/range and the temporary 5 m herding
 quiet radius. With only one available target type the camera faces it; with
 neither it preserves heading. Camera choice is independent of navigation's
 60/40 attraction allocation and does not change the selected search attraction.

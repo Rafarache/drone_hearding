@@ -14,7 +14,9 @@ pytestmark = pytest.mark.skipif(os.environ.get('SIM_TEST_RUN_REAL') != '1',
 def test_actual_launch_early_success_then_recorded_timeout(tmp_path):
     base = defaults().model_dump()
     early = dict(base, name='Smoke: early success', drones=[{'x': 0, 'y': 0}],
-                 cows=[{'x': -10, 'y': -10, 'z': .01}], duration_s=20)
+                 # Four meters from the goal: inside completion (5), outside
+                 # the normal no-push goal (3).
+                 cows=[{'x': -6, 'y': -10, 'z': .01}], duration_s=20)
     moving = dict(base, name='Smoke: recorded movement', drones=[{'x': 0, 'y': 0}, {'x': 0, 'y': 3}],
                   cows=[{'x': 6, 'y': 0, 'z': .01}], duration_s=20)
     store = Store(tmp_path)

@@ -43,7 +43,9 @@ def summarize(path, scenario, expected):
         entities = []
         for entity in expected:
             rows = [dict(r) for r in db.execute('SELECT * FROM positions WHERE entity=? ORDER BY t', (entity,))]
-            result = entity_metrics(rows, (scenario['goal']['x'], scenario['goal']['y']), scenario['goal']['radius_m'])
+            goal = scenario['goal']
+            result = entity_metrics(rows, (goal['x'], goal['y']),
+                                    goal.get('completion_radius_m', goal['radius_m']))
             if result:
                 entities.append(result)
     end = max((r['last_sample_s'] for r in entities), default=0)

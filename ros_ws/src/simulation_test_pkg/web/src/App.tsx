@@ -49,6 +49,7 @@ import { MapCanvas } from "./MapCanvas";
 import { SearchControls, useSearchHistory } from "./SearchControls";
 import { searchAtTime } from "./replay";
 import { ViewSettings, LiveControls } from "./LiveControls";
+import { BuildControls } from "./BuildControls";
 const empty: Trajectory = { frames: [], detections: [] };
 const statusText = (status: string) =>
   ({
@@ -1352,7 +1353,8 @@ export default function App() {
     [search, setSearch] = useState(""),
     [filter, setFilter] = useState("all"),
     [error, setError] = useState(""),
-    [connected, setConnected] = useState(false);
+    [connected, setConnected] = useState(false),
+    [buildBlocked, setBuildBlocked] = useState(false);
   const refresh = useCallback(async () => {
     try {
       const [newRuns, newScenarios, newBatches] = await Promise.all([
@@ -1529,6 +1531,12 @@ export default function App() {
             </p>
           </div>
           <div className="header-actions">
+            <BuildControls
+              queued={runs.some((run) =>
+                ["queued", "starting", "running"].includes(run.status),
+              )}
+              onBlocked={setBuildBlocked}
+            />
             <button
               className="button"
               onClick={newScenario}
@@ -1540,7 +1548,7 @@ export default function App() {
             <button
               className="button primary"
               onClick={() => setBatchEditor(true)}
-              disabled={!scenarios.length}
+              disabled={!scenarios.length || buildBlocked}
             >
               <Play size={15} />
               New batch

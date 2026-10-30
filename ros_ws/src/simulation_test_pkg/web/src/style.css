@@ -1803,3 +1803,15 @@ pre {
 .map-legend {
   flex-wrap: wrap;
 }
+.build-log {
+  max-height: 360px;
+  overflow: auto;
+  padding: 16px;
+  background: #152532;
+  color: #e0edf5;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

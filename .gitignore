@@ -6,6 +6,7 @@ ros_ws/test_results/
 ros_ws/.test_lab_venv/
 ros_ws/src/simulation_test_pkg/web/node_modules/
 ros_ws/src/simulation_test_pkg/web/dist/
+ros_ws/src/simulation_test_pkg/web/.lab-build-*/
 __pycache__/
 .pytest_cache/
 *.tsbuildinfo

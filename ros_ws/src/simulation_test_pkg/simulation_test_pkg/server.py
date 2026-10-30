@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import copy
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,6 +19,8 @@ from .metrics import summarize
 from .models import BatchSpec, Scenario, Visualizations, DeleteRuns
 from .storage import Store, database, trajectory, atomic_json, identifier, utcnow
 from .supervisor import Supervisor, submit_batch
+from .builds import BuildControl, BuildConflict
+from .processes import process_identity
 
 
 def csv_response(rows, filename):
@@ -34,6 +37,7 @@ def csv_response(rows, filename):
 def create_app(data_dir='/ros2_ws/test_results', web_dir=None, manage_worker=True, default_factory=defaults):
     store = Store(data_dir)
     supervisor = Supervisor(store)
+    builds = BuildControl(store)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -49,6 +53,11 @@ def create_app(data_dir='/ros2_ws/test_results', web_dir=None, manage_worker=Tru
 
     app = FastAPI(title='Herding Test Lab', lifespan=lifespan)
     app.state.store = store
+    app.state.builds = builds
+
+    @app.exception_handler(BuildConflict)
+    async def build_conflict(_request, error):
+        return JSONResponse({'detail': str(error)}, status_code=409)
     from starlette.middleware.trustedhost import TrustedHostMiddleware
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost'] +
                        ([] if manage_worker else ['testserver']))
@@ -72,7 +81,20 @@ def create_app(data_dir='/ros2_ws/test_results', web_dir=None, manage_worker=Tru
     @app.get('/api/health')
     def health():
         return {'ok': True, 'data_dir': str(store.root), 'active_run': supervisor.active,
-                'max_duration_s': 1200, 'recording_hz': 10}
+                'max_duration_s': 1200, 'recording_hz': 10,
+                'build_controller': True, 'process': process_identity(os.getpid())}
+
+    @app.get('/api/build')
+    def build_status():
+        return builds.status()
+
+    @app.post('/api/build', status_code=202)
+    def build_checkout():
+        return builds.start()
+
+    def submit(spec, **kwargs):
+        with builds.submission():
+            return submit_batch(store, spec, **kwargs)
 
     @app.get('/api/defaults')
     def get_defaults():
@@ -104,7 +126,7 @@ def create_app(data_dir='/ros2_ws/test_results', web_dir=None, manage_worker=Tru
     @app.post('/api/batches', status_code=202)
     def enqueue(spec: BatchSpec):
         try:
-            batch_id = submit_batch(store, spec)
+            batch_id = submit(spec)
         except (ValueError, OSError) as error:
             raise HTTPException(422, str(error)) from error
         return next(b for b in store.batches() if b['id'] == batch_id)
@@ -195,7 +217,7 @@ def create_app(data_dir='/ros2_ws/test_results', web_dir=None, manage_worker=Tru
         goal.setdefault('completion_radius_m', float(herding.get('final_goal_reached_radius_m')))
         goal.setdefault('extended_radius_m', float(ET.parse(sources['grid_config.xml']).getroot()
                                                    .find('goal_quiet_radius_m').text))
-        batch_id = submit_batch(store, {'name': f"Rerun · {previous['scenario']['name']}",
+        batch_id = submit({'name': f"Rerun · {previous['scenario']['name']}",
                                         'items': [{'scenario': scenario}]},
                                 snapshotter=lambda directory, scenario: snapshot(
                                     directory, scenario, sources, lambda *args: original_world))

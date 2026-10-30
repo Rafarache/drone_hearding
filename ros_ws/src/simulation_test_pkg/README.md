@@ -25,6 +25,26 @@ limits, then use **New batch** to request repeats. A batch can contain several
 scenarios, each with its own repeat count. Tests run sequentially in fresh worlds.
 The dashboard can be closed while the local server keeps running.
 
+Use **Build latest code** in the header, then **Build and reload**, after editing
+code or switching branches. It builds all ROS packages in the Docker workspace,
+installs the locked application dependencies, and builds the React website on
+the host. Progress and errors appear in the dialog. After a successful build,
+the controller restarts the backend and the browser reloads the new website and
+defaults. The dialog shows the built branch, commit and whether local edits were
+included. It builds the current local checkout; it does not pull or switch Git
+branches. Avoid editing the checkout during a build: detected changes invalidate
+the result and require another build.
+
+Builds require an empty queue and no active experiment. New batches and reruns
+are blocked during builds and after failures until a build succeeds, so a partial
+build cannot silently become a new test. Existing recordings and scenarios are
+retained. Logs are saved in `ros_ws/test_results/build.log`; the current build
+state is in `build-state.json`. A build changes the installed code used by future
+runs, including reruns; immutable run snapshots contain configuration, not code.
+The local host controller must be running through `./scripts/test_lab.sh`. A
+backend started directly without it shows instructions to restart through that
+script. Node.js and Docker are required on the host, as with terminal startup.
+
 **The 20-minute limit uses simulation time**, starting at the first valid clock
 and complete configured model snapshot. Real elapsed time and startup time are
 recorded separately. Success ends a test early when all cows are simultaneously

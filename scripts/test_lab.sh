@@ -46,7 +46,7 @@ docker exec "$lab_container" bash -lc '
   /ros2_ws/.test_lab_venv/bin/python -m pip install -q -r /ros2_ws/src/simulation_test_pkg/requirements.lock
   source /opt/ros/iron/setup.bash
   cd /ros2_ws
-  colcon build --packages-select cow_pkg sjtu_drone_control yolo_pkg sjtu_drone_bringup grid_visualizer_pkg simulation_test_pkg
+  colcon build
 '
 if [[ "$lab_mode" != run ]]; then
   npm ci --prefix "$lab_workspace/src/simulation_test_pkg/web" --no-audit --no-fund
@@ -75,4 +75,4 @@ if [[ "$lab_mode" == run ]]; then
   exec docker exec -i "$lab_container" bash -lc 'source /opt/ros/iron/setup.bash && source /ros2_ws/install/setup.bash && cd /ros2_ws && exec .test_lab_venv/bin/python -m simulation_test_pkg.cli --spec "$1"' _ "$lab_spec"
 fi
 printf 'Herding Lab: http://127.0.0.1:%s\n' "${SIM_TEST_PORT:-8765}"
-exec docker exec -i "$lab_container" bash -lc 'source /opt/ros/iron/setup.bash && source /ros2_ws/install/setup.bash && cd /ros2_ws && exec .test_lab_venv/bin/python -m simulation_test_pkg.server --port "$1"' _ "${SIM_TEST_PORT:-8765}"
+exec python3 "$lab_repo_dir/scripts/test_lab_service.py" --container "$lab_container" --port "${SIM_TEST_PORT:-8765}"

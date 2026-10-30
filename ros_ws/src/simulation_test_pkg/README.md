@@ -8,15 +8,28 @@ A local test battery runner and trajectory replay application for the canonical
 From the repository root, with Docker and Node.js 20.19+ or 22.12+ available:
 
 ```bash
-./scripts/test_lab.sh
+./start_lab.sh
 ```
 
-Open **http://127.0.0.1:8765**. The script uses the existing `drone_herding`
-container, installs isolated Python dependencies and virtual-display support,
-builds the affected ROS packages and React frontend, and starts the local API.
-It expects the existing host-network container with `ros_ws` mounted at
-`/ros2_ws`. Set `SIM_TEST_CONTAINER` or `SIM_TEST_PORT` to override the defaults.
-Use `./scripts/test_lab.sh setup` to prepare dependencies without starting it.
+Open **http://127.0.0.1:8765**. The script creates or starts the `drone_herding`
+container using `drone_herding:1.0`, building the image from the repository
+Dockerfile if it is missing. It installs isolated Python dependencies, SciPy for
+cow tracking, ROS model tools (`xacro` and the robot/joint state publishers), and
+virtual-display support, builds the ROS packages and React frontend, and starts
+the local API.
+New containers use host networking and mount this checkout's `ros_ws` at
+`/ros2_ws`. Existing containers are checked for those settings before reuse.
+Set `SIM_TEST_IMAGE`, `SIM_TEST_CONTAINER`, or `SIM_TEST_PORT` to override the defaults.
+Use `./start_lab.sh setup` to prepare dependencies without starting the server,
+or `./start_lab.sh run /path/to/battery.json` to run a batch from the terminal.
+The server runs in the foreground. Ctrl+C stops it; the container stays up for
+the next start. Run `./stop_lab.sh` to gracefully shut down the server and
+container together, preserving saved runs. It honors `SIM_TEST_CONTAINER`, or
+accepts `--container NAME`; `--timeout SECONDS` changes the default 45-second
+grace period for each shutdown step. Repeated stops are safe.
+Host X11 display authorization is mounted when available; otherwise cameras use
+the virtual display. Desktop viewer windows require an available host display.
+The lower-level `./scripts/test_lab.sh` remains available for existing containers.
 The container must be able to install packages on first setup; subsequent starts
 reuse the installed dependencies. No cloud service or account is used.
 
@@ -27,9 +40,9 @@ The dashboard can be closed while the local server keeps running.
 
 Use **Build latest code** in the header, then **Build and reload**, after editing
 code or switching branches. It builds all ROS packages in the Docker workspace,
-installs the locked application dependencies, and builds the React website on
-the host. Progress and errors appear in the dialog. After a successful build,
-the controller restarts the backend and the browser reloads the new website and
+installs missing ROS model tools and the locked application dependencies, and
+builds the React website on the host. Progress and errors appear in the dialog.
+After a successful build, the controller restarts the backend and the browser reloads the new website and
 defaults. The dialog shows the built branch, commit and whether local edits were
 included. It builds the current local checkout; it does not pull or switch Git
 branches. Avoid editing the checkout during a build: detected changes invalidate
@@ -76,6 +89,10 @@ Select run checkboxes and **Compare** to inspect results and saved speed limits.
 Each run exposes metrics/trajectory CSV downloads, configuration snapshots,
 provenance and full logs. **Rerun** reuses that run's frozen configuration files;
 cloning its settings into a scenario uses current defaults for other settings.
+Older templates missing `search_goal_weight` or `search_goal_cap_cells` receive
+the defaults 0.2 and 20 cells in the new snapshot. Existing values and the
+original recording stay unchanged; added values appear in the new manifest's
+`configuration_defaults_added` field.
 
 ## Scenario goal radii
 

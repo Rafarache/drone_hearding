@@ -16,6 +16,7 @@ RUN echo "deb http://packages.osrfoundation.org/gazebo/ubuntu `lsb_release -cs` 
     && apt-get install -y \
     gazebo \
     ros-${ROS_DISTRO}-gazebo-ros-pkgs \
+    ros-${ROS_DISTRO}-xacro ros-${ROS_DISTRO}-robot-state-publisher ros-${ROS_DISTRO}-joint-state-publisher \
     python3-colcon-common-extensions python3-rosdep python3-venv xvfb xauth --no-install-recommends \
     && apt-get clean
 RUN rosdep init && rosdep update --rosdistro=iron
@@ -27,5 +28,5 @@ RUN curl -L https://github.com/osrf/gazebo_models/archive/refs/heads/master.zip 
 RUN apt-get update && apt-get install -y git pip
 RUN git config --global user.name "Rafarache" && git config --global user.email "feettree.1@gmail.com"
 ENV PIP_DEFAULT_TIMEOUT=100
-RUN pip install --no-cache-dir "numpy<2" ultralytics opencv-python
+RUN pip install --no-cache-dir "numpy<2" scipy ultralytics opencv-python
 RUN apt install ros-${ROS_DISTRO}-turtlebot3* -y

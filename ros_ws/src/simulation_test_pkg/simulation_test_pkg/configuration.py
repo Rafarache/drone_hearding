@@ -15,6 +15,11 @@ FILES = {'simulation.xml': ('sjtu_drone_bringup', 'simulation.xml'),
          'yolo_config.xml': ('yolo_pkg', 'yolo_config.xml'),
          'drone.yaml': ('sjtu_drone_bringup', 'drone.yaml')}
 
+# Settings introduced after the first lab recordings. Materialize them in each
+# new snapshot so older frozen templates remain usable with the current node.
+GRID_COMPATIBILITY_DEFAULTS = {'search_goal_weight': '0.2',
+                               'search_goal_cap_cells': '20.0'}
+
 
 def config_sources():
     from ament_index_python.packages import get_package_share_directory
@@ -98,6 +103,11 @@ def snapshot(run_dir, scenario, sources=None, resolve_world=None):
     drone.set('max_linear_velocity_mps', str(speeds['drone_linear_mps']))
     drone.set('max_angular_velocity_radps', str(speeds['drone_angular_radps']))
     grid = trees['grid_config.xml'].getroot()
+    added_grid_defaults = {}
+    for name, value in GRID_COMPATIBILITY_DEFAULTS.items():
+        if grid.find(name) is None:
+            ET.SubElement(grid, name).text = value
+            added_grid_defaults[name] = value
     quiet = grid.find('goal_quiet_radius_m')
     quiet.text = str(scenario['goal']['extended_radius_m'])
     for name, setting in (('show_vector_grid', 'vectors'), ('show_occupancy_grid', 'occupancy'),
@@ -128,6 +138,8 @@ def snapshot(run_dir, scenario, sources=None, resolve_world=None):
                 'ros_distro': os.environ.get('ROS_DISTRO', 'unknown'),
                 'world_archival_state_removed': True, 'search_telemetry_version': 1,
                 'live_visualization_controls': True}
+    if added_grid_defaults:
+        manifest['configuration_defaults_added'] = {'grid_config.xml': added_grid_defaults}
     provenance = run_dir.parent.parent / 'checkout_provenance.json'
     if provenance.exists():
         manifest['checkout'] = json.loads(provenance.read_text())

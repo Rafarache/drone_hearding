@@ -413,7 +413,7 @@ separate validation step.
 
 ## Experiment batteries and replay
 
-Run `./scripts/test_lab.sh` from the repository root and open
+Run `./start_lab.sh` from the repository root and open
 **http://127.0.0.1:8765** to create starting layouts, queue repeated simulations,
 and replay actual cow/drone trajectories with fading paths. Runs end at success
 or at **20 simulated minutes** and save per-entity movement metrics, both clocks,
@@ -422,5 +422,14 @@ detector's remembered cows are available as a separate replay overlay. New tests
 also record per-drone searched/unsearched maps and search goals. Replay has layer
 toggles, scenario/live-run controls for desktop viewers, and single/bulk
 experiment deletion.
+
+The startup script creates or starts the Docker container, builds the image if
+missing, installs dependencies, and builds and serves the lab. It reuses a
+compatible existing container and an already running server. Docker, Python 3,
+Git, and Node.js/npm must be installed on the host. Run `./start_lab.sh --help`
+for image, container, port, setup-only, and batch options.
+
+Run `./stop_lab.sh` when finished to shut down the server and container while
+keeping saved runs. Both scripts honor `SIM_TEST_CONTAINER`.
 
 See [Herding Lab setup, CLI batches and data format](ros_ws/src/simulation_test_pkg/README.md).

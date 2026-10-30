@@ -154,7 +154,9 @@ except FileNotFoundError:
             with (self.data / 'build.log').open('ab', buffering=0) as log:
                 self.command(['docker', 'exec', self.container, 'bash', '-lc',
                               'source /opt/ros/iron/setup.bash && cd /ros2_ws && '
-                              '.test_lab_venv/bin/python -m pip install -q -r src/simulation_test_pkg/requirements.lock && '
+                              'bash src/simulation_test_pkg/scripts/setup_runtime.sh && '
+                              '.test_lab_venv/bin/python -m pip install --disable-pip-version-check --timeout 20 --retries 2 '
+                              '-r src/simulation_test_pkg/requirements.lock && '
                               'colcon build'], log)
                 self.command(['npm', 'ci', '--no-audit', '--no-fund'], log, web)
                 self.command(['npm', 'run', 'build', '--', '--outDir', str(staging)], log, web)
@@ -179,7 +181,7 @@ except FileNotFoundError:
                 log.write(f'\nBuild failed: {error}\n')
             self.publish(status='failed', message=str(error), finished_at=now())
             # Keep the UI available for reading logs and retrying after a failed restart.
-            if self.backend is None or self.backend.poll() is not None:
+            if not self.stopping.is_set() and (self.backend is None or self.backend.poll() is not None):
                 try:
                     self.start_backend()
                 except Exception as restart_error:

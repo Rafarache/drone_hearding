@@ -113,3 +113,61 @@ def test_legacy_rerun_preserves_frozen_shared_and_extended_radii(tmp_path):
     assert repeated['scenario']['goal'] == dict(legacy['goal'], completion_radius_m=3, extended_radius_m=8)
     frozen = ET.parse(app.state.store.run_dir(repeated['id']) / 'config/grid_config.xml').getroot()
     assert float(frozen.find('goal_quiet_radius_m').text) == 8
+
+
+def test_rerun_upgrades_legacy_grid_settings_without_changing_frozen_inputs(tmp_path):
+    from fastapi.testclient import TestClient
+    from simulation_test_pkg.server import create_app
+    from simulation_test_pkg.supervisor import submit_batch
+    app = create_app(tmp_path, manage_worker=False)
+    original = defaults(sources())
+    submit_batch(app.state.store, {'items': [{'scenario': original.model_dump()}]},
+                 lambda directory, scenario: snapshot(directory, scenario, sources(),
+                     lambda *_: SOURCE / 'sjtu_drone_description/worlds/farm_no_animals.world'))
+    previous = app.state.store.runs()[0]
+    app.state.store.update(previous['id'], {'status': 'failed'})
+    old_file = app.state.store.run_dir(previous['id']) / 'config/grid_config.xml'
+    tree = ET.parse(old_file)
+    grid = tree.getroot()
+    grid.remove(grid.find('search_goal_weight'))
+    grid.remove(grid.find('search_goal_cap_cells'))
+    grid.find('search_wall_weight').text = '0.75'
+    tree.write(old_file)
+    frozen_bytes = old_file.read_bytes()
+
+    with TestClient(app) as client:
+        response = client.post('/api/runs/' + previous['id'] + '/rerun')
+        assert response.status_code == 202, response.text
+    repeated = next(run for run in app.state.store.runs() if run['id'] != previous['id'])
+    directory = app.state.store.run_dir(repeated['id'])
+    upgraded = ET.parse(directory / 'config/grid_config.xml').getroot()
+    assert float(upgraded.find('search_goal_weight').text) == 0.2
+    assert float(upgraded.find('search_goal_cap_cells').text) == 20.0
+    assert float(upgraded.find('search_wall_weight').text) == 0.75
+    assert old_file.read_bytes() == frozen_bytes
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    assert manifest['configuration_defaults_added'] == {
+        'grid_config.xml': {'search_goal_weight': '0.2', 'search_goal_cap_cells': '20.0'}}
+    from simulation_test_pkg.configuration import sha256
+    assert manifest['configuration_sha256']['grid_config.xml'] == sha256(directory / 'config/grid_config.xml')
+
+
+def test_snapshot_preserves_explicit_goal_search_settings(tmp_path):
+    import shutil
+    templates = tmp_path / 'templates'
+    templates.mkdir()
+    current = sources()
+    for name, source in current.items():
+        shutil.copyfile(source, templates / name)
+    grid_file = templates / 'grid_config.xml'
+    tree = ET.parse(grid_file)
+    tree.getroot().find('search_goal_weight').text = '0'
+    tree.getroot().find('search_goal_cap_cells').text = '7'
+    tree.write(grid_file)
+    current = {name: templates / name for name in current}
+    manifest = snapshot(tmp_path / 'run', defaults(current), current,
+                        lambda *_: SOURCE / 'sjtu_drone_description/worlds/farm_no_animals.world')
+    grid = ET.parse(tmp_path / 'run/config/grid_config.xml').getroot()
+    assert float(grid.find('search_goal_weight').text) == 0
+    assert float(grid.find('search_goal_cap_cells').text) == 7
+    assert 'configuration_defaults_added' not in manifest

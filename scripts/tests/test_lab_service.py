@@ -63,6 +63,16 @@ class BuildServiceTests(unittest.TestCase):
         replacement = module.LabService(self.root, 'fixture', 8765)
         self.assertEqual(replacement.state['status'], 'failed')
 
+    def test_failed_build_during_shutdown_does_not_restart_backend(self):
+        self.service.stopping.set()
+        self.service.backend.poll.return_value = 1
+        with patch.object(module, 'provenance', return_value=self.code), \
+             patch.object(self.service, 'command', side_effect=RuntimeError('container stopped')), \
+             patch.object(self.service, 'start_backend') as start:
+            self.service.build()
+        self.assertEqual(self.service.state['status'], 'failed')
+        start.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

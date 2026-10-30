@@ -37,19 +37,23 @@ if [[ "$(docker inspect "$lab_container" --format '{{.HostConfig.NetworkMode}}')
 fi
 # Desktop windows are opt-in per scenario. Xvfb supports cameras without DISPLAY.
 docker exec "$lab_container" bash -lc '
-  if ! command -v Xvfb >/dev/null || ! command -v xauth >/dev/null || ! python3 -c "import ensurepip" 2>/dev/null; then
-    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv xvfb xauth
-  fi
+  set -e
+  source /opt/ros/iron/setup.bash
+  bash /ros2_ws/src/simulation_test_pkg/scripts/setup_runtime.sh
   if [ ! -f /ros2_ws/.test_lab_venv/bin/pip ]; then
+    echo "[Herding Lab] Creating the application Python environment..."
     python3 -m venv --system-site-packages /ros2_ws/.test_lab_venv
   fi
-  /ros2_ws/.test_lab_venv/bin/python -m pip install -q -r /ros2_ws/src/simulation_test_pkg/requirements.lock
-  source /opt/ros/iron/setup.bash
+  echo "[Herding Lab] Installing application Python dependencies..."
+  /ros2_ws/.test_lab_venv/bin/python -m pip install --disable-pip-version-check --timeout 20 --retries 2 -r /ros2_ws/src/simulation_test_pkg/requirements.lock
   cd /ros2_ws
+  echo "[Herding Lab] Building ROS packages..."
   colcon build
 '
 if [[ "$lab_mode" != run ]]; then
+  echo '[Herding Lab] Installing frontend dependencies...'
   npm ci --prefix "$lab_workspace/src/simulation_test_pkg/web" --no-audit --no-fund
+  echo '[Herding Lab] Building the frontend...'
   npm run build --prefix "$lab_workspace/src/simulation_test_pkg/web"
 fi
 # Let the host user maintain top-level manifests even when Docker created the directory.
@@ -75,4 +79,5 @@ if [[ "$lab_mode" == run ]]; then
   exec docker exec -i "$lab_container" bash -lc 'source /opt/ros/iron/setup.bash && source /ros2_ws/install/setup.bash && cd /ros2_ws && exec .test_lab_venv/bin/python -m simulation_test_pkg.cli --spec "$1"' _ "$lab_spec"
 fi
 printf 'Herding Lab: http://127.0.0.1:%s\n' "${SIM_TEST_PORT:-8765}"
+echo '[Herding Lab] Starting the server. This terminal stays open; use Ctrl+C to stop it.'
 exec python3 "$lab_repo_dir/scripts/test_lab_service.py" --container "$lab_container" --port "${SIM_TEST_PORT:-8765}"

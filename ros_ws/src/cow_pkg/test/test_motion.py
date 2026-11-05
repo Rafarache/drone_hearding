@@ -54,6 +54,30 @@ class CowMotionTests(unittest.TestCase):
             self.assertAlmostEqual(linear, 0.5 * min(force, 1.0))
             self.assertEqual(angular, 0.0)
 
+    def test_configured_pair_speed_tracks_force_until_the_attraction_peak(self):
+        config = load_cow_config()
+        # These separations previously saturated at 0.5 m/s with a 0.1
+        # full-speed force. Use the production curve and configured controller.
+        for distance, expected_speed in ((3.0, 0.032), (8.0, 0.05459952003204282),
+                                         (10.0, 0.3293502991002851),
+                                         (11.75, 0.5), (15.0, 0.102738261038292)):
+            with self.subTest(distance=distance):
+                fx, fy = cow_interaction_vector(distance, 0.0, config)
+                speed, _ = force_to_velocity(fx, fy, math.atan2(fy, fx), config)
+                self.assertAlmostEqual(speed, expected_speed, places=6)
+                if distance != 11.75:
+                    self.assertLess(speed, config.linear_velocity_mps)
+
+    def test_configured_repulsion_approaches_full_speed_at_zero_distance(self):
+        config = load_cow_config()
+        for distance in (0.001, 0.01, 0.1):
+            fx, fy = cow_interaction_vector(distance, 0.0, config)
+            speed, _ = force_to_velocity(fx, fy, math.pi, config)
+            self.assertAlmostEqual(speed, config.linear_velocity_mps * (1 - distance / 5) ** 3)
+            self.assertLess(speed, config.linear_velocity_mps)
+        # Coincident centers have no direction; retain the existing safe hold.
+        self.assertEqual(cow_interaction_vector(0.0, 0.0, config), (0.0, 0.0))
+
     def test_facing_away_turns_in_place(self):
         linear, angular = force_to_velocity(-0.1, 0.0, 0.0, motion_config())
         self.assertEqual(linear, 0.0)

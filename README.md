@@ -96,7 +96,14 @@ the 2 m-long cow bodies touch. At 3 m separation, the repulsive magnitude is
 0.064 instead of approximately 0.000015. This produces a more spread-out herd;
 mission completion uses its separate 5 m radius.
 
-Both forward speed and turning now taper with resultant force. Resultants at or
+Both forward speed and turning scale with resultant force. `full_speed_force`
+is **1.0**, matching the unit peak of the pairwise force curve. For an aligned
+cow, speed is `0.5 * min(force_magnitude, 1)` m/s above the stop threshold.
+A single neighbor produces full-speed attraction only at **11.75 m** separation;
+repulsive speed approaches its maximum as separation approaches zero. Exact
+coincident positions retain a zero force vector because their direction is
+undefined. Forces from multiple cows and drones add before speed conversion,
+so their combined resultant can still reach full speed elsewhere. Resultants at or
 below `force_stop_threshold` (0.001) stop both, and `heading_tolerance_rad`
 (0.05 rad, about 2.9 degrees) prevents steering corrections for tiny heading
 errors. The steering gains are P=1.0 and angular-rate damping=0.2. Damping uses

@@ -10,11 +10,12 @@
     cow_repulsion_shape="3"
     cow_attraction_rise="6"
     cow_attraction_fall="6" />
-  <!-- Both translation and turning taper with resultant force.
+  <!-- Both translation and turning taper with resultant force. A force of 1
+       reaches full speed, matching the peak pairwise attraction/repulsion.
        The derivative gain damps measured angular velocity in rad/s. -->
   <motion
     linear_velocity_mps="0.5"
-    full_speed_force="0.1"
+    full_speed_force="1.0"
     force_stop_threshold="0.001"
     max_angular_velocity_radps="1.0"
     heading_proportional_gain="1.0"
